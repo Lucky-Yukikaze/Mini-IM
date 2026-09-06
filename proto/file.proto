@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package im.file;
+
+import "common.proto";
+
+message FileInit {
+  string conversation_id = 1;
+  string client_file_id = 2;
+  string file_name = 3;
+  uint64 file_size = 4;
+  string sha256 = 5;
+  im.common.FileTransferDirection direction = 6;
+  uint64 resume_offset = 7;
+  uint32 priority = 8;
+  string source_file_id = 9;
+}
+
+message FileFinish {
+  string file_id = 1;
+  bool success = 2;
+}
+
+message FileUpdated {
+  string event_id = 1;
+  string file_id = 2;
+  string conversation_id = 3;
+  uint64 transferred_bytes = 4;
+  bool completed = 5;
+  uint64 version = 6;
+  int64 updated_at_ms = 7;
+}

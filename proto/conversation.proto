@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package im.conversation;
+
+import "common.proto";
+
+message CreateConversation {
+  string client_conv_id = 1;
+  im.common.ConversationType type = 2;
+  repeated string member_ids = 3;
+  string title = 4;
+}
+
+message AddMembers {
+  string conversation_id = 1;
+  repeated string member_ids = 2;
+}
+
+message RemoveMembers {
+  string conversation_id = 1;
+  repeated string member_ids = 2;
+}
+
+message LeaveConversation {
+  string conversation_id = 1;
+}
+
+message JoinConversation {
+  string conversation_id = 1;
+}
+
+message RenameConversation {
+  string conversation_id = 1;
+  string title = 2;
+}
+
+message ConversationUpdated {
+  string event_id = 1;
+  string conversation_id = 2;
+  int64 updated_at_ms = 3;
+  string title = 4;
+  im.common.ConversationType type = 5;
+  string owner_id = 6;
+  repeated string member_ids = 7;
+}

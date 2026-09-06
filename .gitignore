@@ -1,0 +1,26 @@
+# Local dependencies and build outputs
+/thirdparty_install/
+/build/
+/web/node_modules/
+/web/dist/
+/.venv/
+/venv/
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Runtime data and development credentials
+/server/storage/files/
+/server/storage/sqlite/*.db
+/server/storage/sqlite/*.db-*
+/server/quic/dev_cert.pem
+/server/quic/dev_key.pem
+/tools/.dev_processes.json
+*.log
+.env
+.env.*
+!.env.example
+
+# Temporary investigation outputs
+/tmp/

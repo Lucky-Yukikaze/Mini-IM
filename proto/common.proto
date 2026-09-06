@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package im.common;
+
+enum Channel {
+  CHANNEL_UNSPECIFIED = 0;
+  CHANNEL_CONTROL = 1;
+  CHANNEL_FILE = 2;
+}
+
+enum DeliveryStatus {
+  DELIVERY_UNSPECIFIED = 0;
+  DELIVERY_SENT = 1;
+  DELIVERY_DELIVERED = 2;
+  DELIVERY_READ = 3;
+  DELIVERY_FAILED = 4;
+}
+
+enum MessageType {
+  MSG_UNSPECIFIED = 0;
+  MSG_TEXT = 1;
+  MSG_IMAGE = 2;
+  MSG_FILE = 3;
+  MSG_SYSTEM = 4;
+}
+
+enum ConversationType {
+  CONVERSATION_UNSPECIFIED = 0;
+  CONVERSATION_DIRECT = 1;
+  CONVERSATION_GROUP = 2;
+}
+
+enum FileTransferDirection {
+  FILE_DIRECTION_UNSPECIFIED = 0;
+  FILE_DIRECTION_UPLOAD = 1;
+  FILE_DIRECTION_DOWNLOAD = 2;
+}
+
+message Error {
+  int32 code = 1;
+  string message = 2;
+  string detail = 3;
+}

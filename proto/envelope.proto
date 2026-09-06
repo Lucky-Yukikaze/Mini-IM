@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package im.envelope;
+
+import "auth.proto";
+import "common.proto";
+import "conversation.proto";
+import "file.proto";
+import "message.proto";
+import "sync.proto";
+
+message Envelope {
+  uint32 version = 1;
+  string request_id = 2;
+  im.common.Channel channel = 3;
+  string session_id = 4;
+  string device_id = 5;
+  uint64 seq = 6;
+  int64 client_time_ms = 7;
+  string trace_id = 8;
+
+  oneof body {
+    im.auth.Hello hello = 10;
+    im.auth.Welcome welcome = 11;
+    im.auth.Heartbeat heartbeat = 12;
+
+    im.message.SendMessage send_message = 20;
+    im.message.MessagePush message_push = 21;
+    im.message.Ack ack = 22;
+    im.message.Receipt receipt = 23;
+    im.message.Recall recall = 24;
+
+    im.conversation.CreateConversation create_conversation = 30;
+    im.conversation.ConversationUpdated conversation_updated = 31;
+    im.conversation.AddMembers add_members = 32;
+    im.conversation.RemoveMembers remove_members = 33;
+    im.conversation.LeaveConversation leave_conversation = 34;
+    im.conversation.RenameConversation rename_conversation = 35;
+    im.conversation.JoinConversation join_conversation = 36;
+
+    im.file.FileInit file_init = 40;
+    im.file.FileFinish file_finish = 41;
+    im.file.FileUpdated file_updated = 42;
+
+    im.sync.SyncRequest sync_request = 50;
+    im.sync.SyncResponse sync_response = 51;
+
+    im.common.Error error = 99;
+  }
+}

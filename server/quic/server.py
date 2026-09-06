@@ -1,0 +1,688 @@
+import asyncio
+import os
+import random
+from contextlib import suppress
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from aioquic.asyncio import QuicConnectionProtocol, serve
+from aioquic.quic.configuration import QuicConfiguration
+from aioquic.quic.events import ConnectionTerminated, StreamDataReceived
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
+
+from protocol.codec import EnvelopeCodec
+from protocol.pb import auth_pb2, conversation_pb2, envelope_pb2, file_pb2, message_pb2, sync_pb2
+from services.auth.service import AuthService
+from services.conversation.service import ConversationService
+from services.delivery.service import DeliveryService
+from services.file.service import FileService
+from services.message.service import MessageService
+from services.sync.service import SyncService
+from storage.repo import ConversationRepo, DeliveryRepo, FileRepo, MessageRepo, StoredSyncEvent, SyncRepo
+from storage.sqlite.db import MiniImSqliteDb
+from storage.sqlite.init_db import init_db
+from storage.sqlite.write_queue import SqliteWriteQueue
+
+
+FILE_STREAM_HEADER_PREFIX = b"MINIIMFILE1 "
+FILE_STREAM_HEADER_MAX = 512
+
+
+@dataclass
+class FileStreamState:
+    buffer: bytearray = field(default_factory=bytearray)
+    file_id: str = ""
+    initialized: bool = False
+
+
+@dataclass
+class FaultConfig:
+    file_drop_after_bytes: int = 0
+    file_drop_probability: float = 0.0
+
+
+class OnlineSessionHub:
+    def __init__(self) -> None:
+        self.m_protocols: dict[str, set["MiniImQuicProtocol"]] = {}
+
+    def register(self, user_id: str, protocol: "MiniImQuicProtocol") -> None:
+        bucket = self.m_protocols.get(user_id)
+        if bucket is None:
+            bucket = set()
+            self.m_protocols[user_id] = bucket
+        bucket.add(protocol)
+
+    def unregister(self, user_id: str, protocol: "MiniImQuicProtocol") -> None:
+        bucket = self.m_protocols.get(user_id)
+        if bucket is None:
+            return
+        bucket.discard(protocol)
+        if not bucket:
+            self.m_protocols.pop(user_id, None)
+
+    def fanout_sync_events(
+        self,
+        events: list[StoredSyncEvent],
+        exclude_protocol: "MiniImQuicProtocol | None" = None,
+    ) -> None:
+        for event in events:
+            for protocol in list(self.m_protocols.get(event.user_id, set())):
+                if exclude_protocol is not None and protocol is exclude_protocol:
+                    continue
+                protocol.send_sync_event(event)
+
+
+class MiniImQuicProtocol(QuicConnectionProtocol):
+    def __init__(
+        self,
+        *args,
+        auth_service: AuthService,
+        conversation_service: ConversationService,
+        delivery_service: DeliveryService,
+        file_service: FileService,
+        message_service: MessageService,
+        sync_service: SyncService,
+        online_hub: OnlineSessionHub,
+        fault_config: FaultConfig,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.m_auth_service = auth_service
+        self.m_conversation_service = conversation_service
+        self.m_delivery_service = delivery_service
+        self.m_file_service = file_service
+        self.m_message_service = message_service
+        self.m_sync_service = sync_service
+        self.m_online_hub = online_hub
+        self.m_fault_config = fault_config
+        self.m_user_id = ""
+        self.m_session_id = ""
+        self.m_device_id = ""
+        self.m_control_stream_id: int | None = None
+        self.m_control_stream_buffers: dict[int, bytearray] = {}
+        self.m_file_stream_states: dict[int, FileStreamState] = {}
+
+    @staticmethod
+    def _debug(message: str) -> None:
+        print(f"mini-im server | {message}")
+
+    @staticmethod
+    def _new_response_from_request(request: envelope_pb2.Envelope) -> envelope_pb2.Envelope:
+        response = envelope_pb2.Envelope()
+        response.version = 1
+        response.request_id = request.request_id
+        response.channel = request.channel
+        response.session_id = request.session_id
+        response.device_id = request.device_id
+        response.seq = request.seq
+        response.client_time_ms = request.client_time_ms
+        response.trace_id = request.trace_id
+        return response
+
+    def _send(self, stream_id: int, envelope: envelope_pb2.Envelope) -> None:
+        self._quic.send_stream_data(stream_id, EnvelopeCodec.encode_frame(envelope), end_stream=False)
+        self.transmit()
+
+    def _send_error(self, stream_id: int, request: envelope_pb2.Envelope, code: int, message: str) -> None:
+        response = self._new_response_from_request(request)
+        response.error.code = int(code)
+        response.error.message = message
+        response.error.detail = ""
+        self._send(stream_id, response)
+
+    def _send_file_updated(
+        self,
+        stream_id: int,
+        request: envelope_pb2.Envelope,
+        updated: file_pb2.FileUpdated,
+        sender_event: StoredSyncEvent | None,
+    ) -> None:
+        response = self._new_response_from_request(request)
+        if sender_event is not None:
+            response.seq = int(sender_event.global_seq)
+        response.file_updated.CopyFrom(updated)
+        self._send(stream_id, response)
+
+    def _send_download_stream(self, owner_user_id: str, source_file_id: str, target_file_id: str, offset: int) -> None:
+        source_path = self.m_file_service.get_storage_path(source_file_id)
+        target_transfer = self.m_file_service.get_transfer_for_upload(owner_user_id, target_file_id)
+        if source_path is None or target_transfer is None or not source_path.exists():
+            self._debug(
+                f"download stream skipped source={source_file_id} target={target_file_id} "
+                f"source_exists={source_path.exists() if source_path else False}"
+            )
+            return
+
+        stream_id = self._quic.get_next_available_stream_id(is_unidirectional=True)
+        self._debug(
+            f"download stream start stream={stream_id} source={source_file_id} target={target_file_id} "
+            f"offset={offset} size={target_transfer.file_size}"
+        )
+        header = FILE_STREAM_HEADER_PREFIX + target_file_id.encode("utf-8") + b"\n"
+        self._quic.send_stream_data(stream_id, header, end_stream=False)
+
+        sent = max(0, min(int(offset), int(target_transfer.file_size)))
+        if sent > 0:
+            _, sync_events = self.m_file_service.apply_download_progress(owner_user_id, target_file_id, sent)
+            if sync_events:
+                self.m_online_hub.fanout_sync_events(sync_events)
+
+        with source_path.open("rb") as f:
+            if sent > 0:
+                f.seek(sent)
+            while True:
+                chunk = f.read(64 * 1024)
+                if not chunk:
+                    break
+                sent += len(chunk)
+                self._debug(f"download stream chunk stream={stream_id} target={target_file_id} bytes={len(chunk)} sent={sent}")
+                self._quic.send_stream_data(stream_id, chunk, end_stream=False)
+                _, sync_events = self.m_file_service.apply_download_progress(owner_user_id, target_file_id, sent)
+                if sync_events:
+                    self.m_online_hub.fanout_sync_events(sync_events)
+
+        self._quic.send_stream_data(stream_id, b"", end_stream=True)
+        self._debug(f"download stream finish stream={stream_id} target={target_file_id} sent={sent}")
+        _, finish_events = self.m_file_service.complete_download(owner_user_id, target_file_id)
+        if finish_events:
+            self.m_online_hub.fanout_sync_events(finish_events)
+        self.transmit()
+
+    def send_sync_event(self, event: StoredSyncEvent) -> None:
+        if self.m_control_stream_id is None or not self.m_session_id:
+            return
+
+        envelope = envelope_pb2.Envelope()
+        envelope.version = 1
+        envelope.channel = 1
+        envelope.session_id = self.m_session_id
+        envelope.device_id = self.m_device_id
+        envelope.seq = int(event.global_seq)
+        envelope.client_time_ms = 0
+        envelope.trace_id = event.event_id
+
+        sync_event = sync_pb2.SyncEvent()
+        sync_event.event_id = event.event_id
+        if event.event_type == "message":
+            item = message_pb2.Message()
+            item.ParseFromString(event.payload)
+            sync_event.message.CopyFrom(item)
+        elif event.event_type == "receipt":
+            item = message_pb2.Receipt()
+            item.ParseFromString(event.payload)
+            sync_event.receipt.CopyFrom(item)
+        elif event.event_type == "recall":
+            item = message_pb2.Recall()
+            item.ParseFromString(event.payload)
+            sync_event.recall.CopyFrom(item)
+        elif event.event_type == "conversation_updated":
+            item = conversation_pb2.ConversationUpdated()
+            item.ParseFromString(event.payload)
+            sync_event.conversation_updated.CopyFrom(item)
+        elif event.event_type == "file_updated":
+            item = file_pb2.FileUpdated()
+            item.ParseFromString(event.payload)
+            sync_event.file_updated.CopyFrom(item)
+        else:
+            return
+
+        envelope.sync_response.new_global_cursor = int(event.global_seq)
+        envelope.sync_response.has_more = False
+        envelope.sync_response.events.append(sync_event)
+        self._send(self.m_control_stream_id, envelope)
+
+    def connection_lost(self, exc) -> None:
+        if self.m_user_id:
+            self.m_online_hub.unregister(self.m_user_id, self)
+        super().connection_lost(exc)
+
+    def _handle_file_stream_data(self, stream_id: int, data: bytes, end_stream: bool) -> None:
+        if not self.m_user_id:
+            return
+        state = self.m_file_stream_states.get(stream_id)
+        if state is None:
+            state = FileStreamState()
+            self.m_file_stream_states[stream_id] = state
+        state.buffer.extend(data)
+
+        if not state.initialized:
+            split = state.buffer.find(b"\n")
+            if split < 0:
+                if len(state.buffer) > FILE_STREAM_HEADER_MAX:
+                    self.m_file_stream_states.pop(stream_id, None)
+                return
+            raw_header = bytes(state.buffer[:split])
+            state.buffer = bytearray(state.buffer[split + 1 :])
+            if not raw_header.startswith(FILE_STREAM_HEADER_PREFIX):
+                self.m_file_stream_states.pop(stream_id, None)
+                return
+            file_id = raw_header[len(FILE_STREAM_HEADER_PREFIX) :].decode("utf-8", errors="ignore").strip()
+            if not file_id:
+                self.m_file_stream_states.pop(stream_id, None)
+                return
+            transfer = self.m_file_service.get_transfer_for_upload(self.m_user_id, file_id)
+            if transfer is None:
+                self.m_file_stream_states.pop(stream_id, None)
+                return
+            state.file_id = file_id
+            state.initialized = True
+
+        if state.initialized and state.buffer:
+            transfer = self.m_file_service.get_transfer_for_upload(self.m_user_id, state.file_id)
+            if transfer is None:
+                self.m_file_stream_states.pop(stream_id, None)
+                return
+            if self.m_fault_config.file_drop_after_bytes > 0:
+                projected = int(transfer.received_bytes) + len(state.buffer)
+                if projected >= self.m_fault_config.file_drop_after_bytes:
+                    self._quic.close(error_code=0x1001, reason_phrase="fault_injection_drop_after_bytes")
+                    self.transmit()
+                    self.m_file_stream_states.pop(stream_id, None)
+                    return
+            if self.m_fault_config.file_drop_probability > 0.0:
+                if random.random() < self.m_fault_config.file_drop_probability:
+                    self._quic.close(error_code=0x1002, reason_phrase="fault_injection_random_drop")
+                    self.transmit()
+                    self.m_file_stream_states.pop(stream_id, None)
+                    return
+
+            updated, sync_events = self.m_file_service.append_file_chunk(
+                user_id=self.m_user_id,
+                file_id=state.file_id,
+                chunk=bytes(state.buffer),
+            )
+            state.buffer.clear()
+            if updated is not None and sync_events:
+                self.m_online_hub.fanout_sync_events(sync_events)
+
+        if end_stream:
+            self.m_file_stream_states.pop(stream_id, None)
+
+    def quic_event_received(self, event):
+        if isinstance(event, ConnectionTerminated):
+            if self.m_user_id:
+                self.m_online_hub.unregister(self.m_user_id, self)
+            return
+        if not isinstance(event, StreamDataReceived):
+            return
+
+        if self.m_control_stream_id is not None and event.stream_id != self.m_control_stream_id:
+            self._handle_file_stream_data(event.stream_id, event.data, event.end_stream)
+            return
+
+        control_buffer = self.m_control_stream_buffers.get(event.stream_id)
+        if control_buffer is None:
+            control_buffer = bytearray()
+            self.m_control_stream_buffers[event.stream_id] = control_buffer
+        control_buffer.extend(event.data)
+
+        try:
+            envelopes = EnvelopeCodec.decode_frames(control_buffer)
+        except Exception:
+            self.m_control_stream_buffers.pop(event.stream_id, None)
+            self._quic.close(error_code=0x1003, reason_phrase="invalid_control_frame")
+            self.transmit()
+            return
+
+        for envelope in envelopes:
+            if envelope.HasField("hello"):
+                welcome = self.m_auth_service.handle_hello(envelope.hello)
+                self.m_conversation_service.ensure_user(welcome.user_id)
+                response = self._new_response_from_request(envelope)
+                response.session_id = welcome.session_id
+                response.welcome.CopyFrom(welcome)
+                self._send(event.stream_id, response)
+                continue
+
+            session = self.m_auth_service.get_session(envelope.session_id)
+            if session is None:
+                self._send_error(event.stream_id, envelope, 401, "invalid session")
+                continue
+
+            self.m_user_id = session.user_id
+            self.m_session_id = envelope.session_id
+            self.m_device_id = envelope.device_id
+            if self.m_control_stream_id is None:
+                self.m_control_stream_id = event.stream_id
+            self.m_online_hub.register(session.user_id, self)
+
+            if envelope.HasField("heartbeat"):
+                self.m_auth_service.touch_session(envelope.session_id)
+                ack = self._new_response_from_request(envelope)
+                ack.heartbeat.CopyFrom(auth_pb2.Heartbeat(ts_ms=envelope.heartbeat.ts_ms))
+                self._send(event.stream_id, ack)
+                continue
+
+            if envelope.HasField("send_message"):
+                result = self.m_message_service.handle_send_message(
+                    user_id=session.user_id,
+                    request_id=envelope.request_id,
+                    send_message=envelope.send_message,
+                )
+                ack_envelope = self._new_response_from_request(envelope)
+                ack_envelope.ack.CopyFrom(result.ack)
+                self._send(event.stream_id, ack_envelope)
+
+                if result.message_push is not None:
+                    sender_event = next(
+                        (item for item in result.sync_events if item.user_id == session.user_id),
+                        None,
+                    )
+                    push_envelope = self._new_response_from_request(envelope)
+                    if sender_event is not None:
+                        push_envelope.seq = int(sender_event.global_seq)
+                    push_envelope.message_push.CopyFrom(result.message_push)
+                    self._send(event.stream_id, push_envelope)
+
+                self.m_online_hub.fanout_sync_events(result.sync_events, exclude_protocol=self)
+                continue
+
+            if envelope.HasField("create_conversation"):
+                result = self.m_conversation_service.handle_create_conversation(
+                    user_id=session.user_id,
+                    request_id=envelope.request_id,
+                    create_conversation=envelope.create_conversation,
+                )
+                ack_envelope = self._new_response_from_request(envelope)
+                ack_envelope.ack.CopyFrom(result.ack)
+                self._send(event.stream_id, ack_envelope)
+                self.m_online_hub.fanout_sync_events(result.sync_events)
+                continue
+
+            if envelope.HasField("add_members"):
+                result = self.m_conversation_service.handle_add_members(
+                    user_id=session.user_id,
+                    request_id=envelope.request_id,
+                    add_members=envelope.add_members,
+                )
+                ack_envelope = self._new_response_from_request(envelope)
+                ack_envelope.ack.CopyFrom(result.ack)
+                self._send(event.stream_id, ack_envelope)
+                self.m_online_hub.fanout_sync_events(result.sync_events)
+                continue
+
+            if envelope.HasField("remove_members"):
+                result = self.m_conversation_service.handle_remove_members(
+                    user_id=session.user_id,
+                    request_id=envelope.request_id,
+                    remove_members=envelope.remove_members,
+                )
+                ack_envelope = self._new_response_from_request(envelope)
+                ack_envelope.ack.CopyFrom(result.ack)
+                self._send(event.stream_id, ack_envelope)
+                self.m_online_hub.fanout_sync_events(result.sync_events)
+                continue
+
+            if envelope.HasField("leave_conversation"):
+                result = self.m_conversation_service.handle_leave_conversation(
+                    user_id=session.user_id,
+                    request_id=envelope.request_id,
+                    leave_conversation=envelope.leave_conversation,
+                )
+                ack_envelope = self._new_response_from_request(envelope)
+                ack_envelope.ack.CopyFrom(result.ack)
+                self._send(event.stream_id, ack_envelope)
+                self.m_online_hub.fanout_sync_events(result.sync_events)
+                continue
+
+            if envelope.HasField("join_conversation"):
+                result = self.m_conversation_service.handle_join_conversation(
+                    user_id=session.user_id,
+                    request_id=envelope.request_id,
+                    join_conversation=envelope.join_conversation,
+                )
+                ack_envelope = self._new_response_from_request(envelope)
+                ack_envelope.ack.CopyFrom(result.ack)
+                self._send(event.stream_id, ack_envelope)
+                self.m_online_hub.fanout_sync_events(result.sync_events)
+                continue
+
+            if envelope.HasField("rename_conversation"):
+                result = self.m_conversation_service.handle_rename_conversation(
+                    user_id=session.user_id,
+                    request_id=envelope.request_id,
+                    rename_conversation=envelope.rename_conversation,
+                )
+                ack_envelope = self._new_response_from_request(envelope)
+                ack_envelope.ack.CopyFrom(result.ack)
+                self._send(event.stream_id, ack_envelope)
+                self.m_online_hub.fanout_sync_events(result.sync_events)
+                continue
+
+            if envelope.HasField("receipt"):
+                result = self.m_delivery_service.handle_receipt(
+                    user_id=session.user_id,
+                    request_id=envelope.request_id,
+                    receipt=envelope.receipt,
+                )
+                ack_envelope = self._new_response_from_request(envelope)
+                ack_envelope.ack.CopyFrom(result.ack)
+                self._send(event.stream_id, ack_envelope)
+                self.m_online_hub.fanout_sync_events(result.sync_events)
+                continue
+
+            if envelope.HasField("recall"):
+                result = self.m_delivery_service.handle_recall(
+                    user_id=session.user_id,
+                    request_id=envelope.request_id,
+                    recall=envelope.recall,
+                )
+                ack_envelope = self._new_response_from_request(envelope)
+                ack_envelope.ack.CopyFrom(result.ack)
+                self._send(event.stream_id, ack_envelope)
+                self.m_online_hub.fanout_sync_events(result.sync_events)
+                continue
+
+            if envelope.HasField("file_init"):
+                result = self.m_file_service.handle_file_init(
+                    user_id=session.user_id,
+                    request_id=envelope.request_id,
+                    file_init=envelope.file_init,
+                )
+                ack_envelope = self._new_response_from_request(envelope)
+                ack_envelope.ack.CopyFrom(result.ack)
+                self._send(event.stream_id, ack_envelope)
+                sender_event = next(
+                    (item for item in result.sync_events if item.user_id == session.user_id),
+                    None,
+                )
+                if result.file_updated is not None:
+                    self._send_file_updated(event.stream_id, envelope, result.file_updated, sender_event)
+                self.m_online_hub.fanout_sync_events(result.sync_events, exclude_protocol=self)
+                if result.start_download:
+                    self._send_download_stream(
+                        owner_user_id=session.user_id,
+                        source_file_id=envelope.file_init.source_file_id,
+                        target_file_id=result.download_file_id,
+                        offset=result.download_offset,
+                    )
+                continue
+
+            if envelope.HasField("file_finish"):
+                result = self.m_file_service.handle_file_finish(
+                    user_id=session.user_id,
+                    request_id=envelope.request_id,
+                    file_finish=envelope.file_finish,
+                )
+                ack_envelope = self._new_response_from_request(envelope)
+                ack_envelope.ack.CopyFrom(result.ack)
+                self._send(event.stream_id, ack_envelope)
+                sender_event = next(
+                    (item for item in result.sync_events if item.user_id == session.user_id),
+                    None,
+                )
+                if result.file_updated is not None:
+                    self._send_file_updated(event.stream_id, envelope, result.file_updated, sender_event)
+                self.m_online_hub.fanout_sync_events(result.sync_events)
+                continue
+
+            if envelope.HasField("sync_request"):
+                sync_response, new_global_cursor = self.m_sync_service.handle_sync_request(
+                    user_id=session.user_id,
+                    request=envelope.sync_request,
+                )
+                response = self._new_response_from_request(envelope)
+                response.seq = int(new_global_cursor)
+                response.sync_response.CopyFrom(sync_response)
+                self._send(event.stream_id, response)
+                continue
+
+            self._send_error(event.stream_id, envelope, 400, "unsupported envelope body")
+
+
+def ensure_dev_cert(cert_path: Path, key_path: Path) -> None:
+    if cert_path.exists() and key_path.exists():
+        return
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    subject = issuer = x509.Name(
+        [
+            x509.NameAttribute(NameOID.COUNTRY_NAME, "CN"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Mini-IM"),
+            x509.NameAttribute(NameOID.COMMON_NAME, "mini-im-dev"),
+        ]
+    )
+
+    now = datetime.now(timezone.utc)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(days=1))
+        .not_valid_after(now + timedelta(days=3650))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+
+    key_path.write_bytes(
+        key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    )
+    cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+
+
+async def run_burn_sweeper(
+    delivery_repo: DeliveryRepo,
+    online_hub: OnlineSessionHub,
+    interval_ms: int,
+    batch_size: int,
+    purge_batch_size: int,
+) -> None:
+    safe_interval_ms = max(int(interval_ms), 100)
+    safe_batch_size = max(int(batch_size), 1)
+    safe_purge_batch_size = max(int(purge_batch_size), 1)
+    while True:
+        try:
+            events = delivery_repo.collect_due_burn_sync_events(safe_batch_size)
+            if events:
+                online_hub.fanout_sync_events(events)
+            delivery_repo.purge_burned_message_content(safe_purge_batch_size)
+        except Exception as exc:  # pragma: no cover
+            print(f"mini-im burn sweeper error: {exc}")
+        await asyncio.sleep(safe_interval_ms / 1000.0)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return bool(default)
+    normalized = value.strip().lower()
+    return normalized in {"1", "true", "yes", "on"}
+
+
+async def run_server() -> None:
+    base_path = Path(__file__).resolve().parents[1]
+    cert_path = base_path / "quic" / "dev_cert.pem"
+    key_path = base_path / "quic" / "dev_key.pem"
+    db_path = base_path / "storage" / "sqlite" / "miniim.db"
+    file_root = Path(os.getenv("MINIIM_FILE_ROOT", str(base_path / "storage" / "files")))
+    file_stale_ms = int(os.getenv("MINIIM_FILE_STALE_MS", str(15 * 60 * 1000)))
+    fault_drop_after_bytes = int(os.getenv("MINIIM_FAULT_FILE_DROP_AFTER_BYTES", "0"))
+    fault_drop_probability = float(os.getenv("MINIIM_FAULT_FILE_DROP_PROBABILITY", "0"))
+    burn_enabled = _env_bool("MINIIM_BURN_ENABLED", True)
+    burn_sweep_interval_ms = int(os.getenv("MINIIM_BURN_SWEEP_INTERVAL_MS", "1000"))
+    burn_sweep_batch_size = int(os.getenv("MINIIM_BURN_SWEEP_BATCH_SIZE", "200"))
+    burn_purge_batch_size = int(os.getenv("MINIIM_BURN_PURGE_BATCH_SIZE", "200"))
+
+    ensure_dev_cert(cert_path, key_path)
+
+    init_db(db_path)
+    db = MiniImSqliteDb(db_path)
+    write_queue = SqliteWriteQueue(db)
+    await write_queue.start()
+
+    configuration = QuicConfiguration(is_client=False, alpn_protocols=["mini-im"])
+    configuration.load_cert_chain(str(cert_path), str(key_path))
+
+    auth_service = AuthService()
+    conversation_repo = ConversationRepo(db)
+    message_repo = MessageRepo(db)
+    delivery_repo = DeliveryRepo(db, burn_enabled=burn_enabled)
+    file_repo = FileRepo(db)
+    conversation_service = ConversationService(conversation_repo)
+    delivery_service = DeliveryService(delivery_repo)
+    file_service = FileService(
+        file_repo,
+        conversation_repo,
+        message_repo,
+        file_root=file_root,
+        stale_timeout_ms=max(file_stale_ms, 0),
+    )
+    message_service = MessageService(message_repo, conversation_repo, burn_enabled=burn_enabled)
+    sync_service = SyncService(SyncRepo(db))
+    online_hub = OnlineSessionHub()
+    fault_config = FaultConfig(
+        file_drop_after_bytes=max(fault_drop_after_bytes, 0),
+        file_drop_probability=min(max(fault_drop_probability, 0.0), 1.0),
+    )
+
+    server = await serve(
+        host="127.0.0.1",
+        port=4433,
+        configuration=configuration,
+        create_protocol=lambda *args, **kwargs: MiniImQuicProtocol(
+            *args,
+            auth_service=auth_service,
+            conversation_service=conversation_service,
+            delivery_service=delivery_service,
+            file_service=file_service,
+            message_service=message_service,
+            sync_service=sync_service,
+            online_hub=online_hub,
+            fault_config=fault_config,
+            **kwargs,
+        ),
+    )
+
+    burn_sweeper_task = None
+    if burn_enabled:
+        burn_sweeper_task = asyncio.create_task(
+            run_burn_sweeper(
+                delivery_repo=delivery_repo,
+                online_hub=online_hub,
+                interval_ms=burn_sweep_interval_ms,
+                batch_size=burn_sweep_batch_size,
+                purge_batch_size=burn_purge_batch_size,
+            )
+        )
+
+    print("mini-im quic server listening at 127.0.0.1:4433")
+    try:
+        await asyncio.Future()
+    finally:
+        if burn_sweeper_task is not None:
+            burn_sweeper_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await burn_sweeper_task
+        server.close()
+        await write_queue.stop()
+        db.close()

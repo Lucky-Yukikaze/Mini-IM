@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package im.auth;
+
+message Capability {
+  string name = 1;
+  string value = 2;
+}
+
+message Hello {
+  string token = 1;
+  string device_id = 2;
+  uint64 global_cursor = 3;
+  string resume_session_id = 4;
+  string last_acked_request_id = 5;
+  repeated Capability capabilities = 6;
+}
+
+message Welcome {
+  string session_id = 1;
+  string user_id = 2;
+  int64 server_time_ms = 3;
+  uint32 heartbeat_interval_sec = 4;
+  uint64 global_cursor = 5;
+  bool resumable = 6;
+  bool need_reauth = 7;
+}
+
+message Heartbeat {
+  int64 ts_ms = 1;
+}

@@ -1,0 +1,59 @@
+syntax = "proto3";
+
+package im.message;
+
+import "common.proto";
+
+message SendMessage {
+  string conversation_id = 1;
+  string client_msg_id = 2;
+  im.common.MessageType type = 3;
+  bytes content = 4;
+  uint32 burn_mode = 10;
+  uint32 burn_ttl_sec = 11;
+}
+
+message Message {
+  string message_id = 1;
+  string conversation_id = 2;
+  string sender_id = 3;
+  string client_msg_id = 4;
+  uint64 seq = 5;
+  im.common.MessageType type = 6;
+  bytes content = 7;
+  int64 created_at_ms = 8;
+  bool recalled = 9;
+  uint32 unread_count = 10;
+  uint32 burn_mode = 11;
+  uint32 burn_ttl_sec = 12;
+}
+
+message MessagePush {
+  string event_id = 1;
+  repeated Message messages = 2;
+}
+
+message Ack {
+  string request_id = 1;
+  bool success = 2;
+  int32 code = 3;
+  string message = 4;
+  string entity_id = 5;
+  int64 server_time_ms = 6;
+}
+
+message Receipt {
+  string event_id = 1;
+  string conversation_id = 2;
+  uint64 last_read_seq = 3;
+  int64 read_at_ms = 4;
+  string reader_id = 5;
+}
+
+message Recall {
+  string event_id = 1;
+  string conversation_id = 2;
+  string message_id = 3;
+  int64 ts_ms = 4;
+  string operator_id = 5;
+}

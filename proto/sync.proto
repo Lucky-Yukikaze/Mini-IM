@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package im.sync;
+
+import "conversation.proto";
+import "file.proto";
+import "message.proto";
+
+message SyncRequest {
+  uint64 global_cursor = 1;
+  uint32 limit = 2;
+  string conversation_id = 3;
+  uint64 conversation_cursor = 4;
+}
+
+message SyncEvent {
+  string event_id = 1;
+  oneof body {
+    im.message.Message message = 10;
+    im.message.Recall recall = 11;
+    im.message.Receipt receipt = 12;
+    im.conversation.ConversationUpdated conversation_updated = 13;
+    im.file.FileUpdated file_updated = 14;
+  }
+}
+
+message SyncResponse {
+  uint64 new_global_cursor = 1;
+  repeated SyncEvent events = 2;
+  bool has_more = 3;
+}
