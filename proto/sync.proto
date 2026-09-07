@@ -15,6 +15,7 @@ message SyncRequest {
 
 message SyncEvent {
   string event_id = 1;
+  uint64 global_seq = 2;
   oneof body {
     im.message.Message message = 10;
     im.message.Recall recall = 11;

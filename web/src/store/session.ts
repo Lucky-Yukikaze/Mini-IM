@@ -5,6 +5,7 @@ import type {
   InitialStatePayload,
   FileProgressItem,
   MessageItem,
+  MessageSendItem,
   MessageUpdate
 } from '../types';
 
@@ -14,6 +15,7 @@ interface SessionStoreState {
   globalCursor: number;
   unreadTotal: number;
   conversations: ConversationItem[];
+  messageSends: MessageSendItem[];
   activeConversationId: string;
   activeConversationLabel: string;
   messagesByConversation: Record<string, MessageItem[]>;
@@ -66,7 +68,16 @@ function compareMessages(left: MessageItem, right: MessageItem): number {
 
 function upsertSortedMessage(list: MessageItem[], item: MessageItem): void {
   const existingIndex = list.findIndex((existing) => existing.id === item.id);
-  const nextItem = existingIndex >= 0 ? { ...list[existingIndex], ...item } : item;
+  const existing = list[existingIndex];
+  const nextItem = existing ? {
+    ...existing,
+    ...item,
+    recalled: existing.recalled || item.recalled,
+    burned: existing.burned || item.burned
+  } : item;
+  if (nextItem.recalled || nextItem.burned) {
+    nextItem.text = '';
+  }
   if (existingIndex >= 0) {
     list.splice(existingIndex, 1);
   }
@@ -114,6 +125,7 @@ export const useSessionStore = defineStore('session', {
     globalCursor: 0,
     unreadTotal: 0,
     conversations: [],
+    messageSends: [],
     activeConversationId: '',
     activeConversationLabel: '-',
     messagesByConversation: {},
@@ -122,6 +134,9 @@ export const useSessionStore = defineStore('session', {
     pendingMessageStateByConversation: {}
   }),
   getters: {
+    currentMessageSends(state): MessageSendItem[] {
+      return state.messageSends.filter((item) => item.conversationId === state.activeConversationId);
+    },
     currentMessages(state): MessageItem[] {
       return state.messagesByConversation[state.activeConversationId] ?? [];
     },
@@ -140,8 +155,17 @@ export const useSessionStore = defineStore('session', {
       this.activeConversationId = conversationId;
       this.activeConversationLabel = getConversationLabel(this.conversations, conversationId, this.currentUserId);
     },
+    applyMessageSends(items: MessageSendItem[]): void {
+      this.messageSends = items;
+    },
     applyInitialState(payload: InitialStatePayload): void {
-      this.currentUserId = payload.currentUser?.userId ?? '';
+      const userId = payload.currentUser?.userId ?? '';
+      if (userId !== this.currentUserId) {
+        const connection = this.connection;
+        this.$reset();
+        this.connection = connection;
+      }
+      this.currentUserId = userId;
       if (payload.globalCursor !== undefined) {
         this.globalCursor = payload.globalCursor;
       }
@@ -150,6 +174,16 @@ export const useSessionStore = defineStore('session', {
       }
       if (payload.conversations !== undefined) {
         this.conversations = payload.conversations;
+      }
+      if (payload.readProgressByConversation !== undefined) {
+        this.readProgressByConversation = payload.readProgressByConversation;
+      }
+      if (payload.messageSends !== undefined) {
+        this.applyMessageSends(payload.messageSends);
+      }
+      if (payload.files !== undefined) {
+        this.fileProgressByConversation = {};
+        for (const file of payload.files) this.applyFileProgress(file);
       }
       if (payload.recentMessages !== undefined) {
         this.messagesByConversation = {};
@@ -241,6 +275,7 @@ export const useSessionStore = defineStore('session', {
         const item = list.find((message) => message.id === update.messageId);
         if (item) {
           item.recalled = true;
+          item.text = '';
           if (update.type === 'burn' || update.operatorId === 'system-burn') {
             item.burned = true;
           }

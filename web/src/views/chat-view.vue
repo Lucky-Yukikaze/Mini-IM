@@ -6,7 +6,7 @@
       @direct="dialogMode = 'direct'"
     />
 
-    <main class="chat-pane">
+    <main class="chat-pane" :class="{ 'has-pending-messages': session.currentMessageSends.length > 0 }">
       <header class="chat-header">
         <div class="chat-title">
           <h2>{{ session.activeConversationLabel }}</h2>
@@ -30,10 +30,20 @@
         @fill-download="onFillDownload"
       />
 
+      <section v-if="session.currentMessageSends.length" class="pending-message-list" aria-label="待发送消息">
+        <div v-for="item in session.currentMessageSends" :key="item.clientMsgId" class="pending-message">
+          <span class="pending-message-text">{{ item.text }}</span>
+          <span>{{ item.status === 'failed' ? '发送失败' : item.code ? '等待重试' : '发送中' }}</span>
+          <span v-if="item.error" class="muted-text">{{ item.error }}</span>
+          <button v-if="item.status === 'failed'" class="secondary-button"
+            :disabled="session.connection.state !== 'connected'" @click="onRetryMessage(item.clientMsgId)">重试</button>
+        </div>
+      </section>
+
       <MessageComposer
         :disabled="!canSendToActiveConversation"
         :download-file-id-preset="downloadFileIdPreset"
-        @send="onSend"
+        :send-message="onSend"
         @send-file="onSendFile"
         @download-file="onDownloadFile"
       />
@@ -126,7 +136,7 @@
 import { computed, onMounted, ref, watch } from 'vue';
 import {
   addMembers,
-  connectWithResume,
+  connect,
   createConversation,
   createDirectConversation,
   disconnect,
@@ -135,6 +145,7 @@ import {
   joinConversation,
   leaveConversation,
   recallMessage,
+  retryMessage,
   removeMembers,
   renameConversation,
   sendFile,
@@ -154,6 +165,7 @@ import type {
   FileProgressItem,
   InitialStatePayload,
   MessageItem,
+  MessageSendItem,
   MessageUpdate
 } from '../types';
 
@@ -195,9 +207,8 @@ function showNotice(message: string): void {
 }
 
 function syncReceiptForCurrentConversation(): void {
-  const lastMessage = [...session.currentMessages]
-    .filter((item) => item.senderId !== session.currentUserId)
-    .at(-1);
+  const receivedMessages = session.currentMessages.filter((item) => item.senderId !== session.currentUserId);
+  const lastMessage = receivedMessages[receivedMessages.length - 1];
   if (!lastMessage || !session.activeConversationId) {
     return;
   }
@@ -239,7 +250,20 @@ bridgeEvents.on('connectionChanged', (payload) => {
 });
 
 bridgeEvents.on('initialStateLoaded', (payload) => {
+  if (messageFlushFrame > 0) {
+    window.cancelAnimationFrame(messageFlushFrame);
+    messageFlushFrame = 0;
+  }
+  pendingMessages.splice(0);
   session.applyInitialState(payload as InitialStatePayload);
+});
+
+bridgeEvents.on('messageSendsChanged', (payload) => {
+  session.applyMessageSends((payload as { items: MessageSendItem[] }).items);
+});
+
+bridgeEvents.on('syncProgress', (payload) => {
+  session.globalCursor = (payload as { globalCursor: number }).globalCursor;
 });
 
 bridgeEvents.on('conversationUpdated', (payload) => {
@@ -295,20 +319,14 @@ onMounted(async () => {
 
 async function onConnect(endpoint: string, token: string, deviceId: string): Promise<void> {
   session.setConnection({ state: 'connecting', sessionId: '' });
-  const ok = await connectWithResume(
-    endpoint,
-    token,
-    deviceId,
-    session.connection.sessionId,
-    session.globalCursor,
-    ''
-  );
-  if (ok) {
-    if (session.connection.state === 'connecting') {
-      session.setConnection({ state: 'connected', sessionId: session.connection.sessionId });
+  try {
+    const accepted = await connect(endpoint, token, deviceId);
+    if (!accepted) {
+      session.setConnection({ state: 'error', sessionId: '' });
     }
-  } else {
+  } catch (error) {
     session.setConnection({ state: 'error', sessionId: '' });
+    showNotice(String(error));
   }
 }
 
@@ -372,11 +390,24 @@ function onJoinConversation(conversationId: string): void {
   }
 }
 
-function onSend(text: string, burnMode: number, burnTtlSec: number): void {
-  if (!session.activeConversationId) {
-    return;
+async function onSend(text: string, burnMode: number, burnTtlSec: number): Promise<boolean> {
+  if (!session.activeConversationId) return false;
+  try {
+    const accepted = await sendMessage(session.activeConversationId, text, burnMode, burnTtlSec);
+    if (!accepted) showNotice('消息未能保存，请重试');
+    return accepted;
+  } catch (error) {
+    showNotice(String(error));
+    return false;
   }
-  sendMessage(session.activeConversationId, text, burnMode, burnTtlSec);
+}
+
+async function onRetryMessage(clientMsgId: string): Promise<void> {
+  try {
+    if (!await retryMessage(session.activeConversationId, clientMsgId)) showNotice('暂时无法重试此消息');
+  } catch (error) {
+    showNotice(String(error));
+  }
 }
 
 function onRecall(conversationId: string, messageId: string): void {
@@ -401,3 +432,10 @@ function onDownloadFile(fileId: string, savePath: string): void {
   downloadFile(session.activeConversationId, fileId, savePath, 0);
 }
 </script>
+
+<style scoped>
+.chat-pane.has-pending-messages { grid-template-rows: auto minmax(0, 1fr) auto auto; }
+.pending-message-list { padding: 8px 20px; max-height: 160px; overflow-y: auto; }
+.pending-message { display: flex; align-items: center; gap: 10px; padding: 6px 0; font-size: 13px; }
+.pending-message-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+</style>

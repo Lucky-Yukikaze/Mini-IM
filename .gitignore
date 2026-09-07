@@ -24,3 +24,7 @@ __pycache__/
 
 # Temporary investigation outputs
 /tmp/
+
+# Local browser verification artifacts
+/.playwright-cli/
+/output/playwright/

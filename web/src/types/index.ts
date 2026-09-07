@@ -23,7 +23,7 @@ export interface ConversationItem {
 }
 
 export interface ConnectionState {
-  state: 'idle' | 'connecting' | 'connected' | 'disconnected' | 'error';
+  state: 'idle' | 'connecting' | 'reconnecting' | 'connected' | 'disconnected' | 'error';
   sessionId: string;
 }
 
@@ -35,6 +35,9 @@ export interface InitialStatePayload {
   recentMessages?: MessageItem[];
   unreadTotal?: number;
   globalCursor?: number;
+  readProgressByConversation?: Record<string, Record<string, number>>;
+  files?: FileProgressItem[];
+  messageSends?: MessageSendItem[];
 }
 
 export interface ReceiptUpdate {
@@ -74,4 +77,18 @@ export interface FileProgressItem {
   completed: boolean;
   version: number;
   updatedAtMs: number;
+}
+
+export interface MessageSendItem {
+  requestId: string;
+  conversationId: string;
+  clientMsgId: string;
+  text: string;
+  burnMode: number;
+  burnTtlSec: number;
+  status: 'pending' | 'failed';
+  code: number;
+  error: string;
+  createdAtMs: number;
+  attempts: number;
 }

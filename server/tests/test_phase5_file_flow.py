@@ -332,12 +332,20 @@ class Phase5FileFlowTest(unittest.TestCase):
             dl_file_id = dl_init.download_file_id
             self.assertTrue(dl_file_id)
 
-            updated, _ = file_service.apply_download_progress("u-bob", dl_file_id, 10)
-            self.assertIsNotNone(updated)
-            done, sync_events = file_service.complete_download("u-bob", dl_file_id)
-            self.assertIsNotNone(done)
-            self.assertTrue(done.completed)
-            self.assertGreaterEqual(len(sync_events), 1)
+            incomplete = file_service.handle_file_finish(
+                "u-bob", "req-dl-finish-incomplete",
+                file_pb2.FileFinish(file_id=dl_file_id, success=True, transferred_bytes=10, sha256=sha256),
+            )
+            self.assertFalse(incomplete.ack.success)
+            done = file_service.handle_file_finish(
+                "u-bob", "req-dl-finish",
+                file_pb2.FileFinish(
+                    file_id=dl_file_id, success=True, transferred_bytes=len(payload), sha256=sha256,
+                ),
+            )
+            self.assertTrue(done.ack.success)
+            self.assertTrue(done.file_updated.completed)
+            self.assertGreaterEqual(len(done.sync_events), 1)
 
             bob_sync, _ = sync_service.handle_sync_request(
                 user_id="u-bob",

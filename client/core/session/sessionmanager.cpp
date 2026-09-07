@@ -1,4 +1,7 @@
 #include "core/session/sessionmanager.h"
+#include "core/file/downloadsink.h"
+#include "core/file/uploadstream.h"
+#include "core/model/eventmapper.h"
 
 #include <QByteArray>
 #include <QCoreApplication>
@@ -12,11 +15,14 @@
 #include <QUuid>
 #include <QUrl>
 #include <QStringList>
+#include <QStandardPaths>
+#include <QRegularExpression>
 
 #include <QtEndian>
 
 #include <cstring>
 #include <string>
+#include <stdexcept>
 
 #ifdef SendMessage
 #undef SendMessage
@@ -35,11 +41,13 @@ namespace
 constexpr const char* kAlpn = "mini-im";
 constexpr int kDefaultHeartbeatIntervalSec = 15;
 constexpr quint32 kEnvelopeFrameHeaderSize = 4;
+constexpr quint64 kReceiveBatchSize = 64 * 1024;
+constexpr int kRequestRetryMs = 5000;
 
 struct StreamSendContext
 {
     QUIC_BUFFER buffer;
-    uint8_t* data = nullptr;
+    QByteArray data;
 };
 
 bool IsClientDebugLogEnabled()
@@ -67,89 +75,6 @@ void AppendClientLog(const QString& message)
            << QStringLiteral(" | ")
            << message
            << Qt::endl;
-}
-
-QVariantMap BuildMessagePayload(const im::message::Message& message)
-{
-    const std::string content = message.content();
-    QVariantMap item;
-    item.insert(QStringLiteral("id"), QString::fromStdString(message.message_id()));
-    item.insert(QStringLiteral("conversationId"), QString::fromStdString(message.conversation_id()));
-    item.insert(QStringLiteral("senderId"), QString::fromStdString(message.sender_id()));
-    item.insert(QStringLiteral("clientMsgId"), QString::fromStdString(message.client_msg_id()));
-    item.insert(QStringLiteral("seq"), static_cast<qulonglong>(message.seq()));
-    item.insert(QStringLiteral("text"), QString::fromUtf8(content.data(), static_cast<int>(content.size())));
-    item.insert(QStringLiteral("createdAtMs"), static_cast<qlonglong>(message.created_at_ms()));
-    item.insert(QStringLiteral("recalled"), message.recalled());
-    item.insert(QStringLiteral("unreadCount"), static_cast<uint>(message.unread_count()));
-    item.insert(QStringLiteral("burnMode"), static_cast<uint>(message.burn_mode()));
-    item.insert(QStringLiteral("burnTtlSec"), static_cast<uint>(message.burn_ttl_sec()));
-    return item;
-}
-
-QVariantMap BuildConversationPayload(const im::conversation::ConversationUpdated& updated)
-{
-    QVariantMap payload;
-    QVariantList member_ids;
-    for (const auto& member_id : updated.member_ids())
-    {
-        member_ids.append(QString::fromStdString(member_id));
-    }
-    payload.insert(QStringLiteral("eventId"), QString::fromStdString(updated.event_id()));
-    payload.insert(QStringLiteral("conversationId"), QString::fromStdString(updated.conversation_id()));
-    payload.insert(QStringLiteral("updatedAtMs"), static_cast<qlonglong>(updated.updated_at_ms()));
-    payload.insert(QStringLiteral("title"), QString::fromStdString(updated.title()));
-    payload.insert(QStringLiteral("type"), updated.type() == im::common::CONVERSATION_GROUP ? QStringLiteral("group") : QStringLiteral("direct"));
-    payload.insert(QStringLiteral("ownerId"), QString::fromStdString(updated.owner_id()));
-    payload.insert(QStringLiteral("memberIds"), member_ids);
-    return payload;
-}
-
-QVariantMap BuildReceiptPayload(const im::message::Receipt& receipt)
-{
-    QVariantMap payload;
-    payload.insert(QStringLiteral("type"), QStringLiteral("receipt"));
-    payload.insert(QStringLiteral("eventId"), QString::fromStdString(receipt.event_id()));
-    payload.insert(QStringLiteral("conversationId"), QString::fromStdString(receipt.conversation_id()));
-    payload.insert(QStringLiteral("lastReadSeq"), static_cast<qulonglong>(receipt.last_read_seq()));
-    payload.insert(QStringLiteral("readAtMs"), static_cast<qlonglong>(receipt.read_at_ms()));
-    payload.insert(QStringLiteral("readerId"), QString::fromStdString(receipt.reader_id()));
-    return payload;
-}
-
-QVariantMap BuildRecallPayload(const im::message::Recall& recall)
-{
-    QVariantMap payload;
-    const QString operator_id = QString::fromStdString(recall.operator_id());
-    payload.insert(
-        QStringLiteral("type"),
-        operator_id == QStringLiteral("system-burn") ? QStringLiteral("burn") : QStringLiteral("recall"));
-    payload.insert(QStringLiteral("eventId"), QString::fromStdString(recall.event_id()));
-    payload.insert(QStringLiteral("conversationId"), QString::fromStdString(recall.conversation_id()));
-    payload.insert(QStringLiteral("messageId"), QString::fromStdString(recall.message_id()));
-    payload.insert(QStringLiteral("tsMs"), static_cast<qlonglong>(recall.ts_ms()));
-    payload.insert(QStringLiteral("operatorId"), operator_id);
-    return payload;
-}
-
-QVariantMap BuildFileProgressPayload(
-    const std::string& event_id,
-    const std::string& file_id,
-    const std::string& conversation_id,
-    quint64 transferred_bytes,
-    bool completed,
-    quint64 version,
-    qlonglong updated_at_ms)
-{
-    QVariantMap payload;
-    payload.insert(QStringLiteral("eventId"), QString::fromStdString(event_id));
-    payload.insert(QStringLiteral("fileId"), QString::fromStdString(file_id));
-    payload.insert(QStringLiteral("conversationId"), QString::fromStdString(conversation_id));
-    payload.insert(QStringLiteral("transferredBytes"), static_cast<qulonglong>(transferred_bytes));
-    payload.insert(QStringLiteral("completed"), completed);
-    payload.insert(QStringLiteral("version"), static_cast<qulonglong>(version));
-    payload.insert(QStringLiteral("updatedAtMs"), updated_at_ms);
-    return payload;
 }
 
 QByteArray BuildEnvelopeFrame(const std::string& payload)
@@ -181,6 +106,19 @@ MiniImSessionManager::MiniImSessionManager(QObject* parent)
       m_connection(nullptr),
       m_stream(nullptr)
 {
+    QObject::connect(&m_recovery, &MiniImConnectionRecovery::attemptRequested, this,
+        [this]() { startConnectionAttempt(); });
+    QObject::connect(&m_recovery, &MiniImConnectionRecovery::loginTimedOut, this,
+        [this]() { restartConnection(QStringLiteral("login timed out")); });
+    QObject::connect(&m_recovery, &MiniImConnectionRecovery::retryScheduled, this,
+        [this](int delayMs)
+        {
+            AppendClientLog(QStringLiteral("reconnect scheduled delay_ms=%1").arg(delayMs));
+            emit connectionChanged(QStringLiteral("reconnecting"), m_session_id);
+        });
+    m_heartbeat_timer.setTimerType(Qt::PreciseTimer);
+    m_messageRetryTimer.setInterval(500);
+    QObject::connect(&m_messageRetryTimer, &QTimer::timeout, this, &MiniImSessionManager::pumpMessageOutbox);
     m_heartbeat_timer.setSingleShot(false);
     QObject::connect(&m_heartbeat_timer, &QTimer::timeout, this, &MiniImSessionManager::onHeartbeatTimeout);
 }
@@ -229,12 +167,54 @@ bool MiniImSessionManager::connectToServerWithResume(
         return false;
     }
 
+    Q_UNUSED(resume_session_id);
+    Q_UNUSED(last_acked_request_id);
+    Q_UNUSED(global_cursor);
+    QString stateHost;
+    uint16_t statePort = 0;
+    if (!parseEndpoint(endpoint, &stateHost, &statePort))
+    {
+        emit errorRaised(QStringLiteral("invalid endpoint"));
+        return false;
+    }
+    m_recovery.stop();
     m_endpoint = endpoint;
     m_token = token;
     m_device_id = device_id;
-    m_resume_session_id = resume_session_id;
-    m_last_acked_request_id = last_acked_request_id;
-    m_global_cursor = global_cursor;
+    const QString prefix = QStringLiteral("dev-token:");
+    const QString user = token.startsWith(prefix) ? token.mid(prefix.size()).trimmed() : QString();
+    static const QRegularExpression userPattern(QStringLiteral("^[A-Za-z0-9_.-]{1,64}$"));
+    m_userId = userPattern.match(user).hasMatch() ? user : QStringLiteral("u-demo");
+    QString stateRoot = qEnvironmentVariable("MINIIM_STATE_ROOT");
+    if (stateRoot.isEmpty())
+    {
+        stateRoot = QDir(QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation))
+            .filePath(QStringLiteral("state"));
+    }
+    const QString identity = stateHost.toLower() + QStringLiteral(":") + QString::number(statePort);
+    if (!m_stateStore.open(stateRoot, identity, m_userId, device_id))
+    {
+        emit errorRaised(m_stateStore.errorString());
+        return false;
+    }
+    m_recovery.start();
+    startConnectionAttempt();
+    return m_recovery.enabled();
+}
+
+bool MiniImSessionManager::startConnectionAttempt()
+{
+    if (!m_recovery.enabled() || m_connection != nullptr)
+    {
+        return false;
+    }
+    m_transportStopping = false;
+    m_recovery.beginAttempt();
+    m_resume_session_id = m_stateStore.sessionId();
+    m_last_acked_request_id = m_stateStore.lastAck();
+    m_global_cursor = m_stateStore.cursor();
+    m_syncRequestId.clear();
+    m_latest_file_versions.clear();
     m_seq = 0;
     m_heartbeat_interval_sec = kDefaultHeartbeatIntervalSec;
     m_hello_sent = false;
@@ -252,18 +232,19 @@ bool MiniImSessionManager::connectToServerWithResume(
 
     QString host;
     uint16_t port = 0;
-    if (!parseEndpoint(endpoint, &host, &port))
+    if (!parseEndpoint(m_endpoint, &host, &port))
     {
-        AppendClientLog(QStringLiteral("parseEndpoint failed: %1").arg(endpoint));
+        AppendClientLog(QStringLiteral("parseEndpoint failed: %1").arg(m_endpoint));
         emitConnectionError(QStringLiteral("invalid endpoint"));
         return false;
     }
     AppendClientLog(QStringLiteral("endpoint parsed host=%1 port=%2").arg(host).arg(port));
 
+    m_callbackContext = std::make_unique<CallbackContext>(CallbackContext{this, m_connectionGeneration});
     const QUIC_STATUS open_status = m_msquic->ConnectionOpen(
         m_registration,
         &MiniImSessionManager::handleConnectionEvent,
-        this,
+        m_callbackContext.get(),
         &m_connection);
     if (QUIC_FAILED(open_status))
     {
@@ -283,8 +264,7 @@ bool MiniImSessionManager::connectToServerWithResume(
         port);
     if (QUIC_FAILED(start_status))
     {
-        m_msquic->ConnectionClose(m_connection);
-        m_connection = nullptr;
+        closeConnectionHandle();
         AppendClientLog(QStringLiteral("ConnectionStart failed status=%1").arg(start_status));
         emitConnectionError(QStringLiteral("msquic connection start failed: %1").arg(start_status));
         return false;
@@ -296,6 +276,8 @@ bool MiniImSessionManager::connectToServerWithResume(
 
 void MiniImSessionManager::disconnectFromServer()
 {
+    m_recovery.stop();
+    m_transportStopping = true;
     m_heartbeat_timer.stop();
     resetRuntimeState();
     if (m_connection != nullptr && m_msquic != nullptr)
@@ -303,12 +285,36 @@ void MiniImSessionManager::disconnectFromServer()
         m_msquic->ConnectionShutdown(m_connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
         return;
     }
+    m_connected = false;
+    m_connecting = false;
+    emit connectionChanged(QStringLiteral("disconnected"), m_session_id);
+}
 
-    if (m_connected || m_connecting)
+void MiniImSessionManager::restartConnection(const QString& reason, bool clearSession)
+{
+    if (!m_recovery.enabled() || m_transportStopping)
     {
-        m_connected = false;
+        return;
+    }
+    emit errorRaised(reason);
+    m_transportStopping = true;
+    m_connected = false;
+    m_heartbeat_timer.stop();
+    resetRuntimeState();
+    if (clearSession && !m_stateStore.saveSession(QStringLiteral(""), m_last_acked_request_id))
+    {
+        emit errorRaised(m_stateStore.errorString());
+        disconnectFromServer();
+        return;
+    }
+    if (m_connection != nullptr)
+    {
+        m_msquic->ConnectionShutdown(m_connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+    }
+    else
+    {
         m_connecting = false;
-        emit connectionChanged(QStringLiteral("disconnected"), m_session_id);
+        m_recovery.connectionLost();
     }
 }
 
@@ -316,6 +322,11 @@ void MiniImSessionManager::onHeartbeatTimeout()
 {
     if (!m_connected)
     {
+        return;
+    }
+    if (m_lastResponseTime.isValid() && m_lastResponseTime.elapsed() >= m_heartbeat_interval_sec * 2000LL)
+    {
+        restartConnection(QStringLiteral("server response timed out"));
         return;
     }
     if (!sendHeartbeat())
@@ -329,11 +340,13 @@ QUIC_STATUS QUIC_API MiniImSessionManager::handleConnectionEvent(
     void* context,
     QUIC_CONNECTION_EVENT* event)
 {
-    auto* manager = static_cast<MiniImSessionManager*>(context);
-    if (manager == nullptr)
+    const auto* callback = static_cast<CallbackContext*>(context);
+    if (callback == nullptr || callback->manager == nullptr)
     {
         return QUIC_STATUS_INTERNAL_ERROR;
     }
+    auto* manager = callback->manager;
+    const quint64 generation = callback->generation;
 
     switch (event->Type)
     {
@@ -342,10 +355,14 @@ QUIC_STATUS QUIC_API MiniImSessionManager::handleConnectionEvent(
         AppendClientLog(QStringLiteral("connection event: CONNECTED"));
         QMetaObject::invokeMethod(
             manager,
-            [manager]()
+            [manager, generation]()
             {
+                if (generation != manager->m_connectionGeneration)
+                {
+                    return;
+                }
                 AppendClientLog(QStringLiteral("queued CONNECTED handler begin"));
-                if (manager->m_connection == nullptr || manager->m_stream != nullptr)
+                if (manager->m_transportStopping || manager->m_connection == nullptr || manager->m_stream != nullptr)
                 {
                     AppendClientLog(QStringLiteral("queued CONNECTED handler skipped"));
                     return;
@@ -355,7 +372,7 @@ QUIC_STATUS QUIC_API MiniImSessionManager::handleConnectionEvent(
                     manager->m_connection,
                     QUIC_STREAM_OPEN_FLAG_NONE,
                     &MiniImSessionManager::handleStreamEvent,
-                    manager,
+                    manager->m_callbackContext.get(),
                     &manager->m_stream);
                 if (QUIC_FAILED(open_status))
                 {
@@ -406,7 +423,7 @@ QUIC_STATUS QUIC_API MiniImSessionManager::handleConnectionEvent(
             manager->m_msquic->SetCallbackHandler(
                 peer_stream,
                 reinterpret_cast<void*>(MiniImSessionManager::handleStreamEvent),
-                manager);
+                context);
         }
         break;
     }
@@ -416,8 +433,12 @@ QUIC_STATUS QUIC_API MiniImSessionManager::handleConnectionEvent(
         AppendClientLog(QStringLiteral("connection event: TRANSPORT_SHUTDOWN status=%1").arg(error_code));
         QMetaObject::invokeMethod(
             manager,
-            [manager, error_code]()
+            [manager, generation, error_code]()
             {
+                if (generation != manager->m_connectionGeneration)
+                {
+                    return;
+                }
                 emit manager->errorRaised(QStringLiteral("transport shutdown: %1").arg(error_code));
             },
             Qt::QueuedConnection);
@@ -428,20 +449,22 @@ QUIC_STATUS QUIC_API MiniImSessionManager::handleConnectionEvent(
         AppendClientLog(QStringLiteral("connection event: SHUTDOWN_COMPLETE"));
         QMetaObject::invokeMethod(
             manager,
-            [manager]()
+            [manager, generation]()
             {
+                if (generation != manager->m_connectionGeneration)
+                {
+                    return;
+                }
                 AppendClientLog(QStringLiteral("queued SHUTDOWN_COMPLETE handler begin"));
                 manager->m_heartbeat_timer.stop();
                 manager->resetRuntimeState();
+                manager->closeControlStreamHandle();
                 manager->closeConnectionHandle();
-                const bool should_emit = manager->m_connected || manager->m_connecting;
                 manager->m_connected = false;
                 manager->m_connecting = false;
                 manager->m_hello_sent = false;
-                if (should_emit)
-                {
-                    emit manager->connectionChanged(QStringLiteral("disconnected"), manager->m_session_id);
-                }
+                emit manager->connectionChanged(QStringLiteral("disconnected"), manager->m_session_id);
+                manager->m_recovery.connectionLost();
             },
             Qt::QueuedConnection);
         break;
@@ -456,10 +479,26 @@ QUIC_STATUS QUIC_API MiniImSessionManager::handleConnectionEvent(
 
 QUIC_STATUS QUIC_API MiniImSessionManager::handleStreamEvent(HQUIC stream, void* context, QUIC_STREAM_EVENT* event)
 {
-    auto* manager = static_cast<MiniImSessionManager*>(context);
-    if (manager == nullptr)
+    const auto* callback = static_cast<CallbackContext*>(context);
+    if (callback == nullptr || callback->manager == nullptr)
     {
         return QUIC_STATUS_INTERNAL_ERROR;
+    }
+    auto* manager = callback->manager;
+    const quint64 generation = callback->generation;
+
+    quint64 streamId = 0;
+    if (event->Type == QUIC_STREAM_EVENT_RECEIVE
+        || event->Type == QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN
+        || event->Type == QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE)
+    {
+        uint32_t length = sizeof(streamId);
+        const QUIC_STATUS status = manager->m_msquic->GetParam(
+            stream, QUIC_PARAM_STREAM_ID, &length, &streamId);
+        if (QUIC_FAILED(status))
+        {
+            return status;
+        }
     }
 
     switch (event->Type)
@@ -467,40 +506,60 @@ QUIC_STATUS QUIC_API MiniImSessionManager::handleStreamEvent(HQUIC stream, void*
     case QUIC_STREAM_EVENT_RECEIVE:
     {
         AppendClientLog(QStringLiteral("stream event: RECEIVE len=%1").arg(event->RECEIVE.TotalBufferLength));
-        const uint32_t total_len = event->RECEIVE.TotalBufferLength;
-        if (total_len == 0)
+        const quint64 totalLength = qMin<quint64>(event->RECEIVE.TotalBufferLength, kReceiveBatchSize);
+        if (totalLength == 0)
         {
             break;
         }
 
         QByteArray payload;
-        payload.resize(static_cast<int>(total_len));
-        uint32_t offset = 0;
-        for (uint32_t index = 0; index < event->RECEIVE.BufferCount; ++index)
+        payload.reserve(static_cast<qsizetype>(totalLength));
+        for (uint32_t index = 0; index < event->RECEIVE.BufferCount && payload.size() < totalLength; ++index)
         {
             const QUIC_BUFFER& buffer = event->RECEIVE.Buffers[index];
-            std::memcpy(payload.data() + offset, buffer.Buffer, buffer.Length);
-            offset += buffer.Length;
+            const auto count = qMin<quint64>(buffer.Length, totalLength - payload.size());
+            payload.append(reinterpret_cast<const char*>(buffer.Buffer), static_cast<qsizetype>(count));
         }
 
         QMetaObject::invokeMethod(
             manager,
-            [manager, payload, stream]()
+            [manager, generation, payload, stream, streamId, totalLength]()
             {
-                AppendClientLog(
-                    QStringLiteral("queued stream RECEIVE handler stream=%1 size=%2 control=%3")
-                        .arg(reinterpret_cast<quintptr>(stream))
-                        .arg(payload.size())
-                        .arg(manager->m_stream == stream ? 1 : 0));
+                if (generation != manager->m_connectionGeneration)
+                {
+                    return;
+                }
+                if (manager->m_transportStopping)
+                {
+                    manager->m_msquic->StreamReceiveComplete(stream, totalLength);
+                    return;
+                }
                 if (manager->m_stream == stream)
                 {
                     manager->handleIncomingControlStreamData(payload);
+                    manager->m_msquic->StreamReceiveComplete(stream, totalLength);
+                    manager->m_msquic->StreamReceiveSetEnabled(stream, TRUE);
                     return;
                 }
-                manager->handleIncomingFileStream(stream, payload);
+                auto& state = manager->m_download_stream_states[streamId];
+                state.pending_receive = stream;
+                state.pending_receive_bytes = totalLength;
+                manager->handleIncomingFileStream(streamId, payload);
+                auto received = manager->m_download_stream_states.find(streamId);
+                if (received == manager->m_download_stream_states.end())
+                {
+                    manager->m_msquic->StreamReceiveComplete(stream, totalLength);
+                    manager->m_msquic->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT_RECEIVE, 0x1004);
+                }
+                else if (!received->header_parsed || received->buffer.isEmpty()
+                    || manager->m_failed_file_downloads.contains(received->file_id))
+                {
+                    manager->completeFileReceive(streamId);
+                }
+                // Keep this receive pending until control metadata permits writing the file.
             },
             Qt::QueuedConnection);
-        break;
+        return QUIC_STATUS_PENDING;
     }
     case QUIC_STREAM_EVENT_SEND_COMPLETE:
     {
@@ -508,52 +567,92 @@ QUIC_STATUS QUIC_API MiniImSessionManager::handleStreamEvent(HQUIC stream, void*
         auto* send_context = static_cast<StreamSendContext*>(event->SEND_COMPLETE.ClientContext);
         if (send_context != nullptr)
         {
-            delete[] send_context->data;
             delete send_context;
         }
+        break;
+    }
+    case QUIC_STREAM_EVENT_PEER_SEND_ABORTED:
+    case QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED:
+    {
+        QMetaObject::invokeMethod(manager, [manager, generation, stream]()
+        {
+            if (generation == manager->m_connectionGeneration && manager->m_stream == stream)
+            {
+                manager->restartConnection(QStringLiteral("control stream aborted"));
+            }
+        }, Qt::QueuedConnection);
+        break;
+    }
+    case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN:
+    {
+        QMetaObject::invokeMethod(manager, [manager, generation, stream, streamId]()
+        {
+            if (generation != manager->m_connectionGeneration)
+            {
+                return;
+            }
+            if (manager->m_stream == stream)
+            {
+                manager->restartConnection(QStringLiteral("control stream closed"));
+                return;
+            }
+            if (manager->m_transportStopping)
+            {
+                return;
+            }
+            auto& state = manager->m_download_stream_states[streamId];
+            state.finished = true;
+            manager->flushPendingDownloadBuffers(state.file_id);
+        }, Qt::QueuedConnection);
         break;
     }
     case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE:
     {
         AppendClientLog(QStringLiteral("stream event: SHUTDOWN_COMPLETE"));
+        const bool connectionShutdown = event->SHUTDOWN_COMPLETE.ConnectionShutdown;
         QMetaObject::invokeMethod(
             manager,
-            [manager, stream]()
+            [manager, generation, stream, streamId, connectionShutdown]()
             {
+                if (generation != manager->m_connectionGeneration)
+                {
+                    return;
+                }
                 AppendClientLog(QStringLiteral("queued stream SHUTDOWN_COMPLETE handler begin"));
                 if (manager->m_stream == stream && manager->m_msquic != nullptr)
                 {
                     manager->closeControlStreamHandle();
                     manager->m_stream = nullptr;
+                    if (!connectionShutdown)
+                    {
+                        manager->restartConnection(QStringLiteral("control stream interrupted"));
+                    }
                     return;
                 }
                 if (manager->m_msquic == nullptr)
                 {
                     return;
                 }
-                const quintptr key = reinterpret_cast<quintptr>(stream);
-                const auto it = manager->m_file_stream_to_file_id.find(key);
-                if (it != manager->m_file_stream_to_file_id.end())
+                auto state_it = manager->m_download_stream_states.find(streamId);
+                if (state_it != manager->m_download_stream_states.end())
                 {
-                    const QString file_id = it.value();
-                    manager->m_file_stream_to_file_id.erase(it);
-                    manager->m_msquic->StreamClose(stream);
-                    if (!manager->sendFileFinish(file_id, true))
+                    const QString fileId = state_it->file_id;
+                    if (!state_it->finished || connectionShutdown)
                     {
-                        emit manager->errorRaised(QStringLiteral("failed to send file finish"));
+                        manager->m_failed_file_downloads.insert(fileId);
+                        manager->m_download_stream_states.remove(streamId);
+                        emit manager->errorRaised(QStringLiteral("download stream interrupted"));
                     }
-                    manager->m_pending_file_uploads.remove(file_id);
-                }
-                else
-                {
-                    auto state_it = manager->m_download_stream_states.find(key);
-                    if (state_it != manager->m_download_stream_states.end() && !state_it->file_id.isEmpty())
+                    else
                     {
-                        manager->flushPendingDownloadBuffers(state_it->file_id);
+                        manager->flushPendingDownloadBuffers(fileId);
+                        if (manager->m_failed_file_downloads.contains(fileId))
+                        {
+                            manager->m_download_stream_states.remove(streamId);
+                        }
                     }
-                    manager->m_download_stream_states.remove(key);
-                    manager->m_msquic->StreamClose(stream);
                 }
+                manager->m_msquic->StreamClose(stream);
             },
             Qt::QueuedConnection);
         break;
@@ -591,6 +690,12 @@ bool MiniImSessionManager::initializeMsQuic()
     QUIC_SETTINGS settings = {};
     settings.IsSet.PeerUnidiStreamCount = TRUE;
     settings.PeerUnidiStreamCount = 16;
+    settings.IsSet.SendBufferingEnabled = TRUE;
+    settings.SendBufferingEnabled = FALSE;
+    settings.IsSet.StreamRecvBufferDefault = TRUE;
+    settings.StreamRecvBufferDefault = static_cast<uint32_t>(kReceiveBatchSize);
+    settings.IsSet.StreamRecvWindowDefault = TRUE;
+    settings.StreamRecvWindowDefault = static_cast<uint32_t>(kReceiveBatchSize);
     if (QUIC_FAILED(
             m_msquic->ConfigurationOpen(
                 m_registration,
@@ -641,8 +746,24 @@ void MiniImSessionManager::releaseMsQuic()
 
 void MiniImSessionManager::resetRuntimeState()
 {
+    m_messageRetryTimer.stop();
+    m_messageSyncReady = false;
+    m_activeMessageRequest.clear();
+    m_syncRequestPayload.clear();
+    m_messageAttemptTime.invalidate();
+    m_syncAttemptTime.invalidate();
     m_control_stream_buffer.clear();
-    m_file_stream_to_file_id.clear();
+    m_syncRequestId.clear();
+    qDeleteAll(m_upload_streams);
+    m_upload_streams.clear();
+    for (auto it = m_download_stream_states.begin(); it != m_download_stream_states.end(); ++it)
+    {
+        if (it->pending_receive != nullptr && m_msquic != nullptr)
+        {
+            m_msquic->StreamReceiveComplete(it->pending_receive, it->pending_receive_bytes);
+            m_msquic->StreamShutdown(it->pending_receive, QUIC_STREAM_SHUTDOWN_FLAG_ABORT_RECEIVE, 0);
+        }
+    }
     m_download_stream_states.clear();
     m_latest_file_versions.clear();
     m_pending_file_init_requests.clear();
@@ -650,6 +771,7 @@ void MiniImSessionManager::resetRuntimeState()
     m_pending_file_download_init_requests.clear();
     m_pending_file_downloads.clear();
     m_failed_file_downloads.clear();
+    m_pending_file_finish_requests.clear();
 }
 
 void MiniImSessionManager::closeControlStreamHandle()
@@ -672,6 +794,8 @@ void MiniImSessionManager::closeConnectionHandle()
     HQUIC connection = m_connection;
     m_connection = nullptr;
     m_msquic->ConnectionClose(connection);
+    ++m_connectionGeneration;
+    m_callbackContext.reset();
 }
 
 bool MiniImSessionManager::parseEndpoint(const QString& endpoint, QString* host, uint16_t* port) const
@@ -717,10 +841,9 @@ bool MiniImSessionManager::sendEnvelope(const std::string& payload)
 
     const QByteArray frame = BuildEnvelopeFrame(payload);
     auto* send_context = new StreamSendContext;
-    send_context->data = new uint8_t[static_cast<size_t>(frame.size())];
-    std::memcpy(send_context->data, frame.constData(), static_cast<size_t>(frame.size()));
+    send_context->data = frame;
     send_context->buffer.Length = static_cast<uint32_t>(frame.size());
-    send_context->buffer.Buffer = send_context->data;
+    send_context->buffer.Buffer = reinterpret_cast<uint8_t*>(send_context->data.data());
 
     const QUIC_STATUS status = m_msquic->StreamSend(
         m_stream,
@@ -730,7 +853,6 @@ bool MiniImSessionManager::sendEnvelope(const std::string& payload)
         send_context);
     if (QUIC_FAILED(status))
     {
-        delete[] send_context->data;
         delete send_context;
         AppendClientLog(
             QStringLiteral("StreamSend failed status=%1 frameSize=%2 payloadSize=%3")
@@ -783,6 +905,11 @@ void MiniImSessionManager::handleIncomingControlStreamData(const QByteArray& pay
             m_control_stream_buffer.mid(static_cast<int>(kEnvelopeFrameHeaderSize), static_cast<int>(payload_size));
         m_control_stream_buffer.remove(0, static_cast<int>(frame_size));
         handleIncomingEnvelope(envelope_payload);
+        if (m_transportStopping)
+        {
+            m_control_stream_buffer.clear();
+            return;
+        }
     }
 }
 
@@ -860,29 +987,131 @@ bool MiniImSessionManager::sendMessage(
         return false;
     }
 
-    im::envelope::Envelope envelope;
-    const auto now_ms = QDateTime::currentMSecsSinceEpoch();
-    const QString request_id = makeRequestId(QStringLiteral("msg"));
-    const QByteArray utf8_text = text.toUtf8();
+    try
+    {
+        const QVariantMap intent{{"conversationId", conversation_id}, {"clientMsgId", client_msg_id},
+            {"text", text}, {"burnMode", burn_mode}, {"burnTtlSec", burn_ttl_sec}};
+        m_stateStore.outbox().enqueue(makeRequestId(QStringLiteral("msg")), intent);
+        publishMessageSends();
+        pumpMessageOutbox();
+        return true;
+    }
+    catch (const std::exception& error)
+    {
+        emit errorRaised(QString::fromUtf8(error.what()));
+        return false;
+    }
+}
 
+bool MiniImSessionManager::retryMessage(const QString& conversationId, const QString& clientMsgId)
+{
+    if (!m_connected)
+    {
+        return false;
+    }
+    try
+    {
+        const bool accepted = m_stateStore.outbox().retry(conversationId, clientMsgId);
+        publishMessageSends();
+        pumpMessageOutbox();
+        return accepted;
+    }
+    catch (const std::exception& error)
+    {
+        emit errorRaised(QString::fromUtf8(error.what()));
+        return false;
+    }
+}
+
+void MiniImSessionManager::publishMessageSends()
+{
+    emit messageSendsChanged({{"items", m_stateStore.outbox().pending()}});
+}
+
+bool MiniImSessionManager::sendQueuedMessage(const QVariantMap& item)
+{
+    im::envelope::Envelope envelope;
+    const QString requestId = item.value(QStringLiteral("requestId")).toString();
     envelope.set_version(1);
-    envelope.set_request_id(request_id.toStdString());
+    envelope.set_request_id(requestId.toStdString());
     envelope.set_channel(im::common::CHANNEL_CONTROL);
     envelope.set_session_id(m_session_id.toStdString());
     envelope.set_device_id(m_device_id.toStdString());
     envelope.set_seq(++m_seq);
-    envelope.set_client_time_ms(now_ms);
-    envelope.set_trace_id(request_id.toStdString());
-
-    auto* send_message = envelope.mutable_send_message();
-    send_message->set_conversation_id(conversation_id.toStdString());
-    send_message->set_client_msg_id(client_msg_id.toStdString());
-    send_message->set_type(im::common::MSG_TEXT);
-    send_message->set_content(utf8_text.constData(), utf8_text.size());
-    send_message->set_burn_mode(static_cast<unsigned int>(burn_mode));
-    send_message->set_burn_ttl_sec(static_cast<unsigned int>(burn_ttl_sec));
-
+    envelope.set_client_time_ms(item.value(QStringLiteral("createdAtMs")).toLongLong());
+    envelope.set_trace_id(requestId.toStdString());
+    auto* message = envelope.mutable_send_message();
+    message->set_conversation_id(item.value(QStringLiteral("conversationId")).toString().toStdString());
+    message->set_client_msg_id(item.value(QStringLiteral("clientMsgId")).toString().toStdString());
+    message->set_type(im::common::MSG_TEXT);
+    message->set_content(item.value(QStringLiteral("text")).toString().toStdString());
+    message->set_burn_mode(item.value(QStringLiteral("burnMode")).toUInt());
+    message->set_burn_ttl_sec(item.value(QStringLiteral("burnTtlSec")).toUInt());
     return sendEnvelope(envelope.SerializeAsString());
+}
+
+void MiniImSessionManager::pumpMessageOutbox()
+{
+    if (!m_connected)
+    {
+        return;
+    }
+    if (!m_syncRequestId.isEmpty() && m_syncAttemptTime.isValid()
+        && m_syncAttemptTime.elapsed() >= kRequestRetryMs)
+    {
+        sendEnvelope(m_syncRequestPayload);
+        m_syncAttemptTime.restart();
+    }
+    try
+    {
+        if (!m_messageSyncReady || m_stateStore.hasGap())
+        {
+            return;
+        }
+        const auto item = m_stateStore.outbox().nextPending();
+        if (item.isEmpty())
+        {
+            m_activeMessageRequest.clear();
+            return;
+        }
+        const QString requestId = item.value(QStringLiteral("requestId")).toString();
+        if (requestId == m_activeMessageRequest && m_messageAttemptTime.isValid()
+            && m_messageAttemptTime.elapsed() < kRequestRetryMs)
+        {
+            return;
+        }
+        m_stateStore.outbox().markAttempt(requestId);
+        m_activeMessageRequest = requestId;
+        m_messageAttemptTime.start();
+        publishMessageSends();
+        if (!sendQueuedMessage(item))
+        {
+            emit errorRaised(QStringLiteral("message saved locally; waiting to retry"));
+        }
+    }
+    catch (const std::exception& error)
+    {
+        m_messageRetryTimer.stop();
+        emit errorRaised(QString::fromUtf8(error.what()));
+    }
+}
+
+void MiniImSessionManager::handleMessageResult(
+    const QString& requestId, bool success, int code, const QString& error, const QString& entityId)
+{
+    try
+    {
+        if (m_stateStore.outbox().acknowledge(requestId, success, code, error, entityId))
+        {
+            publishMessageSends();
+            pumpMessageOutbox();
+        }
+    }
+    catch (const std::exception& exception)
+    {
+        m_messageRetryTimer.stop();
+        emit errorRaised(QString::fromUtf8(exception.what()));
+    }
 }
 
 bool MiniImSessionManager::createConversation(
@@ -1282,6 +1511,10 @@ bool MiniImSessionManager::sendSyncRequest(quint64 global_cursor, quint32 limit)
     {
         return false;
     }
+    if (!m_syncRequestId.isEmpty())
+    {
+        return true;
+    }
 
     im::envelope::Envelope envelope;
     const auto now_ms = QDateTime::currentMSecsSinceEpoch();
@@ -1300,7 +1533,14 @@ bool MiniImSessionManager::sendSyncRequest(quint64 global_cursor, quint32 limit)
     sync_request->set_global_cursor(global_cursor);
     sync_request->set_limit(limit);
 
-    return sendEnvelope(envelope.SerializeAsString());
+    m_syncRequestId = request_id;
+    m_syncRequestPayload = envelope.SerializeAsString();
+    m_syncAttemptTime.start();
+    if (!sendEnvelope(m_syncRequestPayload))
+    {
+        return false;
+    }
+    return true;
 }
 
 bool MiniImSessionManager::sendFileInitRequest(
@@ -1346,7 +1586,8 @@ bool MiniImSessionManager::sendFileInitRequest(
     return sendEnvelope(envelope.SerializeAsString());
 }
 
-bool MiniImSessionManager::sendFileFinish(const QString& file_id, bool success)
+bool MiniImSessionManager::sendFileFinish(
+    const QString& file_id, bool success, quint64 transferredBytes, const QString& sha256)
 {
     if (!m_connected || m_session_id.isEmpty() || file_id.trimmed().isEmpty())
     {
@@ -1368,156 +1609,88 @@ bool MiniImSessionManager::sendFileFinish(const QString& file_id, bool success)
     auto* file_finish = envelope.mutable_file_finish();
     file_finish->set_file_id(file_id.toStdString());
     file_finish->set_success(success);
+    file_finish->set_transferred_bytes(transferredBytes);
+    file_finish->set_sha256(sha256.toStdString());
 
-    return sendEnvelope(envelope.SerializeAsString());
-}
-
-bool MiniImSessionManager::sendFileStreamData(const QString& file_id, const QString& file_path, quint64 offset)
-{
-    if (m_connection == nullptr || m_msquic == nullptr || file_id.trimmed().isEmpty() || file_path.trimmed().isEmpty())
+    m_pending_file_finish_requests.insert(request_id, file_id);
+    if (!sendEnvelope(envelope.SerializeAsString()))
     {
+        m_pending_file_finish_requests.remove(request_id);
         return false;
     }
-
-    HQUIC file_stream = nullptr;
-    const QUIC_STATUS open_status = m_msquic->StreamOpen(
-        m_connection,
-        QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL,
-        &MiniImSessionManager::handleStreamEvent,
-        this,
-        &file_stream);
-    if (QUIC_FAILED(open_status) || file_stream == nullptr)
-    {
-        return false;
-    }
-
-    const QUIC_STATUS start_status = m_msquic->StreamStart(file_stream, QUIC_STREAM_START_FLAG_IMMEDIATE);
-    if (QUIC_FAILED(start_status))
-    {
-        m_msquic->StreamClose(file_stream);
-        return false;
-    }
-
-    m_file_stream_to_file_id.insert(reinterpret_cast<quintptr>(file_stream), file_id);
-
-    auto send_bytes = [this, file_stream](const QByteArray& bytes) -> bool
-    {
-        if (bytes.isEmpty())
-        {
-            return true;
-        }
-        auto* send_context = new StreamSendContext;
-        send_context->data = new uint8_t[static_cast<size_t>(bytes.size())];
-        std::memcpy(send_context->data, bytes.constData(), static_cast<size_t>(bytes.size()));
-        send_context->buffer.Length = static_cast<uint32_t>(bytes.size());
-        send_context->buffer.Buffer = send_context->data;
-        const QUIC_STATUS status = m_msquic->StreamSend(
-            file_stream,
-            &send_context->buffer,
-            1,
-            QUIC_SEND_FLAG_NONE,
-            send_context);
-        if (QUIC_FAILED(status))
-        {
-            delete[] send_context->data;
-            delete send_context;
-            return false;
-        }
-        return true;
-    };
-
-    const QByteArray header = QByteArrayLiteral("MINIIMFILE1 ") + file_id.toUtf8() + QByteArrayLiteral("\n");
-    if (!send_bytes(header))
-    {
-        m_file_stream_to_file_id.remove(reinterpret_cast<quintptr>(file_stream));
-        m_msquic->StreamClose(file_stream);
-        return false;
-    }
-
-    QFile file(file_path);
-    if (!file.open(QIODevice::ReadOnly))
-    {
-        m_file_stream_to_file_id.remove(reinterpret_cast<quintptr>(file_stream));
-        m_msquic->StreamClose(file_stream);
-        return false;
-    }
-    if (offset > 0 && !file.seek(static_cast<qint64>(offset)))
-    {
-        file.close();
-        m_file_stream_to_file_id.remove(reinterpret_cast<quintptr>(file_stream));
-        m_msquic->StreamClose(file_stream);
-        return false;
-    }
-
-    while (!file.atEnd())
-    {
-        const QByteArray chunk = file.read(64 * 1024);
-        if (chunk.isEmpty() && file.error() != QFileDevice::NoError)
-        {
-            file.close();
-            m_file_stream_to_file_id.remove(reinterpret_cast<quintptr>(file_stream));
-            m_msquic->StreamClose(file_stream);
-            return false;
-        }
-        if (!chunk.isEmpty() && !send_bytes(chunk))
-        {
-            file.close();
-            m_file_stream_to_file_id.remove(reinterpret_cast<quintptr>(file_stream));
-            m_msquic->StreamClose(file_stream);
-            return false;
-        }
-    }
-    file.close();
-
-    m_msquic->StreamShutdown(file_stream, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
     return true;
 }
 
-void MiniImSessionManager::handleFileUpdated(
-    const std::string& event_id,
-    const std::string& file_id,
-    const std::string& conversation_id,
-    quint64 transferred_bytes,
-    bool completed,
-    quint64 version,
-    qlonglong updated_at_ms,
-    bool check_event_id)
+bool MiniImSessionManager::sendFileStreamData(
+    const QString& file_id, const QString& file_path, quint64 offset, quint64 fileSize)
 {
-    const QString qevent_id = QString::fromStdString(event_id);
-    if (check_event_id && !qevent_id.isEmpty())
+    if (m_connection == nullptr || m_msquic == nullptr || m_upload_streams.contains(file_id))
     {
-        if (m_seen_event_ids.contains(qevent_id))
+        return false;
+    }
+    auto* sender = new MiniImUploadStream(m_msquic, m_connection, file_path, fileSize, this);
+    QObject::connect(sender, &MiniImUploadStream::finished, this,
+        [this, sender, file_id](bool success, const QString& error)
         {
+            m_upload_streams.remove(file_id);
+            sender->deleteLater();
+            if (!success)
+            {
+                emit errorRaised(error);
+            }
+            else if (!sendFileFinish(file_id, true))
+            {
+                emit errorRaised(QStringLiteral("failed to send file finish"));
+            }
+        });
+    if (!sender->start(file_id, offset))
+    {
+        delete sender;
+        return false;
+    }
+    m_upload_streams.insert(file_id, sender);
+    return true;
+}
+
+void MiniImSessionManager::handleFileUpdated(const im::file::FileUpdated& updated)
+{
+    const QString fileId = QString::fromStdString(updated.file_id());
+    if (updated.version() < m_latest_file_versions.value(fileId, 0))
+    {
+        return;
+    }
+    m_latest_file_versions.insert(fileId, updated.version());
+    emit fileProgress(miniim::BuildFileProgressPayload(
+        updated.event_id(), updated.file_id(), updated.conversation_id(), updated.transferred_bytes(),
+        updated.completed(), updated.version(), updated.updated_at_ms()));
+
+    auto download = m_pending_file_downloads.find(fileId);
+    if (download != m_pending_file_downloads.end() && !download->sink && updated.file_size() > 0)
+    {
+        download->sink = std::make_shared<MiniImDownloadSink>(download->save_path, fileId);
+        if (!download->sink->open(updated.file_size(), QString::fromStdString(updated.sha256())))
+        {
+            m_failed_file_downloads.insert(fileId);
+            emit errorRaised(download->sink->errorString());
+            for (auto it = m_download_stream_states.begin(); it != m_download_stream_states.end(); ++it)
+            {
+                if (it->file_id == fileId)
+                {
+                    completeFileReceive(it.key());
+                }
+            }
             return;
         }
-        m_seen_event_ids.insert(qevent_id);
+        flushPendingDownloadBuffers(fileId);
     }
-    const QString qfile_id = QString::fromStdString(file_id);
-    const quint64 old_version = m_latest_file_versions.value(qfile_id, 0);
-    if (version > 0 && version < old_version)
+    auto upload = m_pending_file_uploads.find(fileId);
+    if (upload == m_pending_file_uploads.end() || upload->stream_started || updated.completed())
     {
         return;
     }
-    if (version > old_version)
+    if (sendFileStreamData(fileId, upload->file_path, updated.transferred_bytes(), upload->file_size))
     {
-        m_latest_file_versions.insert(qfile_id, version);
-    }
-    emit fileProgress(
-        BuildFileProgressPayload(event_id, file_id, conversation_id, transferred_bytes, completed, version, updated_at_ms));
-
-    auto pending_it = m_pending_file_uploads.find(qfile_id);
-    if (pending_it == m_pending_file_uploads.end() || pending_it->stream_started)
-    {
-        if (completed)
-        {
-            m_pending_file_downloads.remove(qfile_id);
-        }
-        return;
-    }
-
-    if (sendFileStreamData(qfile_id, pending_it->file_path, transferred_bytes))
-    {
-        pending_it->stream_started = true;
+        upload->stream_started = true;
     }
     else
     {
@@ -1525,9 +1698,9 @@ void MiniImSessionManager::handleFileUpdated(
     }
 }
 
-void MiniImSessionManager::handleIncomingFileStream(HQUIC stream, const QByteArray& payload)
+void MiniImSessionManager::handleIncomingFileStream(quint64 streamId, const QByteArray& payload)
 {
-    const quintptr key = reinterpret_cast<quintptr>(stream);
+    const quint64 key = streamId;
     AppendClientLog(
         QStringLiteral("handleIncomingFileStream stream=%1 append=%2")
             .arg(key)
@@ -1545,11 +1718,16 @@ void MiniImSessionManager::handleIncomingFileStream(HQUIC stream, const QByteArr
         const int split = state.buffer.indexOf('\n');
         if (split < 0)
         {
-            if (state.buffer.size() > 1024)
+            if (state.buffer.size() >= 512)
             {
                 AppendClientLog(QStringLiteral("handleIncomingFileStream header too large stream=%1").arg(key));
                 m_download_stream_states.remove(key);
             }
+            return;
+        }
+        if (split >= 512)
+        {
+            m_download_stream_states.remove(key);
             return;
         }
         const QByteArray header = state.buffer.left(split);
@@ -1572,6 +1750,7 @@ void MiniImSessionManager::handleIncomingFileStream(HQUIC stream, const QByteArr
     if (state.file_id.isEmpty())
     {
         AppendClientLog(QStringLiteral("handleIncomingFileStream empty file id stream=%1").arg(key));
+        m_download_stream_states.remove(key);
         return;
     }
     flushPendingDownloadBuffers(state.file_id);
@@ -1579,55 +1758,76 @@ void MiniImSessionManager::handleIncomingFileStream(HQUIC stream, const QByteArr
 
 void MiniImSessionManager::flushPendingDownloadBuffers(const QString& file_id)
 {
-    if (file_id.trimmed().isEmpty())
+    auto pending = m_pending_file_downloads.find(file_id);
+    if (pending == m_pending_file_downloads.end() || !pending->sink || m_failed_file_downloads.contains(file_id))
     {
         return;
     }
-    auto pending_it = m_pending_file_downloads.find(file_id);
-    if (pending_it == m_pending_file_downloads.end())
-    {
-        AppendClientLog(QStringLiteral("flushPendingDownloadBuffers pending not ready fileId=%1").arg(file_id));
-        return;
-    }
-
+    bool finished = false;
     for (auto it = m_download_stream_states.begin(); it != m_download_stream_states.end(); ++it)
     {
-        DownloadStreamState& state = it.value();
-        if (state.file_id != file_id || state.buffer.isEmpty() || m_failed_file_downloads.contains(file_id))
+        auto& state = it.value();
+        if (state.file_id != file_id)
         {
             continue;
         }
-
-        const QFileInfo info(pending_it->save_path);
-        const QString parent_dir = info.dir().absolutePath();
-        if (!QDir().mkpath(parent_dir))
+        if (!state.buffer.isEmpty() && !pending->sink->append(state.buffer))
         {
             m_failed_file_downloads.insert(file_id);
-            AppendClientLog(
-                QStringLiteral("flushPendingDownloadBuffers mkdir failed fileId=%1 dir=%2 path=%3")
-                    .arg(file_id, parent_dir, pending_it->save_path));
-            emit errorRaised(QStringLiteral("failed to create download directory"));
+            emit errorRaised(pending->sink->errorString());
+            completeFileReceive(it.key());
             return;
         }
-
-        QFile output(pending_it->save_path);
-        if (!output.open(QIODevice::WriteOnly | QIODevice::Append))
-        {
-            m_failed_file_downloads.insert(file_id);
-            AppendClientLog(
-                QStringLiteral("flushPendingDownloadBuffers write failed fileId=%1 path=%2 error=%3")
-                    .arg(file_id, pending_it->save_path, output.errorString()));
-            emit errorRaised(QStringLiteral("failed to write download file: %1").arg(pending_it->save_path));
-            return;
-        }
-        output.write(state.buffer);
-        output.close();
-        AppendClientLog(
-            QStringLiteral("flushPendingDownloadBuffers wrote fileId=%1 bytes=%2 path=%3")
-                .arg(file_id)
-                .arg(state.buffer.size())
-                .arg(pending_it->save_path));
         state.buffer.clear();
+        completeFileReceive(it.key());
+        finished = finished || state.finished;
+    }
+    if (finished)
+    {
+        finishDownload(file_id);
+    }
+}
+
+void MiniImSessionManager::completeFileReceive(quint64 streamId)
+{
+    auto state = m_download_stream_states.find(streamId);
+    if (state == m_download_stream_states.end() || state->pending_receive == nullptr)
+    {
+        return;
+    }
+    HQUIC stream = state->pending_receive;
+    const quint64 bytes = state->pending_receive_bytes;
+    state->pending_receive = nullptr;
+    state->pending_receive_bytes = 0;
+    m_msquic->StreamReceiveComplete(stream, bytes);
+    if (m_failed_file_downloads.contains(state->file_id))
+    {
+        state->buffer.clear();
+        m_msquic->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT_RECEIVE, 0x1004);
+    }
+    else
+    {
+        m_msquic->StreamReceiveSetEnabled(stream, TRUE);
+    }
+}
+
+void MiniImSessionManager::finishDownload(const QString& file_id)
+{
+    auto pending = m_pending_file_downloads.find(file_id);
+    if (pending == m_pending_file_downloads.end() || pending->finish_sent || !pending->sink)
+    {
+        return;
+    }
+    if (!pending->sink->finish())
+    {
+        m_failed_file_downloads.insert(file_id);
+        emit errorRaised(pending->sink->errorString());
+        return;
+    }
+    pending->finish_sent = sendFileFinish(file_id, true, pending->sink->receivedBytes(), pending->sink->sha256());
+    if (!pending->finish_sent)
+    {
+        emit errorRaised(QStringLiteral("failed to confirm downloaded file"));
     }
 }
 
@@ -1642,27 +1842,60 @@ void MiniImSessionManager::handleIncomingEnvelope(const QByteArray& payload)
         return;
     }
 
-    if (!envelope.request_id().empty())
+    if (m_transportStopping)
     {
-        m_last_acked_request_id = QString::fromStdString(envelope.request_id());
+        return;
     }
-
+    m_lastResponseTime.start();
     if (envelope.has_welcome())
     {
         AppendClientLog(QStringLiteral("handleIncomingEnvelope: welcome"));
         const auto& welcome = envelope.welcome();
+        if (welcome.need_reauth())
+        {
+            restartConnection(QStringLiteral("session requires reauthentication"), true);
+            return;
+        }
+        if (QString::fromStdString(welcome.user_id()) != m_userId)
+        {
+            emit errorRaised(QStringLiteral("welcome user does not match account state"));
+            disconnectFromServer();
+            return;
+        }
         m_connected = true;
         m_connecting = false;
         m_session_id = QString::fromStdString(welcome.session_id());
         m_resume_session_id = m_session_id;
-        m_global_cursor = static_cast<quint64>(welcome.global_cursor());
+        m_global_cursor = m_stateStore.cursor();
+        if (!m_stateStore.saveSession(m_session_id, m_last_acked_request_id))
+        {
+            emit errorRaised(m_stateStore.errorString());
+            disconnectFromServer();
+            return;
+        }
+        m_recovery.authenticated();
         m_heartbeat_interval_sec = welcome.heartbeat_interval_sec() > 0
-            ? static_cast<int>(welcome.heartbeat_interval_sec())
+            ? static_cast<int>(qMin<quint32>(welcome.heartbeat_interval_sec(), 300))
             : kDefaultHeartbeatIntervalSec;
 
         emit connectionChanged(QStringLiteral("connected"), m_session_id);
-        emit initialStateLoaded(buildInitialStatePayload(QString::fromStdString(welcome.user_id()), m_global_cursor));
+        const QVariantMap initial = m_stateStore.snapshot();
+        if (initial.isEmpty())
+        {
+            emit errorRaised(m_stateStore.errorString());
+            disconnectFromServer();
+            return;
+        }
+        for (const auto& value : initial.value(QStringLiteral("files")).toList())
+        {
+            const auto file = value.toMap();
+            m_latest_file_versions.insert(file.value(QStringLiteral("fileId")).toString(),
+                file.value(QStringLiteral("version")).toULongLong());
+        }
+        emit initialStateLoaded(initial);
         m_heartbeat_timer.start(m_heartbeat_interval_sec * 1000);
+        m_messageSyncReady = false;
+        m_messageRetryTimer.start();
         if (!sendSyncRequest(m_global_cursor))
         {
             emit errorRaised(QStringLiteral("failed to request sync after welcome"));
@@ -1674,7 +1907,38 @@ void MiniImSessionManager::handleIncomingEnvelope(const QByteArray& payload)
     {
         AppendClientLog(QStringLiteral("handleIncomingEnvelope: ack"));
         const auto& ack = envelope.ack();
+        if (!ack.success() && ack.code() == 401)
+        {
+            restartConnection(QStringLiteral("session rejected; reconnecting"), true);
+        }
         const QString request_id = QString::fromStdString(ack.request_id());
+        handleMessageResult(request_id, ack.success(), ack.code(),
+            QString::fromStdString(ack.message()), QString::fromStdString(ack.entity_id()));
+        if (ack.success())
+        {
+            m_last_acked_request_id = request_id;
+            if (!m_stateStore.saveSession(m_session_id, request_id))
+            {
+                emit errorRaised(m_stateStore.errorString());
+            }
+        }
+        const QString finishedFileId = m_pending_file_finish_requests.take(request_id);
+        if (!finishedFileId.isEmpty())
+        {
+            if (ack.success())
+            {
+                m_pending_file_uploads.remove(finishedFileId);
+                m_pending_file_downloads.remove(finishedFileId);
+                for (auto it = m_download_stream_states.begin(); it != m_download_stream_states.end();)
+                {
+                    it = it->file_id == finishedFileId ? m_download_stream_states.erase(it) : ++it;
+                }
+            }
+            else if (m_pending_file_downloads.contains(finishedFileId))
+            {
+                m_pending_file_downloads[finishedFileId].finish_sent = false;
+            }
+        }
         auto pending_init = m_pending_file_init_requests.find(request_id);
         if (pending_init != m_pending_file_init_requests.end())
         {
@@ -1695,11 +1959,6 @@ void MiniImSessionManager::handleIncomingEnvelope(const QByteArray& payload)
                 PendingFileDownload pending = pending_download_init.value();
                 pending.file_id = QString::fromStdString(ack.entity_id());
                 m_failed_file_downloads.remove(pending.file_id);
-                QFile output(pending.save_path);
-                if (output.exists())
-                {
-                    output.remove();
-                }
                 m_pending_file_downloads.insert(pending.file_id, pending);
                 AppendClientLog(
                     QStringLiteral("download ack ready fileId=%1 savePath=%2")
@@ -1720,104 +1979,116 @@ void MiniImSessionManager::handleIncomingEnvelope(const QByteArray& payload)
 
     if (envelope.has_file_updated())
     {
-        AppendClientLog(QStringLiteral("handleIncomingEnvelope: file_updated"));
         const auto& updated = envelope.file_updated();
-        handleFileUpdated(
-            updated.event_id(),
-            updated.file_id(),
-            updated.conversation_id(),
-            static_cast<quint64>(updated.transferred_bytes()),
-            updated.completed(),
-            static_cast<quint64>(updated.version()),
-            static_cast<qlonglong>(updated.updated_at_ms()));
-        m_global_cursor = qMax(m_global_cursor, static_cast<quint64>(envelope.seq()));
+        if (!updated.event_id().empty())
+        {
+            const MiniImStateEvent event{envelope.seq(), QString::fromStdString(updated.event_id()),
+                QStringLiteral("file"), miniim::BuildFileProgressPayload(
+                    updated.event_id(), updated.file_id(), updated.conversation_id(), updated.transferred_bytes(),
+                    updated.completed(), updated.version(), updated.updated_at_ms())};
+            if (!applySyncEvents({event}))
+            {
+                return;
+            }
+        }
+        handleFileUpdated(updated);
+        if (m_stateStore.hasGap())
+        {
+            sendSyncRequest(m_global_cursor);
+        }
         return;
     }
 
     if (envelope.has_message_push())
     {
-        AppendClientLog(QStringLiteral("handleIncomingEnvelope: message_push"));
-        const auto& message_push = envelope.message_push();
-        const QString event_id = QString::fromStdString(message_push.event_id());
-        if (!event_id.isEmpty())
+        const auto& pushed = envelope.message_push();
+        if (!pushed.event_id().empty())
         {
-            if (m_seen_event_ids.contains(event_id))
+            if (pushed.messages_size() != 1)
             {
-                m_global_cursor = qMax(m_global_cursor, static_cast<quint64>(envelope.seq()));
+                emit errorRaised(QStringLiteral("message event must contain exactly one message"));
                 return;
             }
-            m_seen_event_ids.insert(event_id);
+            if (!applySyncEvents({{envelope.seq(), QString::fromStdString(pushed.event_id()),
+                    QStringLiteral("message"), miniim::BuildMessagePayload(pushed.messages(0))}}))
+            {
+                return;
+            }
         }
-
-        for (const auto& message : message_push.messages())
+        if (m_stateStore.hasGap())
         {
-            emit messagePushed(BuildMessagePayload(message));
+            sendSyncRequest(m_global_cursor);
         }
-
-        m_global_cursor = qMax(m_global_cursor, static_cast<quint64>(envelope.seq()));
         return;
     }
 
     if (envelope.has_sync_response())
     {
-        AppendClientLog(QStringLiteral("handleIncomingEnvelope: sync_response"));
-        const auto& sync_response = envelope.sync_response();
-        for (const auto& event : sync_response.events())
+        const bool requested = QString::fromStdString(envelope.request_id()) == m_syncRequestId
+            && !m_syncRequestId.isEmpty();
+        if (requested)
         {
-            const QString event_id = QString::fromStdString(event.event_id());
-            if (!event_id.isEmpty())
-            {
-                if (m_seen_event_ids.contains(event_id))
-                {
-                    continue;
-                }
-                m_seen_event_ids.insert(event_id);
-            }
-
+            m_syncRequestId.clear();
+            m_syncRequestPayload.clear();
+            m_syncAttemptTime.invalidate();
+        }
+        const auto& response = envelope.sync_response();
+        QVector<MiniImStateEvent> events;
+        for (const auto& event : response.events())
+        {
+            MiniImStateEvent item{event.global_seq(), QString::fromStdString(event.event_id()), {}, {}};
             if (event.has_message())
             {
-                emit messagePushed(BuildMessagePayload(event.message()));
-                continue;
+                item.type = QStringLiteral("message");
+                item.data = miniim::BuildMessagePayload(event.message());
             }
-
-            if (event.has_conversation_updated())
+            else if (event.has_conversation_updated())
             {
-                emit conversationUpdated(BuildConversationPayload(event.conversation_updated()));
-                continue;
+                item.type = QStringLiteral("conversation");
+                item.data = miniim::BuildConversationPayload(event.conversation_updated());
             }
-
-            if (event.has_receipt())
+            else if (event.has_receipt())
             {
-                emit messageUpdated(BuildReceiptPayload(event.receipt()));
-                continue;
+                item.type = QStringLiteral("receipt");
+                item.data = miniim::BuildReceiptPayload(event.receipt());
             }
-
-            if (event.has_recall())
+            else if (event.has_recall())
             {
-                emit messageUpdated(BuildRecallPayload(event.recall()));
-                continue;
+                item.data = miniim::BuildRecallPayload(event.recall());
+                item.type = item.data.value(QStringLiteral("type")).toString();
             }
-
+            else if (event.has_file_updated())
+            {
+                const auto& file = event.file_updated();
+                item.type = QStringLiteral("file");
+                item.data = miniim::BuildFileProgressPayload(file.event_id(), file.file_id(), file.conversation_id(),
+                    file.transferred_bytes(), file.completed(), file.version(), file.updated_at_ms());
+            }
+            events.append(item);
+        }
+        if (!applySyncEvents(events))
+        {
+            return;
+        }
+        for (const auto& event : response.events())
+        {
             if (event.has_file_updated())
             {
-                const auto& updated = event.file_updated();
-                handleFileUpdated(
-                    updated.event_id(),
-                    updated.file_id(),
-                    updated.conversation_id(),
-                    static_cast<quint64>(updated.transferred_bytes()),
-                    updated.completed(),
-                    static_cast<quint64>(updated.version()),
-                    static_cast<qlonglong>(updated.updated_at_ms()),
-                    false);
+                handleFileUpdated(event.file_updated());
             }
         }
-
-        m_global_cursor = qMax(m_global_cursor, static_cast<quint64>(sync_response.new_global_cursor()));
-        m_global_cursor = qMax(m_global_cursor, static_cast<quint64>(envelope.seq()));
-        if (sync_response.has_more() && !sendSyncRequest(m_global_cursor))
+        if (requested && response.events().empty() && m_stateStore.hasGap())
         {
-            emit errorRaised(QStringLiteral("failed to request next sync page"));
+            emit errorRaised(QStringLiteral("server sync stream has an unresolved gap"));
+        }
+        else if (response.has_more() || m_stateStore.hasGap())
+        {
+            sendSyncRequest(m_global_cursor);
+        }
+        else if (requested)
+        {
+            m_messageSyncReady = true;
+            pumpMessageOutbox();
         }
         return;
     }
@@ -1826,6 +2097,12 @@ void MiniImSessionManager::handleIncomingEnvelope(const QByteArray& payload)
     {
         AppendClientLog(QStringLiteral("handleIncomingEnvelope: error"));
         const auto& error = envelope.error();
+        if (error.code() == 401)
+        {
+            restartConnection(QStringLiteral("session rejected; reconnecting"), true);
+        }
+        handleMessageResult(QString::fromStdString(envelope.request_id()), false, error.code(),
+            QString::fromStdString(error.message()), QString());
         const QString message = error.message().empty()
             ? QStringLiteral("server error")
             : QString::fromStdString(error.message());
@@ -1834,24 +2111,40 @@ void MiniImSessionManager::handleIncomingEnvelope(const QByteArray& payload)
     }
 }
 
-QVariantMap MiniImSessionManager::buildInitialStatePayload(const QString& user_id, quint64 global_cursor) const
+bool MiniImSessionManager::applySyncEvents(const QVector<MiniImStateEvent>& events)
 {
-    QVariantMap payload;
-    QVariantMap current_user;
-    current_user.insert(QStringLiteral("userId"), user_id);
-    payload.insert(QStringLiteral("currentUser"), current_user);
-    payload.insert(QStringLiteral("globalCursor"), static_cast<qulonglong>(global_cursor));
-    return payload;
+    QVector<MiniImStateEvent> applied;
+    if (!m_stateStore.apply(events, &applied))
+    {
+        emit errorRaised(m_stateStore.errorString());
+        disconnectFromServer();
+        return false;
+    }
+    m_global_cursor = m_stateStore.cursor();
+    for (const auto& event : applied)
+    {
+        if (event.type == QStringLiteral("message"))
+        {
+            emit messagePushed(event.data);
+        }
+        else if (event.type == QStringLiteral("conversation"))
+        {
+            emit conversationUpdated(event.data);
+        }
+        else if (event.type != QStringLiteral("file"))
+        {
+            emit messageUpdated(event.data);
+        }
+    }
+    publishMessageSends();
+    emit syncProgress({{"globalCursor", QVariant::fromValue(m_global_cursor)}, {"hasGap", m_stateStore.hasGap()}});
+    return true;
 }
 
 QString MiniImSessionManager::makeRequestId(const QString& suffix) const
 {
-    const auto now_ms = QDateTime::currentMSecsSinceEpoch();
-    if (suffix.isEmpty())
-    {
-        return QStringLiteral("%1-%2").arg(m_device_id).arg(now_ms);
-    }
-    return QStringLiteral("%1-%2-%3").arg(m_device_id).arg(suffix).arg(now_ms);
+    return m_device_id + QStringLiteral("-") + suffix + QStringLiteral("-")
+        + QUuid::createUuid().toString(QUuid::WithoutBraces);
 }
 
 void MiniImSessionManager::emitConnectionError(const QString& message)
@@ -1861,4 +2154,8 @@ void MiniImSessionManager::emitConnectionError(const QString& message)
     m_connected = false;
     emit errorRaised(message);
     emit connectionChanged(QStringLiteral("error"), QString());
+    if (m_connection == nullptr)
+    {
+        m_recovery.connectionLost();
+    }
 }

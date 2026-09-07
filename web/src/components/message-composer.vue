@@ -29,7 +29,7 @@
     <form class="composer-main" @submit.prevent="submitMessage">
       <textarea
         v-model="draft"
-        :disabled="disabled"
+        :disabled="disabled || submitting"
         rows="1"
         placeholder="输入消息"
         @keydown.enter.exact.prevent="submitMessage"
@@ -50,7 +50,7 @@
           min="5"
           max="604800"
         />
-        <button type="submit" :disabled="disabled || !draft.trim()">发送</button>
+        <button type="submit" :disabled="disabled || submitting || !draft.trim()">发送</button>
       </div>
     </form>
   </footer>
@@ -62,15 +62,16 @@ import { ref, watch } from 'vue';
 const props = defineProps<{
   disabled: boolean;
   downloadFileIdPreset: string;
+  sendMessage: (text: string, burnMode: number, burnTtlSec: number) => Promise<boolean>;
 }>();
 
 const emit = defineEmits<{
-  send: [text: string, burnMode: number, burnTtlSec: number];
   sendFile: [filePath: string];
   downloadFile: [fileId: string, savePath: string];
 }>();
 
 const draft = ref('');
+const submitting = ref(false);
 const burnEnabled = ref(false);
 const burnTtlSec = ref(30);
 const attachOpen = ref(false);
@@ -88,14 +89,18 @@ watch(
   }
 );
 
-function submitMessage(): void {
-  const text = draft.value.trim();
-  if (!text) {
-    return;
-  }
+async function submitMessage(): Promise<void> {
+  const originalDraft = draft.value;
+  const text = originalDraft.trim();
+  if (props.disabled || submitting.value || !text) return;
   const ttl = burnEnabled.value ? Math.max(5, Math.min(604800, Number(burnTtlSec.value) || 0)) : 0;
-  emit('send', text, burnEnabled.value ? 1 : 0, ttl);
-  draft.value = '';
+  submitting.value = true;
+  try {
+    const accepted = await props.sendMessage(text, burnEnabled.value ? 1 : 0, ttl);
+    if (accepted && draft.value === originalDraft) draft.value = '';
+  } finally {
+    submitting.value = false;
+  }
 }
 
 function submitFile(): void {

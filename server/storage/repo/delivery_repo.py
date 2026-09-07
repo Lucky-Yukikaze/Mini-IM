@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import json
 import time
-import uuid
 from dataclasses import dataclass
 
 from protocol.pb import common_pb2, message_pb2
-from storage.repo.conversation_repo import StoredSyncEvent
+from storage.repo.sync_event import AppendSyncEvents, PurgedMessageContent, RedactMessageEvents, StoredSyncEvent
 from storage.sqlite.db import MiniImSqliteDb
 
 
@@ -35,19 +33,11 @@ class DeliveryRepo:
     def _now_ms() -> int:
         return int(time.time() * 1000)
 
-    @staticmethod
-    def _next_global_seq(connection, user_id: str) -> int:
-        row = connection.execute(
-            "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM sync_events WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-        return int(row["next_seq"])
-
     def apply_receipt(self, user_id: str, conversation_id: str, last_read_seq: int) -> ReceiptApplyResult | None:
         now_ms = self._now_ms()
         connection = self.m_db.m_connection
 
-        with connection:
+        with self.m_db.transaction():
             member_row = connection.execute(
                 """
                 SELECT last_read_seq
@@ -177,30 +167,10 @@ class DeliveryRepo:
                 (conversation_id,),
             ).fetchall()
 
-            payload_event_id = str(uuid.uuid4())
-            receipt.event_id = payload_event_id
-            payload = receipt.SerializeToString()
-            sync_events: list[StoredSyncEvent] = []
-            for row in member_rows:
-                member_id = str(row["user_id"])
-                event_id = str(uuid.uuid4())
-                global_seq = self._next_global_seq(connection, member_id)
-                connection.execute(
-                    """
-                    INSERT INTO sync_events(event_id, user_id, seq, conversation_id, event_type, payload, created_at_ms)
-                    VALUES(?, ?, ?, ?, 'receipt', ?, ?)
-                    """,
-                    (event_id, member_id, global_seq, conversation_id, payload, now_ms),
-                )
-                sync_events.append(
-                    StoredSyncEvent(
-                        user_id=member_id,
-                        global_seq=global_seq,
-                        event_id=payload_event_id,
-                        event_type="receipt",
-                        payload=payload,
-                    )
-                )
+            sync_events = AppendSyncEvents(
+                connection, [str(row["user_id"]) for row in member_rows],
+                conversation_id, "receipt", receipt, now_ms,
+            )
 
         return ReceiptApplyResult(receipt=receipt, sync_events=sync_events, updated=True)
 
@@ -208,7 +178,7 @@ class DeliveryRepo:
         now_ms = self._now_ms()
         connection = self.m_db.m_connection
 
-        with connection:
+        with self.m_db.transaction():
             message_row = connection.execute(
                 """
                 SELECT sender_id, recalled
@@ -259,30 +229,11 @@ class DeliveryRepo:
                 (conversation_id,),
             ).fetchall()
 
-            payload_event_id = str(uuid.uuid4())
-            recall.event_id = payload_event_id
-            payload = recall.SerializeToString()
-            sync_events: list[StoredSyncEvent] = []
-            for row in member_rows:
-                member_id = str(row["user_id"])
-                event_id = str(uuid.uuid4())
-                global_seq = self._next_global_seq(connection, member_id)
-                connection.execute(
-                    """
-                    INSERT INTO sync_events(event_id, user_id, seq, conversation_id, event_type, payload, created_at_ms)
-                    VALUES(?, ?, ?, ?, 'recall', ?, ?)
-                    """,
-                    (event_id, member_id, global_seq, conversation_id, payload, now_ms),
-                )
-                sync_events.append(
-                    StoredSyncEvent(
-                        user_id=member_id,
-                        global_seq=global_seq,
-                        event_id=payload_event_id,
-                        event_type="recall",
-                        payload=payload,
-                    )
-                )
+            RedactMessageEvents(connection, message_id)
+            sync_events = AppendSyncEvents(
+                connection, [str(row["user_id"]) for row in member_rows],
+                conversation_id, "recall", recall, now_ms,
+            )
 
         return RecallApplyResult(recall=recall, sync_events=sync_events, updated=True)
 
@@ -295,7 +246,7 @@ class DeliveryRepo:
         sync_events: list[StoredSyncEvent] = []
         affected_message_ids: set[str] = set()
 
-        with connection:
+        with self.m_db.transaction():
             rows = connection.execute(
                 """
                 SELECT
@@ -335,33 +286,16 @@ class DeliveryRepo:
                 if updated_rows <= 0:
                     continue
 
-                payload_event_id = str(uuid.uuid4())
                 recall = message_pb2.Recall(
-                    event_id=payload_event_id,
                     conversation_id=conversation_id,
                     message_id=message_id,
                     ts_ms=now_ms,
                     operator_id="system-burn",
                 )
-                payload = recall.SerializeToString()
-                event_id = str(uuid.uuid4())
-                global_seq = self._next_global_seq(connection, target_user_id)
-                connection.execute(
-                    """
-                    INSERT INTO sync_events(event_id, user_id, seq, conversation_id, event_type, payload, created_at_ms)
-                    VALUES(?, ?, ?, ?, 'recall', ?, ?)
-                    """,
-                    (event_id, target_user_id, global_seq, conversation_id, payload, now_ms),
-                )
-                sync_events.append(
-                    StoredSyncEvent(
-                        user_id=target_user_id,
-                        global_seq=global_seq,
-                        event_id=payload_event_id,
-                        event_type="recall",
-                        payload=payload,
-                    )
-                )
+                sync_events.extend(AppendSyncEvents(
+                    connection, [target_user_id], conversation_id, "recall", recall, now_ms,
+                ))
+                RedactMessageEvents(connection, message_id, target_user_id)
                 affected_message_ids.add(message_id)
 
             for message_id in affected_message_ids:
@@ -390,14 +324,14 @@ class DeliveryRepo:
         connection = self.m_db.m_connection
         purged = 0
 
-        with connection:
+        with self.m_db.transaction():
             rows = connection.execute(
                 """
                 SELECT m.server_msg_id, m.type, m.content
                 FROM messages AS m
                 WHERE m.burn_mode = ?
                   AND m.recalled = 1
-                  AND LENGTH(m.content) > 0
+                  AND m.content_purged_at_ms = 0
                   AND NOT EXISTS(
                     SELECT 1
                     FROM message_deliveries AS d
@@ -420,12 +354,13 @@ class DeliveryRepo:
                 affected = connection.execute(
                     """
                     UPDATE messages
-                    SET content = ?
+                    SET content = ?, content_purged_at_ms = ?
                     WHERE server_msg_id = ?
-                      AND LENGTH(content) > 0
+                      AND content_purged_at_ms = 0
                     """,
-                    (replacement, message_id),
+                    (replacement, self._now_ms(), message_id),
                 ).rowcount
+                RedactMessageEvents(connection, message_id)
                 if affected > 0:
                     purged += affected
 
@@ -433,19 +368,4 @@ class DeliveryRepo:
 
     @staticmethod
     def _build_purged_content(message_type: int, content: bytes) -> bytes:
-        if int(message_type) != int(common_pb2.MSG_FILE):
-            return b""
-        file_id = ""
-        try:
-            parsed = json.loads(content.decode("utf-8"))
-            if isinstance(parsed, dict):
-                file_id = str(parsed.get("fileId", "")).strip()
-        except Exception:
-            file_id = ""
-        if not file_id:
-            return b""
-        minimal_payload = {
-            "kind": "file",
-            "fileId": file_id,
-        }
-        return json.dumps(minimal_payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        return PurgedMessageContent(message_type, content)

@@ -19,6 +19,8 @@ message FileInit {
 message FileFinish {
   string file_id = 1;
   bool success = 2;
+  uint64 transferred_bytes = 3;
+  string sha256 = 4;
 }
 
 message FileUpdated {
@@ -29,4 +31,9 @@ message FileUpdated {
   bool completed = 5;
   uint64 version = 6;
   int64 updated_at_ms = 7;
+  uint64 file_size = 8;
+  string sha256 = 9;
+  im.common.FileTransferDirection direction = 10;
+  string status = 11;
+  string file_name = 12;
 }

@@ -39,6 +39,8 @@ void AppendBridgeLog(const QString& message)
 ImBridge::ImBridge(QObject* parent)
     : QObject(parent)
 {
+    QObject::connect(&m_session_manager, &MiniImSessionManager::messageSendsChanged, this, &ImBridge::messageSendsChanged);
+    QObject::connect(&m_session_manager, &MiniImSessionManager::syncProgress, this, &ImBridge::syncProgress);
     QObject::connect(
         &m_session_manager,
         &MiniImSessionManager::connectionChanged,
@@ -187,4 +189,9 @@ bool ImBridge::downloadFile(
     quint32 priority)
 {
     return m_session_manager.downloadFile(conversation_id, source_file_id, save_path, priority);
+}
+
+bool ImBridge::retryMessage(const QString& conversationId, const QString& clientMsgId)
+{
+    return m_session_manager.retryMessage(conversationId, clientMsgId);
 }

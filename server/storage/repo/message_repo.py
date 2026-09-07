@@ -5,7 +5,7 @@ import uuid
 from dataclasses import dataclass
 
 from protocol.pb import message_pb2
-from storage.repo.conversation_repo import StoredSyncEvent
+from storage.repo.sync_event import AppendSyncEvents, StoredSyncEvent
 from storage.sqlite.db import MiniImSqliteDb
 
 
@@ -24,14 +24,6 @@ class MessageRepo:
     @staticmethod
     def _now_ms() -> int:
         return int(time.time() * 1000)
-
-    @staticmethod
-    def _next_global_seq(connection, user_id: str) -> int:
-        row = connection.execute(
-            "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM sync_events WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-        return int(row["next_seq"])
 
     @classmethod
     def _compute_burn_at_ms(cls, burn_mode: int, burn_ttl_sec: int, started_at_ms: int) -> int | None:
@@ -112,7 +104,7 @@ class MessageRepo:
         burn_ttl_sec = int(send_message.burn_ttl_sec)
 
         connection = self.m_db.m_connection
-        with connection:
+        with self.m_db.transaction():
             next_seq_row = connection.execute(
                 "SELECT COALESCE(MAX(conversation_seq), 0) + 1 AS next_seq FROM messages WHERE conversation_id = ?",
                 (send_message.conversation_id,),
@@ -229,19 +221,10 @@ class MessageRepo:
                 burn_ttl_sec=burn_ttl_sec,
             )
 
-            payload = message.SerializeToString()
-            sync_events: list[StoredSyncEvent] = []
-            payload_event_id = str(uuid.uuid4())
+            sync_events = AppendSyncEvents(
+                connection, member_ids, send_message.conversation_id, "message", message, now_ms,
+            )
             for member_id in member_ids:
-                event_id = str(uuid.uuid4())
-                global_seq = self._next_global_seq(connection, member_id)
-                connection.execute(
-                    """
-                    INSERT INTO sync_events(event_id, user_id, seq, conversation_id, event_type, payload, created_at_ms)
-                    VALUES(?, ?, ?, ?, 'message', ?, ?)
-                    """,
-                    (event_id, member_id, global_seq, send_message.conversation_id, payload, now_ms),
-                )
                 connection.execute(
                     """
                     INSERT INTO sync_cursors(user_id, conversation_id, last_seq, updated_at_ms)
@@ -250,15 +233,6 @@ class MessageRepo:
                     DO UPDATE SET last_seq = excluded.last_seq, updated_at_ms = excluded.updated_at_ms
                     """,
                     (member_id, send_message.conversation_id, conversation_seq, now_ms),
-                )
-                sync_events.append(
-                    StoredSyncEvent(
-                        user_id=member_id,
-                        global_seq=global_seq,
-                        event_id=payload_event_id,
-                        event_type="message",
-                        payload=payload,
-                    )
                 )
 
         return StoredMessage(message=message, sync_events=sync_events)

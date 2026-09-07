@@ -1,604 +1,163 @@
-# Mini-IM 系统 - AGENTS.md（Qt 宿主 + Web UI + QUIC + Protobuf 版）
-
-## 1. 项目定位
-
-Mini-IM 是一个基于 `Qt 6 + C++` 的桌面 IM 项目。
-
-当前重构目标不是继续扩展旧版 `WebSocket` 原型，而是重建一套可持续演进的 IM 内核，满足以下约束：
-
-* Qt 原生层持有 QUIC 连接
-* Web UI 只负责界面与交互，不直接接触传输层
-* 应用层协议统一使用 Protobuf
-* 业务可靠性依赖应用层幂等、ACK、同步游标与状态恢复
-* 第一阶段先用 SQLite 做单机版可靠内核，后续可迁移到 Redis + PostgreSQL/MySQL
-
-当前实现口径（更新于 2026-04-29）：
-
-* 客户端构建链路已接入 `MsQuic`（vcpkg）
-* Phase 2 链路 `Hello / Welcome / Heartbeat / 会话恢复 / initialStateLoaded` 已打通
-* Phase 3 链路 `send_message / Ack / message_push / SyncRequest / SyncResponse` 已打通
-* 单聊消息闭环（发送、落库、幂等、补偿同步）已完成
-* Phase 4 链路 `create_conversation / receipt / recall / conversation_updated` 已打通
-* 群聊、成员落库、已读推进、撤回、多端恢复已完成
-* 群消息未读标签采用 `message_read_counters` 缓存读模型
-* 客户端运行时 QUIC 已切换为纯 C++ `MsQuic` 实现
-* `quic_client_worker.py` 仅保留为调试参考，不参与默认运行链路
-* Phase 5 文件双向闭环已打通：上传/下载 `FileInit/FileFinish`、独立 QUIC 文件流、断点续传、故障注入
-* 文件状态事件 `FileUpdated` 已补充 `version/updated_at_ms`，客户端按版本单调接收
-* `FileFinish(success=true)` 增加完整性门禁：`transferred_bytes == file_size` 且 `sha256` 校验通过
-* `client_file_id` 已采用发送意图 ID（intent_id）语义，并增加同 intent 的 `file_size` 防错校验
-* intent 僵尸任务已支持软回收：超时上传任务可标记 `failed_stale` 并由新 `FileInit` 接管
-* 文件上传完成后可生成 `MSG_FILE` 消息事件（引用 `file_id`）
-* `direction=DOWNLOAD` 已打通服务端主动下发文件流与客户端落盘闭环
-* 已补充大文件与故障恢复自动化测试场景（Phase 5）
-* Phase 6 阅后即焚已落地：`burn_mode/burn_ttl_sec` 全链路生效，发送者与接收者统一按已读后 TTL 焚毁
-* `message_deliveries` 已增加 `burn_started_at_ms/burn_at_ms/burned_at_ms`，服务端按批扫描到期焚毁并写入 `system-burn` 事件
-* 焚毁后内容清理已落地：文本消息正文清空，文件消息仅保留 `{"kind":"file","fileId":"..."}` 最小引用元数据
-* 已增加 `MINIIM_BURN_ENABLED` 与焚毁扫描批次配置开关，支持运行时快速回退
-* 已完成 Phase 6 自动化回归与 10 分钟稳定性压测（600 秒）
-* Web UI 已重构为现代聊天软件布局：左会话、中消息、右详情、调试抽屉
-* 群聊已补齐建群、加群、退群、拉人、移除成员、改群名；单聊可通过已登录用户名创建
-* 当前不引入正式账号系统；联调用 `dev-token:<用户名>` 写入用户表，用户存在性以“登录过”为准
-* 前端消息渲染已改为轻量虚拟列表，消息入库采用批量写入与二分插入
-* 单聊已读态已在 UI 层展示为 `未读/已读`，群聊继续展示 `x 人未读`
-* 文件消息卡片已展示源文件 ID，文件传输栏展示传输任务 ID，下载保存目录会自动补默认文件名
-* 文件上传/下载发送缓冲区已统一为堆上下文，避免 `SEND_COMPLETE` 后释放错误导致闪退
-* 状态同步已补齐 `SyncResponse.has_more` 分页续拉，避免大量 `file_updated` 阻塞后续状态事件
-* 前端状态已补齐消息先后乱序兜底：撤回、焚毁、已读和文件进度可在消息后到时正确合并
-* `unreadTotal` 与文件进度已迁入 Pinia 状态，按消息、receipt、`fileId/version` 单调更新
-
----
-
-## 2. 技术路线
-
-### 2.1 客户端
-
-* `Qt 6`
-* `C++`
-* `QWebEngine`
-* `QWebChannel`
-* `MsQuic`
-* `protobuf`
-
-### 2.2 Web UI
-
-* `Vue 3`
-* `TypeScript`
-* `Vite`
-* `Pinia`
-* `naive-ui` 仅作为辅助组件库
-
-### 2.3 服务端
-
-* `Python 3.10+`
-* `asyncio`
-* `aioquic`
-* `protobuf`
-* `SQLite`
-
----
-
-## 3. 总体架构
-
-```text
-Qt Client
-├─ UI 宿主
-│  ├─ MainWindow / QWebEngine
-│  └─ QWebChannel Bridge
-├─ IM Core
-│  ├─ QUIC Session Manager
-│  ├─ Message Service
-│  ├─ Sync Engine
-│  ├─ File Transfer Manager
-│  └─ Local Cache
-└─ SQLite（本地可选缓存）
-
-Web UI
-├─ 会话列表
-├─ 聊天页面
-├─ 文件卡片
-└─ Bridge Event Store
-
-QUIC Server
-├─ QUIC Gateway
-├─ Auth Service
-├─ Conversation Service
-├─ Message Service
-├─ Delivery Service
-├─ File Service
-├─ Sync Service
-└─ SQLite
-```
-
----
-
-## 4. 核心边界
-
-### 4.1 Qt 原生层职责
-
-* 持有并管理 QUIC 连接
-* 管理登录、重连、心跳、同步、文件传输
-* 承担 protobuf 编解码
-* 向 Web UI 暴露高层 API
-* 向 Web UI 推送高层事件
-
-### 4.2 Web UI 职责
-
-* 展示会话、消息、文件、状态
-* 响应用户交互
-* 调用 bridge API
-* 订阅 bridge 事件并刷新状态
-
-### 4.3 明确禁止
-
-* Web UI 禁止直接访问 QUIC
-* Web UI 禁止处理 protobuf 字节流
-* Web UI 禁止直接实现重连、ACK、同步状态机
-* Qt 宿主层禁止把业务逻辑散落到页面脚本中
-
----
-
-## 5. 客户端目录基线
-
-```text
-client/
-├── core/
-│   ├── quic/
-│   ├── protocol/
-│   ├── session/
-│   ├── sync/
-│   ├── message/
-│   ├── file/
-│   └── model/
-├── bridge/
-├── ui/
-│   └── webview/
-└── main.cpp
-
-web/
-├── src/
-│   ├── api/
-│   ├── store/
-│   ├── components/
-│   ├── views/
-│   ├── events/
-│   └── types/
-├── index.html
-└── vite.config.ts
-```
-
----
-
-## 6. 服务端目录基线
-
-```text
-server/
-├── quic/
-├── protocol/
-│   └── handlers/
-├── services/
-│   ├── auth/
-│   ├── conversation/
-│   ├── message/
-│   ├── delivery/
-│   ├── file/
-│   └── sync/
-├── storage/
-│   ├── sqlite/
-│   └── repo/
-└── main.py
-```
-
----
-
-## 7. 协议设计原则
-
-### 7.1 统一信封
-
-所有控制面请求统一使用 `Envelope + oneof body`。
-
-固定元信息至少包括：
-
-* `version`
-* `request_id`
-* `channel`
-* `session_id`
-* `device_id`
-* `seq`
-* `client_time_ms`
-* `trace_id`
-
-### 7.2 通道约定
-
-* `CHANNEL_CONTROL`：登录、消息控制、ACK、同步、会话事件
-* `CHANNEL_FILE`：文件控制面
-
-说明：
-
-* `channel` 是逻辑通道，不等于 QUIC stream id
-* 文件数据分片不走 protobuf，不塞进普通消息发送队列
-* 文件二进制走独立 QUIC stream
-
-### 7.3 幂等原则
-
-所有写操作必须支持幂等：
-
-* `request_id`：请求级幂等键
-* `client_msg_id`：消息实体级幂等键
-* `client_conv_id`：建会话级幂等键
-* `client_file_id`：文件初始化级幂等键
-
-`request_id` 规则：
-
-* 格式建议：`client_id + monotonic_counter`
-* 在单个 session 内唯一
-* 服务端保存短期去重缓存
-
-### 7.4 服务端事件 ID
-
-所有服务端推送事件都必须带可去重的 `event_id`。
-
-适用范围至少包括：
-
-* `MessagePush`
-* `Recall`
-* `Receipt`
-* `ConversationUpdated`
-* `SyncResponse` 中的同步事件
-
-客户端必须基于 `event_id` 做去重，不能把去重逻辑散落在 UI 层。
-
-补充约束：
-
-* `event_id` 在单个用户的同步流内必须全局唯一
-* `seq` 用于同步推进与排序
-* `event_id` 用于事件去重
-* 禁止混用 `seq` 和 `event_id` 的职责
-
-### 7.5 三层确认
-
-* 传输确认：QUIC 负责到达
-* 应用确认：服务端成功处理请求后返回 `Ack`
-* 业务确认：消息被投递、已读、撤回、生效后返回 `Receipt` 或控制事件
-
-禁止把三层确认混为一层。
-
----
-
-## 8. 数据模型原则
-
-必须优先围绕以下实体设计：
-
-* `User`
-* `Device`
-* `Session`
-* `Conversation`
-* `Message`
-* `Attachment`
-
-### 8.1 会话模型
-
-* 一个用户可以有多个设备
-* 一个设备可以有多次会话
-* QUIC 连接断开不等于业务 session 立即失效
-
-### 8.2 消息模型
-
-每条消息至少要有：
-
-* `client_msg_id`
-* `server_msg_id`
-* `conversation_seq`
-* `request_id`
-
-### 8.3 群聊模型
-
-群聊不是单聊多播版，必须有独立实体与成员关系。
-
-建议：
-
-* 消息正文在 `messages` 中只存一份
-* 投递状态在 `message_deliveries` 中按用户跟踪
-
----
-
-## 9. SQLite 设计原则
-
-### 9.1 基本要求
-
-* 开启 `WAL`
-* 写请求统一走单写队列
-* 表结构先规范化，避免一表塞所有字段
-* 时间统一使用毫秒时间戳
-
-### 9.2 第一版核心表
-
-* `users`
-* `devices`
-* `sessions`
-* `conversations`
-* `conversation_create_requests`
-* `conversation_members`
-* `messages`
-* `message_deliveries`
-* `message_read_counters`
-* `attachments`
-* `sync_cursors`
-
-### 9.3 游标原则
-
-采用多维游标：
-
-* `per user + per conversation`
-
-说明：
-
-* 全局游标负责统一增量同步入口
-* 会话游标负责按会话追平与历史补拉
-* `conversation_id` 不使用 `NULL` 语义偷表达全局，建议使用固定哨兵值
-
-### 9.4 投递状态机
-
-`message_deliveries` 至少支持：
-
-* `sent`
-* `delivered`
-* `read`
-* `failed`
-
-并记录：
-
-* `delivered_at`
-* `read_at`
-* `failed_at`
-* `failure_reason`
-* `conversation_id`
-* `seq`
-
-### 9.5 群消息未读标签缓存
-
-群聊消息上的 `xx 人未读` 标签采用“真值 + 缓存”双层口径：
-
-* 真值：`conversation_members.last_read_seq`
-* 缓存：`message_read_counters`
-
-约束：
-
-* `message_read_counters` 只是展示缓存，不得作为业务真值
-* 已读推进必须以 `last_read_seq` 单调递增为准
-* 缓存错误允许重算，真值错误不允许
-* `member_count` 采用消息发送当时的成员数口径
-* 默认排除发送者本人，不把发送者算入该消息的未读人数
-
----
-
-## 10. 同步与恢复原则
-
-IM 的重点不是“发出去”，而是“状态可恢复”。
-
-### 10.1 重连必须带上
-
-* `session_id` 或 `resume_session_id`
-* `device_id`
-* `global_cursor`
-* 最近请求确认信息
-
-### 10.2 服务端返回的信息必须支持判断
-
-* 当前会话能否恢复
-* 从哪个游标开始补偿
-* 是否需要重新认证
-* 当前会话对应的 `user_id`
-
-### 10.3 心跳职责
-
-心跳只做两件事：
-
-* 保活
-* 在线状态判断
-
-禁止把业务逻辑塞进心跳。
-
-### 10.4 同步语义
-
-同步返回的是事件流，不只是消息列表。
-
-至少要支持同步以下事件：
-
-* 消息事件
-* 撤回事件
-* 已读推进事件
-* 会话更新事件
-* 文件状态事件
-
-`SyncResponse` 必须以统一事件结构承载这些变化，避免后续再拆第二套同步协议。
-
-实现上应统一采用 `SyncEvent` 外壳承载事件体，禁止回退到“消息列表 + 其他接口”的拆分方案。
-
----
-
-## 11. 文件传输原则
-
-### 11.1 控制面
-
-通过 protobuf 控制消息完成：
-
-* `FileInit`
-* `FileFinish`
-
-建议预留：
-
-* `priority`
-
-说明：
-
-* `priority` 是传输层调度 hint
-* `priority` 不代表业务优先级
-* `priority` 不改变业务语义，只影响文件传输调度策略
-
-### 11.2 数据面
-
-* 文件内容通过独立 QUIC stream 传输
-* 支持断点续传
-* 支持校验
-* 不与普通聊天消息抢同一调度队列
-* `FileFinish(success=true)` 前必须满足 `transferred_bytes == file_size`
-* `FileUpdated` 建议携带 `version` 与 `updated_at_ms`，客户端按版本单调处理
-
----
-
-## 12. Bridge 约束
-
-### 12.1 Web UI 可调用的高层 API
-
-* `connect`
-* `disconnect`
-* `sendMessage`
-* `recallMessage`
-* `sendReceipt`
-* `createConversation`
-* `sendFile`
-* `loadHistory`
-
-### 12.2 Qt 可推送给 Web UI 的事件
-
-* `connectionChanged`
-* `initialStateLoaded`
-* `messagePushed`
-* `messageUpdated`
-* `conversationUpdated`
-* `syncProgress`
-* `fileProgress`
-* `errorRaised`
-
-Bridge 层只传高层语义对象，不传底层字节流。
-
-`initialStateLoaded` 至少应包含：
-
-* 当前登录用户信息
-* 会话列表
-* 最近消息
-* 未读数
-
----
-
-## 13. 开发顺序
-
-### 第一阶段
-
-* QUIC 连接打通
-* `Hello / Welcome`
-* 心跳
-* 工程骨架可运行
-
-### 第二阶段
-
-* 登录态
-* 会话恢复骨架
-* `initialStateLoaded`
-
-### 第三阶段
-
-* 单聊发送
-* 应用层 `Ack`
-* SQLite 落库
-* 去重
-* `SyncRequest / SyncResponse`
-
-### 第四阶段
-
-* 群聊
-* 会话成员管理
-* 已读
-* 撤回
-
-### 第五阶段
-
-* 文件传输
-* 分片
-* 断点续传
-* 故障注入与压测
-
-### 第六阶段
-
-* 阅后即焚
-* 稳定性收尾与回归
-
----
-
-## 14. 测试要求
-
-必做：
-
-* protobuf 编解码测试
-* 登录与恢复测试
-* 单聊消息测试
-* 幂等去重测试
-* 同步补偿测试
-* 群聊测试
-* 撤回与已读测试
-* 文件断点续传测试
-* 服务端宕机恢复测试
-
-建议补充：
-
-* 多设备并发测试
-* 群消息高压测试
-* 重复提交测试
-* 重复 ACK 测试
-
----
-
-## 15. 底线原则
-
-后续所有设计和实现都不能破坏以下四条：
-
-* 传输层只负责到达
-* 应用层负责语义
-* 每个写操作都可重试
-* 每个状态都可恢复
-
-如果新功能破坏这四条，优先回退设计，不要硬加。
-
-## 16. 编码规范
-
-### 16.1 命名
-
-| 类型 | 规则 | 示例 |
-|------|------|------|
-| 文件名 | 全小写 | `applegamemodel.h` |
-| 类名 | 前缀 + 驼峰 | `AppleGameModel` |
-| 成员变量 | `m_` 前缀 | `m_appleList` |
-| 静态成员 | `s_` 前缀 | `s_instance` |
-| 全局变量 | `g_` 前缀 | `g_running` |
-| 成员函数 | 小写驼峰 | `startGame()` |
-| 非成员函数 | 大写驼峰 | `GetObjectCount()` |
-| 宏 | 全大写下划线 | `MAX_APPLE_COUNT` |
-| 命名空间 | 全小写 | `namespace apple {}` |
-
-### 16.2 头文件
-
-每个头文件必须带规范注释头和 include guard。
-
-### 16.3 强制规则
-
-- 单参构造必须 `explicit`
-- 虚函数重写必须 `override`
-- 无拷贝需求时必须 `= delete`
-- 禁止使用 `NULL`，统一使用 `nullptr`
-- 禁止 `malloc/free`
-- 禁止 `new[]/delete[]`
-- 禁止 `using namespace std`
-- 禁止无意义重复代码
-- 禁止在代码中硬编码路径分隔符
-- 常量优先使用 `constexpr`
-- UI 文案允许中文，除此之外禁止中文硬编码
-
-### 16.4 格式要求
-
-- 花括号独占一行
-- 推荐单行不超过 `120` 字符
-- 函数尽量不超过 `80` 行
-- 复杂逻辑必须拆分
-
----
+# Mini-IM 开发约束
+
+本文件维护长期开发规则，不维护功能完成清单。
+以下约束描述目标边界与开发要求，不声明当前代码已经全部满足。
+修改前核对实际调用路径；差距及验证结果统一记录在 [执行记录](docs/refactoring-progress.md)。
+
+## 工作方式与文档职责
+
+- KISS = 用满足需求的最简单实现解决问题；先调研当前代码、调用路径和测试，再做最小必要设计。
+  业务目标或影响范围确实不明确时向用户确认，已有授权内的常规实现选择自行推进。
+- 代码与实际运行结果决定当前状态。声明、计划、目录名称和历史测试记录均不能单独证明功能完成。
+- 按模块推进，每步保留可运行版本；修复问题时加入能检出该问题的测试，避免只验证实现细节。
+- [README.md](README.md) 是项目入口；[开发指南](docs/development.md) 维护安装、运行、配置与验证命令；本文件维护架构和编码约束。
+- [执行记录](docs/refactoring-progress.md) 是当前任务、验证结果和剩余事项的唯一进度记录；[PLANS.md](PLANS.md) 只提供计划入口。
+- [REPORT.md](REPORT.md) 解释设计与展示口径；[基线评估](docs/architecture-review-2026-09-07.md) 保存历史证据，不作为最新缺陷清单。
+
+修改行为、命令或开发流程时同步更新负责该内容的文档，其他文档用链接引用。
+新增文档前先确认现有文档是否可以容纳；README 保持总入口，PLANS 保持导航。
+“当前实现”“目标约束”“历史结果”分别标明；代码已有改动但未完成验证时写为“已实现，待验收”。
+
+验证记录注明日期、环境、命令、结果及未覆盖范围。
+同日多轮检查按实施批次记录，注明适用改动；后续代码变化不能沿用旧结果宣称验证通过。
+修复结果写入执行记录，保留历史评估的当时结论；提交前更新当前摘要与剩余事项。
+每个阶段完成并通过相应验证后，提交到本地 Git；持续重构中的已验收模块也分别提交。
+提交说明写明实际交付范围和验证结果，整体阶段尚未完成时保留其未完成状态。
+
+仓库内文档使用相对链接；本机路径只作为可替换示例，临时文件注明是否入库及是否为复现前提。
+调整标题或移动文件时同步修正引用；编辑后检查 UTF-8、文件链接、章节链接和命令示例。
+
+## 项目边界
+
+Mini-IM 是 Qt 6/C++ 桌面即时通讯项目。保留 Qt 原生连接、Vue 页面、Protobuf 应用协议、
+Python asyncio/aioquic 服务端和 SQLite 单机内核；替换组件须有需求或实测依据。
+
+- Qt 原生层负责 QUIC 连接、协议编解码、登录与恢复、重连、心跳、请求重试、同步和文件任务。
+- Vue 3/TypeScript 页面通过 QWebChannel 调用高层接口，Pinia 保存界面展示状态。
+- 服务端负责用户、会话成员、消息、投递、文件和统一同步事件，存储层负责一致写入。
+- 页面不得直接访问 QUIC、处理 Protobuf 字节流，或实现重连、请求确认及同步状态机。
+- Bridge = Qt 与页面之间传递业务对象的接口；不得向页面传递传输字节或连接句柄。
+- Qt 宿主只承载界面和接口；不要把业务逻辑散落到页面脚本。
+
+默认开发登录继续使用 dev-token:<用户名>，以登录过的用户为存在性依据。
+这属于联调约定，不代表正式认证；生产认证、证书验证和外网部署须另行明确产品目标。
+
+## 模块组织
+
+客户端按 client/core/quic、protocol、session、sync、message、file、model 分职责；
+client/bridge 负责页面接口，client/ui 负责宿主。
+服务端按 server/quic、protocol/handlers、services/<业务域>、storage/repo、storage/sqlite 分职责。
+Web 按 web/src/api、store、components、views、events、types 分职责。
+目录可以随模块迁移逐步建立；空目录和空类不算完成分层，不为凑齐目录创建无行为抽象。
+
+## 协议与可靠性
+
+- 所有控制消息使用 Envelope + oneof body；保留 version、request_id、channel、session_id、
+  device_id、seq、client_time_ms、trace_id。
+- CHANNEL_CONTROL 承载登录、消息、确认、同步和会话事件；CHANNEL_FILE 承载文件控制。
+  channel 是逻辑分类，与 QUIC stream id 分开。
+- 文件二进制使用独立 QUIC stream，不放入 Protobuf 控制消息或普通消息发送队列。
+- 控制流使用 4 字节大端长度前缀，接收端必须处理拆包、合包、非法长度和不完整消息。
+- Protobuf 定义在 proto/；字段号不可重用，兼容扩展用新字段；生成文件通过工具生成。
+- 幂等 = 同一个写入意图重复执行，不增加重复业务实体或重复业务效果。
+- request_id 标识请求；client_msg_id、client_conv_id、client_file_id 分别标识消息、建会话、文件意图。
+  重试复用原 ID；新的用户意图使用新 ID。请求 ID 在会话内唯一，避免仅靠毫秒时间戳。
+- event_id 是一次事件的稳定标识，在单用户同步流内唯一；在线推送与历史重放必须一致。
+- 消息的 conversation_seq 用于会话内排序，SyncEvent.global_seq 是事件在单用户全局同步流中的位置；
+  event_id 用于去重。客户端事件去重集中在 Qt 核心，禁止直接用请求序号推进同步位置。
+- 同步游标 = 已完整应用并保存的连续事件位置；不能因为收到更大的在线事件位置而跳过未处理历史。
+- ACK = 服务端处理请求后返回的应用确认；成功 ACK 必须晚于相应业务事务提交。
+  QUIC 到达确认、应用 ACK、已读等业务确认分别处理，不混用。
+- 收到重复 ACK、断连和进程重启时，待确认写入仍须可恢复并使用原意图重试。
+
+四条底线：传输层负责到达，应用层负责语义，每个写操作可重试，每个状态可恢复。
+
+## 数据与事务
+
+- 核心实体包括 User、Device、Session、Conversation、Message、Attachment，群聊有独立成员关系。
+- 一个用户可有多个设备，一个设备可多次建立会话；断开 QUIC 不等于业务会话立刻失效。
+- messages 保存消息正文，message_deliveries 按用户保存投递状态；消息包含 client_msg_id、
+  server_msg_id、conversation_seq、request_id。
+- 数据库时间使用毫秒。SQLite 每个连接正确设置 WAL、同步策略和外键检查。
+  WAL = 先把变更写入日志，再合并到数据库文件的模式。
+- 写入通过单一受控入口顺序执行；写队列必须承载完整业务事务，不能拆成逐条提交的 SQL。
+  事务 = 一组数据库写入共同提交或共同回滚。
+- 业务状态与对应同步事件共同提交；文件完成与生成文件消息也必须共同提交。
+  仓储中的嵌套事务不得提前提交调用方事务。
+- 数据库迁移必须兼容已有数据；验证新建数据库与旧结构升级，不直接清空用户数据。
+- 全局游标负责统一增量入口，会话游标负责该会话追平与历史补拉。
+  全局记录使用明确哨兵值，不用空值暗示含义。
+- 投递状态至少区分 sent、delivered、read、failed，并保存对应时间和失败原因。
+  不把“服务端写入成功”当成“客户端已收到”。
+
+核心表按实现演进：users、devices、sessions、conversations、conversation_create_requests、
+conversation_members、messages、message_deliveries、message_read_counters、attachments、
+file_transfers、sync_events、sync_cursors。
+
+## 已读、撤回与焚毁
+
+- conversation_members.last_read_seq 是已读真值，只能推进。
+- message_read_counters 是可重算的展示缓存；按消息发送时的成员数计算，排除发送者本人。
+- 同步统一使用 SyncEvent，承载消息、撤回、已读、会话更新和文件状态，禁止拆成互不关联的恢复接口。
+- 旧消息重放不得覆盖已生效的撤回或焚毁状态；先收到状态变化时，消息后到也必须正确合并。
+- 用户切换必须隔离会话、消息、已读、文件任务、待处理事件和恢复位置。
+- 阅后即焚按用户投递记录计时；发送者入库即视为已读，接收者首次已读后开始计时。
+  TTL = 从开始计时到焚毁的秒数；有效范围为 5 至 604800，关闭模式为 0。
+  调整范围时同步修改 [服务端校验](server/services/message/service.py)、客户端输入及边界测试。
+- 焚毁扫描必须可重复执行；用户已经焚毁的正文不能从同步事件副本或客户端缓存重新取回。
+- 全员焚毁后清理正文；文件消息只保留业务需要的最小文件引用。清理不得破坏其他用户尚可读取的内容。
+- 保留 MINIIM_BURN_ENABLED 和扫描批次配置；关闭功能不恢复已焚毁内容。
+
+## 文件传输
+
+- FileInit、FileFinish 负责控制；FileUpdated 带单调版本和更新时间，旧版本不能覆盖新状态。
+- client_file_id 是发送意图 ID；断线或进程重启后继续原任务，不自动改成新上传。
+  复用意图时校验大小、摘要、方向及引用一致性。
+- 文件流与控制流独立仍需应用层调度；按发送进度分批读取，限制未完成发送数据。
+- priority 只影响传输调度，不改变业务权限、状态与一致性。
+- 完成条件是实际接收/落盘字节数等于 file_size 且 SHA-256 校验通过。
+  下载由下载端落盘校验后确认；发送队列接受数据或流关闭都不能直接代表业务完成。
+- 处理部分写入、磁盘错误、截断、取消、重复完成与恢复偏移；中断不得报告成功。
+- 续传和过期任务接管须保证已有数据与记录一致；失败任务保留可恢复意图。
+
+## 页面接口
+
+页面操作采用 connect、disconnect、sendMessage、retryMessage、recallMessage、sendReceipt、
+createConversation、sendFile、loadHistory 等高层语义，成员管理和下载接口按相同边界扩展。
+QWebChannel 方法调用是异步的，接口封装必须正确处理完成回调与错误。
+发送消息的“已接受”表示发送意图已保存到本地；服务端确认和对端已读分别由后续事件表达。
+页面须在保存成功后再清空草稿，失败重试复用原发送意图。
+
+Qt 事件采用 connectionChanged、initialStateLoaded、messagePushed、messageUpdated、
+conversationUpdated、syncProgress、messageSendsChanged、fileProgress、errorRaised 等高层对象。
+initialStateLoaded 的目标契约包含当前用户、会话、最近消息和未读数；
+实际是否满足契约以执行记录和测试为准，不把目标接口当成已经实现。
+
+## 编码规范
+
+以下 C++ 规则不强套到 Python/TypeScript 的语法；其他语言沿用其目录的既有命名与格式。
+
+| 对象 | C++ 规则 |
+| --- | --- |
+| 文件、命名空间 | 文件名全小写，命名空间全小写 |
+| 类、成员函数、自由函数 | 类名沿用所属模块前缀（如 MiniImSessionManager、ImBridge）；成员函数小写驼峰，自由函数大写驼峰 |
+| 变量与宏 | 成员 m_、静态成员 s_、全局 g_ 前缀；宏全大写下划线 |
+
+- 头文件使用用途注释和 include guard；单参构造 explicit，重写函数 override。
+- 无拷贝需求的类删除拷贝操作；使用 nullptr，禁止 NULL、malloc/free、new[]/delete[] 和 using namespace std。
+- 常量优先 constexpr，资源由具有明确生命周期的对象持有；不得硬编码路径分隔符。
+- C++ 花括号独占一行；推荐单行不超过 120 字符、函数不超过 80 行；复杂逻辑拆分。
+- 不写无意义重复代码。UI 文案允许中文，其他代码字面量使用英文；文档可使用中文。
+- 尊重已有改动，避免无关格式化和整文件换行变化；新增/编辑文本采用 UTF-8，保留适合工具链的换行。
+
+## 验证与完成标准
+
+必测范围：Protobuf 编解码/拆包、登录恢复、单聊、幂等、同步补偿、群成员、
+撤回与已读、文件续传、服务端宕机恢复。涉及多设备、并发或确认语义时增加对应场景。
+
+- 修复先建立可复现场景；测试关注外部可观察结果，包括重复输入、乱序、异常提交和恢复。
+- 业务层测试不能替代真实客户端/网络测试；构建成功不能替代类型检查或交互验证。
+- 性能结论记录环境、输入规模、并发数、持续时间与测量结果；文件大小测试不等同于吞吐压测。
+- 只报告已执行且范围匹配的检查；未验证项写入执行记录，不能凭绿色测试标记整个阶段完成。
+- 按变更范围执行必要验证；纯文档调整核对链接、命令与实现，不为文字改动增加业务测试。
+- 日常命令集中维护在 [开发指南](docs/development.md)。完成模块时在执行记录中更新改动、命令、结果和剩余工作。

@@ -7,7 +7,7 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
-find_package(Qt6 REQUIRED COMPONENTS Core Widgets WebChannel)
+find_package(Qt6 REQUIRED COMPONENTS Core Sql Widgets WebChannel)
 find_package(Qt6 QUIET COMPONENTS WebEngineWidgets)
 find_package(msquic CONFIG REQUIRED)
 find_package(protobuf CONFIG REQUIRED)
@@ -23,55 +23,72 @@ set(MINI_IM_PROTO_FILES
     "${MINI_IM_PROTO_DIR}/sync.proto"
 )
 
-set(MINI_IM_CLIENT_SOURCES
-    main.cpp
-    bridge/imbridge.cpp
+add_library(mini_im_core STATIC
+    core/quic/recovery.cpp
+    core/quic/recovery.h
+    core/message/outbox.cpp
+    core/message/outbox.h
+    core/model/eventmapper.cpp
+    core/model/eventmapper.h
+    core/sync/statestore.cpp
+    core/sync/statestore.h
     core/session/sessionmanager.cpp
-    ui/mainwindow.cpp
-)
-
-set(MINI_IM_CLIENT_HEADERS
-    bridge/imbridge.h
     core/session/sessionmanager.h
-    ui/mainwindow.h
+    core/file/downloadsink.cpp
+    core/file/downloadsink.h
+    core/file/uploadstream.cpp
+    core/file/uploadstream.h
 )
-
-add_executable(mini_im_client
-    ${MINI_IM_CLIENT_SOURCES}
-    ${MINI_IM_CLIENT_HEADERS}
+target_include_directories(mini_im_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_BINARY_DIR}
 )
-
-target_include_directories(mini_im_client PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_include_directories(mini_im_client PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
-
 protobuf_generate(
-    TARGET mini_im_client
+    TARGET mini_im_core
     LANGUAGE cpp
     PROTOS ${MINI_IM_PROTO_FILES}
     IMPORT_DIRS "${MINI_IM_PROTO_DIR}"
     APPEND_PATH
 )
-
-target_link_libraries(mini_im_client PRIVATE
-    Qt6::Core
-    Qt6::Widgets
-    Qt6::WebChannel
-    protobuf::libprotobuf
-)
+target_link_libraries(mini_im_core PUBLIC Qt6::Core Qt6::Sql protobuf::libprotobuf)
 
 if(TARGET msquic::msquic)
-    target_link_libraries(mini_im_client PRIVATE msquic::msquic)
-    target_compile_definitions(mini_im_client PRIVATE MINI_IM_HAS_MSQUIC=1)
-    message(STATUS "Mini-IM: using MsQuic from CMake package target msquic::msquic")
+    target_link_libraries(mini_im_core PUBLIC msquic::msquic)
 elseif(TARGET msquic)
-    target_link_libraries(mini_im_client PRIVATE msquic)
-    target_compile_definitions(mini_im_client PRIVATE MINI_IM_HAS_MSQUIC=1)
-    message(STATUS "Mini-IM: using MsQuic from CMake package target msquic")
+    target_link_libraries(mini_im_core PUBLIC msquic)
 else()
-    message(FATAL_ERROR "Mini-IM: MsQuic CMake target not found, cannot build pure C++ QUIC runtime.")
+    message(FATAL_ERROR "Mini-IM: MsQuic CMake target not found.")
 endif()
+target_compile_definitions(mini_im_core PRIVATE MINI_IM_HAS_MSQUIC=1)
+
+add_executable(mini_im_client
+    main.cpp
+    bridge/imbridge.cpp
+    bridge/imbridge.h
+    ui/mainwindow.cpp
+    ui/mainwindow.h
+)
+target_link_libraries(mini_im_client PRIVATE mini_im_core Qt6::Widgets Qt6::WebChannel)
 
 if(Qt6WebEngineWidgets_FOUND)
     target_link_libraries(mini_im_client PRIVATE Qt6::WebEngineWidgets)
     target_compile_definitions(mini_im_client PRIVATE MINI_IM_HAS_WEBENGINE=1)
+endif()
+
+include(CTest)
+if(BUILD_TESTING)
+    find_package(Qt6 REQUIRED COMPONENTS Network)
+    add_executable(mini_im_native_driver tests/native_driver.cpp bridge/imbridge.cpp bridge/imbridge.h)
+    target_link_libraries(mini_im_native_driver PRIVATE mini_im_core Qt6::Network Qt6::WebChannel)
+    add_executable(mini_im_download_tests tests/downloadsink_test.cpp core/file/downloadsink.cpp)
+    target_include_directories(mini_im_download_tests PRIVATE .)
+    target_link_libraries(mini_im_download_tests PRIVATE Qt6::Core)
+    add_test(NAME download_integrity COMMAND mini_im_download_tests)
+    add_executable(mini_im_upload_tests tests/uploadstream_test.cpp)
+    target_link_libraries(mini_im_upload_tests PRIVATE mini_im_core)
+    add_test(NAME upload_backpressure COMMAND mini_im_upload_tests)
+    add_executable(mini_im_state_tests tests/statestore_test.cpp core/sync/statestore.cpp core/message/outbox.cpp)
+    target_include_directories(mini_im_state_tests PRIVATE .)
+    target_link_libraries(mini_im_state_tests PRIVATE Qt6::Core Qt6::Sql)
+    add_test(NAME state_persistence COMMAND mini_im_state_tests)
 endif()

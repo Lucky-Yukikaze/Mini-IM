@@ -29,6 +29,7 @@ public:
         const QString& text,
         quint32 burn_mode,
         quint32 burn_ttl_sec);
+    Q_INVOKABLE bool retryMessage(const QString& conversationId, const QString& clientMsgId);
     Q_INVOKABLE bool createConversation(
         const QString& client_conv_id,
         const QString& title,
@@ -55,6 +56,8 @@ signals:
     void messageUpdated(const QVariantMap& payload);
     void conversationUpdated(const QVariantMap& payload);
     void fileProgress(const QVariantMap& payload);
+    void syncProgress(const QVariantMap& payload);
+    void messageSendsChanged(const QVariantMap& payload);
     void errorRaised(const QString& message);
 
 private:

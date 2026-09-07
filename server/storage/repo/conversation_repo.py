@@ -6,15 +6,7 @@ from dataclasses import dataclass
 
 from protocol.pb import common_pb2, conversation_pb2
 from storage.sqlite.db import MiniImSqliteDb
-
-
-@dataclass
-class StoredSyncEvent:
-    user_id: str
-    global_seq: int
-    event_id: str
-    event_type: str
-    payload: bytes
+from storage.repo.sync_event import AppendSyncEvents, StoredSyncEvent
 
 
 @dataclass
@@ -47,14 +39,6 @@ class ConversationRepo:
     @staticmethod
     def _now_ms() -> int:
         return int(time.time() * 1000)
-
-    @staticmethod
-    def _next_global_seq(connection, user_id: str) -> int:
-        row = connection.execute(
-            "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM sync_events WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-        return int(row["next_seq"])
 
     @staticmethod
     def _normalize_member_ids(owner_id: str, member_ids: list[str]) -> list[str]:
@@ -118,27 +102,10 @@ class ConversationRepo:
             owner_id=record.owner_id,
             member_ids=record.member_ids,
         )
-        payload = conversation_updated.SerializeToString()
-        sync_events: list[StoredSyncEvent] = []
-        for user_id in self._unique_user_ids(target_user_ids):
-            global_seq = self._next_global_seq(connection, user_id)
-            row_event_id = str(uuid.uuid4())
-            connection.execute(
-                """
-                INSERT INTO sync_events(event_id, user_id, seq, conversation_id, event_type, payload, created_at_ms)
-                VALUES(?, ?, ?, ?, 'conversation_updated', ?, ?)
-                """,
-                (row_event_id, user_id, global_seq, record.conversation_id, payload, now_ms),
-            )
-            sync_events.append(
-                StoredSyncEvent(
-                    user_id=user_id,
-                    global_seq=global_seq,
-                    event_id=row_event_id,
-                    event_type="conversation_updated",
-                    payload=payload,
-                )
-            )
+        sync_events = AppendSyncEvents(
+            connection, self._unique_user_ids(target_user_ids), record.conversation_id,
+            "conversation_updated", conversation_updated, now_ms,
+        )
         return conversation_updated, sync_events
 
     def create_group_conversation(
@@ -182,7 +149,7 @@ class ConversationRepo:
         normalized_members = self._normalize_member_ids(owner_id, member_ids)
         connection = self.m_db.m_connection
 
-        with connection:
+        with self.m_db.transaction():
             should_validate_users = self.has_any_user()
             if should_validate_users and not self.all_users_exist(normalized_members):
                 raise ValueError("conversation member does not exist")
@@ -264,29 +231,10 @@ class ConversationRepo:
                 member_ids=record.member_ids,
             )
 
-            sync_events: list[StoredSyncEvent] = []
-            payload_event_id = str(uuid.uuid4())
-            conversation_updated.event_id = payload_event_id
-            payload = conversation_updated.SerializeToString()
-            for member_id in record.member_ids:
-                event_id = str(uuid.uuid4())
-                global_seq = self._next_global_seq(connection, member_id)
-                connection.execute(
-                    """
-                    INSERT INTO sync_events(event_id, user_id, seq, conversation_id, event_type, payload, created_at_ms)
-                    VALUES(?, ?, ?, ?, 'conversation_updated', ?, ?)
-                    """,
-                    (event_id, member_id, global_seq, record.conversation_id, payload, now_ms),
-                )
-                sync_events.append(
-                    StoredSyncEvent(
-                        user_id=member_id,
-                        global_seq=global_seq,
-                        event_id=payload_event_id,
-                        event_type="conversation_updated",
-                        payload=payload,
-                    )
-                )
+            sync_events = AppendSyncEvents(
+                connection, record.member_ids, record.conversation_id,
+                "conversation_updated", conversation_updated, now_ms,
+            )
 
         return CreateConversationResult(
             conversation=conversation_updated,
@@ -302,7 +250,7 @@ class ConversationRepo:
     ) -> UpdateConversationResult | None:
         now_ms = self._now_ms()
         connection = self.m_db.m_connection
-        with connection:
+        with self.m_db.transaction():
             record = self.get_conversation(conversation_id)
             if record is None or record.type != int(common_pb2.CONVERSATION_GROUP):
                 return None
@@ -335,7 +283,7 @@ class ConversationRepo:
     ) -> UpdateConversationResult | None:
         now_ms = self._now_ms()
         connection = self.m_db.m_connection
-        with connection:
+        with self.m_db.transaction():
             record = self.get_conversation(conversation_id)
             if record is None or record.type != int(common_pb2.CONVERSATION_GROUP):
                 return None
@@ -380,7 +328,7 @@ class ConversationRepo:
     ) -> UpdateConversationResult | None:
         now_ms = self._now_ms()
         connection = self.m_db.m_connection
-        with connection:
+        with self.m_db.transaction():
             record = self.get_conversation(conversation_id)
             if record is None or record.type != int(common_pb2.CONVERSATION_GROUP):
                 return None
@@ -417,7 +365,7 @@ class ConversationRepo:
     ) -> UpdateConversationResult | None:
         now_ms = self._now_ms()
         connection = self.m_db.m_connection
-        with connection:
+        with self.m_db.transaction():
             record = self.get_conversation(conversation_id)
             if record is None or record.type != int(common_pb2.CONVERSATION_GROUP):
                 return None
@@ -457,7 +405,7 @@ class ConversationRepo:
     ) -> UpdateConversationResult | None:
         now_ms = self._now_ms()
         connection = self.m_db.m_connection
-        with connection:
+        with self.m_db.transaction():
             record = self.get_conversation(conversation_id)
             if record is None or record.type != int(common_pb2.CONVERSATION_GROUP):
                 return None

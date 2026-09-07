@@ -8,23 +8,17 @@ interface QtSignal {
 }
 
 interface QtImBridge {
-  connectToServer(endpoint: string, token: string, deviceId: string): boolean;
-  connectToServerWithResume?(
-    endpoint: string,
-    token: string,
-    deviceId: string,
-    resumeSessionId: string,
-    globalCursor: number,
-    lastAckedRequestId: string
-  ): boolean;
+  connectToServer(endpoint: string, token: string, deviceId: string, done: (accepted: boolean) => void): void;
   disconnectFromServer(): void;
   sendMessage(
     conversationId: string,
     clientMsgId: string,
     text: string,
     burnMode: number,
-    burnTtlSec: number
-  ): boolean;
+    burnTtlSec: number,
+    done: (accepted: boolean) => void
+  ): void;
+  retryMessage(conversationId: string, clientMsgId: string, done: (accepted: boolean) => void): void;
   createConversation(clientConvId: string, title: string, memberIds: string[]): boolean;
   createDirectConversation?(clientConvId: string, peerUserId: string): boolean;
   addMembers?(conversationId: string, memberIds: string[]): boolean;
@@ -42,6 +36,8 @@ interface QtImBridge {
   messageUpdated?: QtSignal;
   conversationUpdated?: QtSignal;
   fileProgress?: QtSignal;
+  syncProgress?: QtSignal;
+  messageSendsChanged?: QtSignal;
   errorRaised?: QtSignal;
 }
 
@@ -92,6 +88,12 @@ function bindSignals(bridge: QtImBridge): void {
   });
   bridge.fileProgress?.connect((payload) => {
     bridgeEvents.emit('fileProgress', payload);
+  });
+  bridge.messageSendsChanged?.connect((payload) => {
+    bridgeEvents.emit('messageSendsChanged', payload);
+  });
+  bridge.syncProgress?.connect((payload) => {
+    bridgeEvents.emit('syncProgress', payload);
   });
   bridge.errorRaised?.connect((payload) => {
     bridgeEvents.emit('errorRaised', payload);
@@ -158,36 +160,9 @@ export async function connect(endpoint: string, token: string, deviceId: string)
     });
     return true;
   }
-  return runtimeWindow.imBridge.connectToServer(endpoint, token, deviceId);
-}
-
-export async function connectWithResume(
-  endpoint: string,
-  token: string,
-  deviceId: string,
-  resumeSessionId: string,
-  globalCursor: number,
-  lastAckedRequestId: string
-): Promise<boolean> {
-  try {
-    await initBridge();
-  } catch {
-    // Fallback to web-debug mode when Qt bridge is unavailable.
-  }
-  if (!runtimeWindow.imBridge) {
-    return connect(endpoint, token, deviceId);
-  }
-  if (!runtimeWindow.imBridge.connectToServerWithResume) {
-    return runtimeWindow.imBridge.connectToServer(endpoint, token, deviceId);
-  }
-  return runtimeWindow.imBridge.connectToServerWithResume(
-    endpoint,
-    token,
-    deviceId,
-    resumeSessionId,
-    globalCursor,
-    lastAckedRequestId
-  );
+  return new Promise<boolean>((resolve) => {
+    runtimeWindow.imBridge!.connectToServer(endpoint, token, deviceId, resolve);
+  });
 }
 
 export function disconnect(): void {
@@ -198,15 +173,17 @@ export function disconnect(): void {
   bridgeEvents.emit('connectionChanged', { state: 'disconnected', sessionId: '' });
 }
 
-export function sendMessage(
+export async function sendMessage(
   conversationId: string,
   text: string,
   burnMode = 0,
   burnTtlSec = 0
-): boolean {
+): Promise<boolean> {
   if (runtimeWindow.imBridge) {
     const clientMsgId = `cm-${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
-    return runtimeWindow.imBridge.sendMessage(conversationId, clientMsgId, text, burnMode, burnTtlSec);
+    return new Promise<boolean>((resolve) => {
+      runtimeWindow.imBridge!.sendMessage(conversationId, clientMsgId, text, burnMode, burnTtlSec, resolve);
+    });
   }
 
   const item: MessageItem = {
@@ -225,6 +202,13 @@ export function sendMessage(
   };
   bridgeEvents.emit('messagePushed', item);
   return true;
+}
+
+export async function retryMessage(conversationId: string, clientMsgId: string): Promise<boolean> {
+  if (!runtimeWindow.imBridge) return false;
+  return new Promise<boolean>((resolve) => {
+    runtimeWindow.imBridge!.retryMessage(conversationId, clientMsgId, resolve);
+  });
 }
 
 export function createConversation(title: string, memberIds: string[]): boolean {

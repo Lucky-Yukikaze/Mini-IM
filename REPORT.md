@@ -1,234 +1,77 @@
-# Mini-IM 面试版项目报告
-
-## 项目一句话
-
-Mini-IM 是一个桌面端即时通讯系统，使用 `Qt 6 + C++` 承载原生 QUIC 连接，用 `Vue 3` 做聊天界面，用 `Python asyncio + aioquic + SQLite` 实现服务端可靠消息、群聊、文件传输和状态恢复。
-
-## 为什么做这个项目
-
-这个项目重点不是做一个简单聊天 Demo，而是验证 IM 系统最核心的能力：消息可达、状态可恢复、操作可重试、传输和业务解耦。旧版 WebSocket 原型很快能跑通聊天，但继续加群聊、文件、撤回、阅后即焚后会把状态逻辑揉在一起，所以重构成 QUIC + Protobuf + 同步事件流。
-
-## 我的设计取舍
-
-客户端分两层：
-
-* Qt 原生层：持有 MsQuic 连接，负责 protobuf、ACK、同步、文件流
-* Web UI 层：只通过 QWebChannel 调高层 API，订阅高层事件并刷新界面
-
-服务端按业务拆服务：
-
-* Auth：dev 登录和 session 恢复
-* Conversation：群聊、单聊和成员关系
-* Message：消息落库和投递事件
-* Delivery：已读、撤回、阅后即焚
-* File：文件元数据、上传下载、完整性校验
-* Sync：按游标补偿同步
-
-这个拆法的核心收益是：UI 不感知传输细节，传输层只负责到达，业务一致性由服务端事件和客户端同步恢复保证。
-
-## 核心链路
-
-登录恢复：
-
-```text
-Client Hello(global_cursor, resume_session_id)
--> Server Welcome(session_id, user_id)
--> Client SyncRequest(global_cursor)
--> Server SyncResponse(events, new_global_cursor, has_more)
-```
-
-工程落点：
-
-* 客户端入口在 `MiniImSessionManager::sendHello` 和 `handleIncomingEnvelope`
-* 服务端入口在 `MiniImQuicProtocol`，收到 hello 后由 `AuthService` 生成 session
-* Welcome 后客户端发 `SyncRequest`，后续按 `SyncResponse.has_more` 分页追平
-* 前端只收到 bridge 事件，不直接接触 session_id 以外的底层连接细节
-
-消息发送：
-
-```text
-send_message
--> Ack
--> messages 落库
--> message_deliveries 投递状态
--> sync_events 写入每个成员的事件流
--> 在线成员实时收到 sync_response
--> 离线成员上线后按 global_cursor 补偿
-```
-
-工程落点：
-
-* `MessageService` 处理发送请求，`MessageRepo` 写 messages、message_deliveries 和 sync_events
-* 群消息只存一份正文，每个成员的投递状态单独写入 message_deliveries
-* 在线用户由 `OnlineHub.fanout_sync_events` 推送，离线用户靠 `SyncService` 补拉
-* Web 侧 `session.ts` 按 conversationId 分组存消息，插入时按 seq 排序
-
-文件上传：
-
-```text
-FileInit
--> Ack(file_id)
--> 独立 QUIC stream 上传二进制
--> FileFinish
--> sha256 / size 校验
--> 生成 MSG_FILE 消息
--> 同步给会话成员
-```
-
-工程落点：
-
-* `FileService` 处理 `FileInit / FileFinish`
-* `FileRepo` 保存 file_transfers，记录 direction、received_bytes、version、status、source_file_id
-* 二进制数据走独立 QUIC stream，控制面只传文件元数据和完成状态
-* 上传完成后 `_append_file_message` 生成 `MSG_FILE`，消息内容是包含 fileId、fileName、fileSize、sha256 的 JSON
-* 客户端文件进度按 fileId/version 单调更新，避免旧进度覆盖新进度
-
-> 截图占位：请在这里插入“文件上传后生成文件消息”的截图，面试时用于说明控制面和数据面分离。
-
-## 关键难点和解决方案
-
-状态恢复：
-
-问题：在线推送不能覆盖断线、重连、乱序和离线场景。  
-方案：所有业务变化统一写入 `sync_events`，客户端只记 `global_cursor`，重连后补拉事件流；`has_more=true` 时继续分页拉取，避免大量文件进度事件阻塞后续状态。
-
-单聊和群聊已读：
-
-问题：单聊要显示 `未读/已读`，群聊要显示 `x 人未读`，但底层不能为 UI 做两套状态。  
-方案：服务端统一用 `conversation_members.last_read_seq` 作为已读真值，`message_read_counters` 作为群聊展示缓存；前端按会话类型展示，单聊把 `unreadCount > 0` 显示为 `未读`，`unreadCount = 0` 显示为 `已读`，群聊继续显示未读人数。
-
-文件传输：
-
-问题：文件数据不能塞进普通消息队列，否则会阻塞聊天控制面。  
-方案：`FileInit / FileFinish` 走 protobuf 控制面，文件内容走独立 QUIC stream；完成后才生成 `MSG_FILE` 消息。客户端区分源文件 ID 和传输任务 ID，下载时用源文件 ID。
-
-前端状态及时性：
-
-问题：消息、撤回、已读、文件进度可能乱序到达。  
-方案：前端 Pinia store 做统一状态入口，消息批量入库，撤回/焚毁/已读先到时先缓存或合并，文件进度按 `fileId/version` 单调更新。
-
-压测和故障注入：
-
-问题：只测正常路径无法证明 IM 状态可恢复。  
-方案：把故障注入放在业务状态层，模拟上传中断、任务过期、文件分段恢复、焚毁扫描重复执行和同步事件堆积；用自动化测试验证幂等、断点续传、`sha256` 校验和 `SyncResponse.has_more` 分页续拉。
-
-## 项目亮点
-
-* 使用 MsQuic 做桌面客户端传输层，Qt 负责原生连接，Web UI 保持纯展示边界
-* Protobuf Envelope 统一控制面协议，所有请求都有 request_id 幂等语义
-* 用 sync_events 做离线补偿和状态恢复，避免只依赖在线推送
-* 文件控制面和数据面分离，支持上传、下载、断点续传和完整性校验
-* 群聊不是单聊多播，独立建模 conversation_members、message_deliveries、message_read_counters
-* 单聊和群聊共用 receipt 语义，UI 按会话类型展示为 `未读/已读` 或 `x 人未读`
-* 阅后即焚落到投递状态机，按接收者已读后 TTL 触发
-* 前端做了虚拟列表和状态乱序合并，解决联调中的卡顿和状态不及时
-* 压测覆盖 2 MB 大文件恢复、文件断点续传、过期上传接管、阅后即焚批扫描和同步分页续拉
-
-> 截图占位：请在这里插入“群聊 x 人未读 + 撤回/焚毁状态”的截图，面试时用于展示状态同步能力。
-
-## 遇到过的典型问题
-
-连接后闪退：
-
-原因：MsQuic `SEND_COMPLETE` 回调释放上下文时，控制流和文件流上下文不统一。  
-修复：统一使用堆上的发送上下文，回调完成后释放。
-
-上传文件后聊天区白屏：
-
-原因：Vue 模板里文件 payload 变量作用域写法错误，文件消息渲染触发运行时异常。  
-修复：提前解析 `filePayload`，模板只读稳定字段。
-
-状态不及时：
-
-原因：文件进度事件很多时 sync 分页没有续拉，后续 receipt 和 conversation_updated 滞留。  
-修复：客户端处理 `SyncResponse.has_more` 自动继续拉取下一页。
-
-离线撤回后仍看到旧消息：
-
-原因：sync_response 中 recall 先到，message 后入前端 store，撤回操作变成 no-op。  
-修复：前端增加 pending 状态，消息后到时合并撤回/焚毁状态。
-
-四个关键 review 修复：
-
-* 同步分页：`SyncResponse.has_more=true` 时继续用 `new_global_cursor` 拉下一页，解决 file_updated 堆积后状态滞留
-* 初始状态：Welcome 不再发送空会话和空消息，避免连接成功后 UI 被清空
-* 未读总数：`unreadTotal` 从“只初始化”改为随新消息和当前用户 receipt 增减
-* 文件进度：从页面局部 ref 迁入 Pinia store，按 `fileId/version` 单调 upsert，重连和组件重建后状态更稳定
-* 单聊已读：MessageList 接收 conversationType，单聊显示 `未读/已读`，群聊保留 `x 人未读`
-
-实现细节可以补充：
-
-* 服务端业务状态以 SQLite 表为准，客户端 Pinia 只是展示缓存
-* `message_read_counters` 是展示缓存，`conversation_members.last_read_seq` 是已读真值
-* `sync_events` 每个用户一条 seq 链，客户端用 global_cursor 单调推进
-* 文件流和控制流分开后，大文件上传不会阻塞 receipt、recall、conversation_updated 这类控制事件
-* 前端先 flush 消息批处理队列再处理状态更新，解决 message 和 receipt/recall 同一帧乱序的问题
-
-## 测试和验证
-
-自动化测试覆盖：
-
-* 登录与恢复
-* 单聊消息
-* 群聊、成员管理、已读、撤回
-* 多用户 dev 登录
-* 文件上传、下载、断点续传
-* 阅后即焚
-* SQLite schema
-
-测试设计口径：
-
-* 正常路径：覆盖登录、建会话、发消息、收消息、已读、撤回、文件完成、阅后即焚
-* 恢复路径：覆盖离线同步、断点续传、过期上传接管、焚毁任务重复扫描
-* 异常路径：覆盖未知用户拒绝、文件大小冲突、sha256 不匹配、非法 burn TTL
-* 一致性验证：服务端查 SQLite 真值，客户端侧依赖同步事件恢复展示状态
-
-压测说明：
-
-* 文件压测：使用 `2 MB` payload 做分段上传，模拟上传任务过期后同 intent 恢复，完成后校验 size 和 sha256
-* 恢复压测：上传/下载覆盖 resume offset，验证断点续传后 sync_events 仍能补偿
-* 状态压测：阅后即焚批扫描到期 delivery，生成 `system-burn`，二次扫描验证不重复生成事件
-* 同步压测：大量 file_updated 场景依赖 `has_more` 分页续拉，避免后续已读和会话事件滞留
-* 执行命令：`python -m unittest server.tests.test_phase5_file_flow server.tests.test_phase6_burn_flow`
-* 当前压测口径：以 unittest 场景验证恢复能力和状态一致性，不是独立 QPS 压测脚本
-
-> 截图占位：请在这里插入“压测测试输出”截图，面试时可展示 25 个服务端测试通过和大文件恢复用例。
-
-常用验证命令：
-
-```powershell
-python -m unittest discover server\tests
-Set-Location .\web
-npm run build
-Set-Location ..
-$env:QT_DIR="<你的Qt安装目录>\6.11.0\msvc2022_64"
-git clone https://github.com/microsoft/vcpkg .\thirdparty_install\vcpkg
-.\thirdparty_install\vcpkg\bootstrap-vcpkg.bat
-.\thirdparty_install\vcpkg\vcpkg.exe install msquic protobuf --triplet x64-windows
-cmake -S .\client -B .\build\client_qt611 -DCMAKE_TOOLCHAIN_FILE="$PWD\thirdparty_install\vcpkg\scripts\buildsystems\vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows -DCMAKE_PREFIX_PATH="$env:QT_DIR"
-cmake --build .\build\client_qt611 --config Release --target mini_im_client
-```
-
-## 可以怎么讲给面试官
-
-我会先强调这个项目的目标是“可靠 IM 内核”，不是聊天 UI Demo。然后按三条线讲：
-
-1. 传输线：Qt 持有 MsQuic，控制面 Envelope，文件走独立 stream。
-2. 状态线：服务端所有业务变化写入 sync_events，客户端用 global_cursor 恢复。
-3. 业务线：群聊、已读、撤回、文件、阅后即焚都统一落在消息、投递和同步模型上。
-
-最后补充几个真实联调问题，例如 SEND_COMPLETE 释放错误、文件消息白屏、sync 分页不续拉。这些问题能说明项目不是只写了静态代码，而是经过了端到端联调。
-
-压测部分可以这样讲：我没有只做吞吐数字，而是围绕 IM 的恢复能力设计压测，重点验证“中断后能不能接着传、状态事件堆积后能不能追平、重复扫描会不会重复发事件、文件完成后校验是否严格”。这个口径比单纯 QPS 更贴近 IM 项目的可靠性目标。
-
-被追问“一致性怎么保证”时可以这样答：服务端以 SQLite 中的业务表为真值，以 `sync_events` 作为可重放事件流；客户端状态只是展示缓存，断线或乱序后靠 `global_cursor` 补拉，前端再按 messageId、fileId/version、lastReadSeq 做幂等合并。
-
-被追问“为什么不用 WebSocket”时可以这样答：这个项目想验证桌面端原生传输和文件流能力，QUIC 允许控制面和文件数据面拆开，文件大流量不会和聊天控制事件抢同一条逻辑通道。
-
-## 后续可扩展方向
-
-* dev 用户升级为正式账号系统
-* SQLite 替换为 PostgreSQL/MySQL，热状态接 Redis
-* 增加多设备在线策略和端到端设备列表
-* 增加文件秒传、缩略图、过期清理
-* 增加更完整的 UI 自动化联调
+# Mini-IM 设计说明
+
+返回 [项目入口](README.md)。本文解释组件职责、主要数据路径和项目展示口径。
+它不维护功能完成表；当前结果见 [重构执行记录](docs/refactoring-progress.md)，
+必须遵守的目标约束见 [AGENTS.md](AGENTS.md)。
+
+## 组件与职责
+
+| 组件 | 职责与源码入口 |
+| --- | --- |
+| 桌面客户端 | [窗口宿主](client/ui/mainwindow.cpp) 承载页面；[Qt 会话管理](client/core/session/sessionmanager.cpp) 调用 MsQuic，处理协议、登录、同步和文件任务；[下载落盘组件](client/core/file/downloadsink.cpp) 负责校验与目标替换，[上传流组件](client/core/file/uploadstream.cpp) 随发送完成回调分批读取文件。 |
+| 页面与接口 | [Bridge](client/bridge/imbridge.h) = Qt 向页面提供业务操作和事件的接口；[页面调用封装](web/src/api/bridge.ts) 转发操作并订阅事件，[Pinia 状态](web/src/store/session.ts) 保存界面展示数据。 |
+| 服务端与存储 | [监听入口](server/quic/endpoint.py) 配置接收端口，[QUIC 入口](server/quic/server.py) 分派请求；[业务服务](server/services/) 校验业务；[仓储](server/storage/repo/) = 执行业务数据读写的代码；[SQLite 层](server/storage/sqlite/) 管理连接、表结构及升级。 |
+
+[对象映射](client/core/model/eventmapper.cpp) 把协议字段转换为页面业务对象；
+[原生状态存储](client/core/sync/statestore.cpp) 保存消息、会话、状态事件与同步位置；
+[消息发送队列](client/core/message/outbox.cpp) 保存发送意图、确认状态和失败原因。
+[连接恢复组件](client/core/quic/recovery.cpp) 管理重连等待和登录超时；
+会话类仍持有原生连接收发及同步调度，拆分进度与验收缺口见执行记录。
+历史 [Python 客户端脚本](client/core/quic/quic_client_worker.py) 未被当前 CMake 客户端目标引用，
+原生运行路径以 [CMake 定义](client/CMakeLists.txt) 和 Qt 会话管理代码为准；桌面程序与原生联调驱动共用同一原生库。
+
+## 消息与同步
+
+控制消息使用 `Envelope`，即含路由信息和一种业务消息的协议对象。
+每条控制消息前置 4 字节大端长度；接收端累积数据后拆出完整消息。
+定义见 [envelope.proto](proto/envelope.proto)，服务端实现见 [codec.py](server/protocol/codec.py)。
+
+发送消息的路径是：页面操作 → Qt 保存发送意图 → 原生连接发送 → 服务端业务校验 → 数据库写入 → 应用确认及事件推送。
+事务 = 一组数据库写入共同提交或共同回滚；消息正文、用户投递记录和对应同步事件应在同一事务中保存。
+ACK = 服务端返回的应用处理结果；成功 ACK 不能代表其他用户已经收到或读过消息。
+
+幂等 = 重复执行同一写入意图，不增加重复业务实体或效果。
+`request_id` 标识请求，`client_msg_id` 标识用户的发送意图；重试须复用原有标识。
+`event_id` 标识一次同步事件，在同一用户的在线推送和历史重放中保持一致。
+
+同步游标 = 已完整应用并保存的连续事件位置。
+[SyncEvent.global_seq](proto/sync.proto) 表示事件在单用户全局同步流中的位置，
+`conversation_seq` 表示消息在会话内的位置；请求序号、事件位置和消息位置分别使用。
+
+当前原生存储的处理路径是：接收事件 → 合并业务状态并记录事件标识 →
+推进连续位置 → 共同提交 → 向页面发送业务事件。
+登录后从本地状态生成 `initialStateLoaded`，再从保存的位置补拉；
+`syncProgress` 向页面传递展示用同步进度。持久化与恢复的验收结果见执行记录。
+
+QWebChannel 的调用结果通过完成回调返回；连接方法的回调只表示请求是否被接受，
+登录状态通过 `connectionChanged` 传递。发送消息的成功回调表示意图已保存到本地，
+页面据此清空草稿；`messageSendsChanged` 更新待确认及失败列表，`retryMessage` 复用失败意图。
+Qt 在同步追平后重发未确认消息，成功 ACK 到达后清空该意图保存的正文；
+撤回和焚毁事件也会清理对应发送副本。
+网络断开或控制流中断时，Qt 在旧连接关闭后重新登录；会话失效时清除旧会话标识，保留本地消息和同步位置。
+主动断开会停止重连。恢复参数、重试规则及实际验证范围分别见开发指南和执行记录。
+
+## 文件与消息状态
+
+文件控制使用 [FileInit / FileFinish / FileUpdated](proto/file.proto)，文件内容使用独立 QUIC 流。
+上传完成需由服务端核对实际文件大小和 SHA-256；SHA-256 = 根据文件内容计算的 256 位摘要，用于核对内容是否一致。
+上传完成状态与对应文件聊天消息共同提交，避免中间失败导致任务完成但会话中没有消息。
+
+下载时，服务端提供预期大小和摘要，Qt 先写临时文件；
+收满并校验后替换目标文件，再通过 `FileFinish` 提交实际字节数和摘要。
+发送队列接受数据、流结束、目标文件校验完成分别是不同处理步骤。
+服务端下载按未确认缓冲量调度文件读取，Qt 接收按处理进度继续；上限与验证见执行记录。
+协议扩展后需同时更新服务端和客户端；具体重建命令见开发指南。
+
+群聊使用独立成员关系，已读位置以 `conversation_members.last_read_seq` 为准；
+消息未读人数保存为可重算的展示数据。撤回和阅后即焚通过同步事件传播，
+已生效状态必须抵抗旧消息重放；正文清理须覆盖业务表、同步副本和客户端缓存。
+
+## 展示与验证口径
+
+演示时说明实际走过的客户端与服务端路径，并给出执行记录中的日期和覆盖范围。
+业务测试、原生组件测试和真实网络交互分别记录；打包成功与类型检查分别记录。
+独立文件流不能单独证明聊天延迟不受影响，文件恢复用例的输入大小也不能证明并发吞吐能力。
+
+历史缺陷和测量保留在 [基线评估](docs/architecture-review-2026-09-07.md)；
+后续修复不会改写当时结果。安装、运行、排查和测试命令统一见 [开发指南](docs/development.md)。

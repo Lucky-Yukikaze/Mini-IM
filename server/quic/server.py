@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from aioquic.asyncio import QuicConnectionProtocol, serve
+from aioquic.asyncio import QuicConnectionProtocol
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import ConnectionTerminated, StreamDataReceived
 from cryptography import x509
@@ -14,8 +14,10 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
+from quic.endpoint import serve_quic
+from quic.download import DownloadScheduler, FILE_STREAM_HEADER_PREFIX
 from protocol.codec import EnvelopeCodec
-from protocol.pb import auth_pb2, conversation_pb2, envelope_pb2, file_pb2, message_pb2, sync_pb2
+from protocol.pb import common_pb2, auth_pb2, conversation_pb2, envelope_pb2, file_pb2, message_pb2, sync_pb2
 from services.auth.service import AuthService
 from services.conversation.service import ConversationService
 from services.delivery.service import DeliveryService
@@ -28,7 +30,6 @@ from storage.sqlite.init_db import init_db
 from storage.sqlite.write_queue import SqliteWriteQueue
 
 
-FILE_STREAM_HEADER_PREFIX = b"MINIIMFILE1 "
 FILE_STREAM_HEADER_MAX = 512
 
 
@@ -105,6 +106,7 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
         self.m_control_stream_id: int | None = None
         self.m_control_stream_buffers: dict[int, bytearray] = {}
         self.m_file_stream_states: dict[int, FileStreamState] = {}
+        self.m_download_sender = DownloadScheduler(self)
 
     @staticmethod
     def _debug(message: str) -> None:
@@ -145,52 +147,27 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
         if sender_event is not None:
             response.seq = int(sender_event.global_seq)
         response.file_updated.CopyFrom(updated)
+        if sender_event is not None:
+            response.file_updated.event_id = sender_event.event_id
         self._send(stream_id, response)
 
     def _send_download_stream(self, owner_user_id: str, source_file_id: str, target_file_id: str, offset: int) -> None:
         source_path = self.m_file_service.get_storage_path(source_file_id)
-        target_transfer = self.m_file_service.get_transfer_for_upload(owner_user_id, target_file_id)
-        if source_path is None or target_transfer is None or not source_path.exists():
-            self._debug(
-                f"download stream skipped source={source_file_id} target={target_file_id} "
-                f"source_exists={source_path.exists() if source_path else False}"
-            )
-            return
-
-        stream_id = self._quic.get_next_available_stream_id(is_unidirectional=True)
-        self._debug(
-            f"download stream start stream={stream_id} source={source_file_id} target={target_file_id} "
-            f"offset={offset} size={target_transfer.file_size}"
+        target = self.m_file_service.get_transfer_for_upload(owner_user_id, target_file_id)
+        if source_path is None or target is None:
+            raise ValueError("download source or target missing")
+        self.m_download_sender.start(
+            target_file_id, source_path, target.file_size, offset, target.priority,
         )
-        header = FILE_STREAM_HEADER_PREFIX + target_file_id.encode("utf-8") + b"\n"
-        self._quic.send_stream_data(stream_id, header, end_stream=False)
 
-        sent = max(0, min(int(offset), int(target_transfer.file_size)))
-        if sent > 0:
-            _, sync_events = self.m_file_service.apply_download_progress(owner_user_id, target_file_id, sent)
-            if sync_events:
-                self.m_online_hub.fanout_sync_events(sync_events)
+    def transmit(self) -> None:
+        super().transmit()
+        # Incoming datagrams and timers run transmit after aioquic processes acknowledgements.
+        self.m_download_sender.notify()
 
-        with source_path.open("rb") as f:
-            if sent > 0:
-                f.seek(sent)
-            while True:
-                chunk = f.read(64 * 1024)
-                if not chunk:
-                    break
-                sent += len(chunk)
-                self._debug(f"download stream chunk stream={stream_id} target={target_file_id} bytes={len(chunk)} sent={sent}")
-                self._quic.send_stream_data(stream_id, chunk, end_stream=False)
-                _, sync_events = self.m_file_service.apply_download_progress(owner_user_id, target_file_id, sent)
-                if sync_events:
-                    self.m_online_hub.fanout_sync_events(sync_events)
-
-        self._quic.send_stream_data(stream_id, b"", end_stream=True)
-        self._debug(f"download stream finish stream={stream_id} target={target_file_id} sent={sent}")
-        _, finish_events = self.m_file_service.complete_download(owner_user_id, target_file_id)
-        if finish_events:
-            self.m_online_hub.fanout_sync_events(finish_events)
-        self.transmit()
+    def close(self, error_code=0, reason_phrase="") -> None:
+        self.m_download_sender.close()
+        super().close(error_code=error_code, reason_phrase=reason_phrase)
 
     def send_sync_event(self, event: StoredSyncEvent) -> None:
         if self.m_control_stream_id is None or not self.m_session_id:
@@ -207,6 +184,7 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
 
         sync_event = sync_pb2.SyncEvent()
         sync_event.event_id = event.event_id
+        sync_event.global_seq = event.global_seq
         if event.event_type == "message":
             item = message_pb2.Message()
             item.ParseFromString(event.payload)
@@ -236,6 +214,7 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
         self._send(self.m_control_stream_id, envelope)
 
     def connection_lost(self, exc) -> None:
+        self.m_download_sender.close()
         if self.m_user_id:
             self.m_online_hub.unregister(self.m_user_id, self)
         super().connection_lost(exc)
@@ -304,6 +283,7 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
 
     def quic_event_received(self, event):
         if isinstance(event, ConnectionTerminated):
+            self.m_download_sender.close()
             if self.m_user_id:
                 self.m_online_hub.unregister(self.m_user_id, self)
             return
@@ -376,6 +356,8 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
                     if sender_event is not None:
                         push_envelope.seq = int(sender_event.global_seq)
                     push_envelope.message_push.CopyFrom(result.message_push)
+                    if sender_event is not None:
+                        push_envelope.message_push.event_id = sender_event.event_id
                     self._send(event.stream_id, push_envelope)
 
                 self.m_online_hub.fanout_sync_events(result.sync_events, exclude_protocol=self)
@@ -478,6 +460,10 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
                 continue
 
             if envelope.HasField("file_init"):
+                if (envelope.file_init.direction == common_pb2.FILE_DIRECTION_DOWNLOAD
+                        and not self.m_download_sender.can_accept):
+                    self._send_error(event.stream_id, envelope, 429, "download queue is full; retry later")
+                    continue
                 result = self.m_file_service.handle_file_init(
                     user_id=session.user_id,
                     request_id=envelope.request_id,
@@ -487,7 +473,7 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
                 ack_envelope.ack.CopyFrom(result.ack)
                 self._send(event.stream_id, ack_envelope)
                 sender_event = next(
-                    (item for item in result.sync_events if item.user_id == session.user_id),
+                    (item for item in result.sync_events if item.user_id == session.user_id and item.event_type == "file_updated"),
                     None,
                 )
                 if result.file_updated is not None:
@@ -512,7 +498,7 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
                 ack_envelope.ack.CopyFrom(result.ack)
                 self._send(event.stream_id, ack_envelope)
                 sender_event = next(
-                    (item for item in result.sync_events if item.user_id == session.user_id),
+                    (item for item in result.sync_events if item.user_id == session.user_id and item.event_type == "file_updated"),
                     None,
                 )
                 if result.file_updated is not None:
@@ -645,7 +631,7 @@ async def run_server() -> None:
         file_drop_probability=min(max(fault_drop_probability, 0.0), 1.0),
     )
 
-    server = await serve(
+    server = await serve_quic(
         host="127.0.0.1",
         port=4433,
         configuration=configuration,

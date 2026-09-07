@@ -9,8 +9,8 @@ def patch_imports(out_dir: Path) -> None:
     for pb_file in out_dir.glob("*_pb2.py"):
         content = pb_file.read_text(encoding="utf-8")
         patched = pattern.sub(r"from . import \1 as \2", content)
-        if patched != content:
-            pb_file.write_text(patched, encoding="utf-8")
+        if patched != content or b"\r\n" in pb_file.read_bytes():
+            pb_file.write_text(patched, encoding="utf-8", newline="\n")
 
 
 def main() -> None:

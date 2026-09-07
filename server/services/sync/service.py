@@ -29,6 +29,7 @@ class SyncService:
         for row in selected_rows:
             event = response.events.add()
             event.event_id = row.event_id
+            event.global_seq = row.seq
 
             if row.event_type == "message":
                 message = message_pb2.Message()

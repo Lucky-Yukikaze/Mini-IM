@@ -70,7 +70,13 @@ class FileService:
         if not file_init.client_file_id.strip():
             return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
 
+        if file_init.direction not in (common_pb2.FILE_DIRECTION_UPLOAD, common_pb2.FILE_DIRECTION_DOWNLOAD):
+            ack.message = "invalid file direction"
+            return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
         is_download = int(file_init.direction) == int(common_pb2.FILE_DIRECTION_DOWNLOAD)
+        if not is_download and file_init.source_file_id:
+            ack.message = "uploads cannot reference a source file"
+            return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
         effective_conversation_id = file_init.conversation_id
         effective_file_name = file_init.file_name
         effective_file_size = int(file_init.file_size)
@@ -82,9 +88,14 @@ class FileService:
                 ack.message = "missing source_file_id"
                 return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
             source = self.m_file_repo.get_transfer_by_file_id(file_init.source_file_id)
-            if source is None or source.status != "completed":
+            if (source is None or source.status != "completed"
+                    or source.direction != common_pb2.FILE_DIRECTION_UPLOAD):
                 ack.code = 404
                 ack.message = "source file not found"
+                return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
+            if file_init.conversation_id and file_init.conversation_id != source.conversation_id:
+                ack.code = 409
+                ack.message = "download conversation does not match source"
                 return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
             effective_conversation_id = source.conversation_id
             effective_file_name = source.file_name
@@ -95,6 +106,7 @@ class FileService:
             not effective_conversation_id.strip()
             or not effective_file_name.strip()
             or int(effective_file_size) <= 0
+            or int(file_init.resume_offset) > int(effective_file_size)
         ):
             return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
 
@@ -125,9 +137,9 @@ class FileService:
             storage_relative_path=relative_path,
             stale_timeout_ms=self.m_stale_timeout_ms,
         )
-        if result.size_conflict:
+        if result.conflict:
             ack.code = 409
-            ack.message = "intent_id file_size mismatch"
+            ack.message = result.conflict
             return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
 
         ack.success = True
@@ -143,6 +155,11 @@ class FileService:
             completed=result.transfer.status == "completed",
             version=int(result.transfer.version),
             updated_at_ms=int(result.transfer.updated_at_ms),
+            file_size=result.transfer.file_size,
+            sha256=result.transfer.sha256,
+            direction=result.transfer.direction,
+            status=result.transfer.status,
+            file_name=result.transfer.file_name,
         )
         return FileServiceResult(
             ack=ack,
@@ -160,9 +177,11 @@ class FileService:
         chunk: bytes,
     ) -> tuple[file_pb2.FileUpdated | None, list[StoredSyncEvent]]:
         transfer = self.m_file_repo.get_transfer_by_file_id(file_id)
-        if transfer is None or transfer.owner_id != user_id:
+        if (transfer is None or transfer.owner_id != user_id
+                or transfer.direction != common_pb2.FILE_DIRECTION_UPLOAD
+                or transfer.status == "completed"):
             return None, []
-        if not chunk:
+        if not chunk or transfer.received_bytes + len(chunk) > transfer.file_size:
             return None, []
 
         target_path = self.m_file_root / transfer.storage_path
@@ -189,6 +208,11 @@ class FileService:
             completed=result.transfer.status == "completed",
             version=int(result.transfer.version),
             updated_at_ms=int(result.transfer.updated_at_ms),
+            file_size=result.transfer.file_size,
+            sha256=result.transfer.sha256,
+            direction=result.transfer.direction,
+            status=result.transfer.status,
+            file_name=result.transfer.file_name,
         )
         return updated, result.sync_events
 
@@ -216,35 +240,44 @@ class FileService:
             ack.message = "file_finish rejected"
             return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
 
-        if bool(file_finish.success):
-            if int(transfer.received_bytes) != int(transfer.file_size):
-                ack.code = 400
-                ack.message = "status incomplete"
-                return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
-            if not self._verify_file_sha256(transfer):
-                ack.code = 409
-                ack.message = "sha256 mismatch"
-                return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
+        is_download = transfer.direction == common_pb2.FILE_DIRECTION_DOWNLOAD
+        if bool(file_finish.success) and transfer.status != "completed":
+            if is_download:
+                if int(file_finish.transferred_bytes) != transfer.file_size:
+                    ack.message = "download confirmation size mismatch"
+                    return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
+                if file_finish.sha256.lower() != transfer.sha256.lower():
+                    ack.code = 409
+                    ack.message = "download confirmation sha256 mismatch"
+                    return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
+            else:
+                if int(transfer.received_bytes) != int(transfer.file_size):
+                    ack.message = "status incomplete"
+                    return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
+                if not self._verify_file_sha256(transfer):
+                    ack.code = 409
+                    ack.message = "sha256 mismatch"
+                    return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
 
-        member_ids = self.m_conversation_repo.list_member_ids(transfer.conversation_id)
-        result = self.m_file_repo.apply_finish(
-            file_id=transfer.file_id,
-            success=bool(file_finish.success),
-            member_ids=member_ids,
-        )
-        if result is None:
-            return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
-
-        all_sync_events = list(result.sync_events)
-        if bool(file_finish.success) and result.changed and result.transfer.status == "completed":
-            file_message_sync_events = self._append_file_message(
-                user_id=user_id,
-                transfer=result.transfer,
-                request_id=request_id,
+        with self.m_file_repo.m_db.transaction():
+            member_ids = self.m_conversation_repo.list_member_ids(transfer.conversation_id)
+            result = self.m_file_repo.apply_finish(
+                file_id=transfer.file_id,
+                success=bool(file_finish.success),
                 member_ids=member_ids,
             )
-            all_sync_events.extend(file_message_sync_events)
+            if result is None:
+                return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
 
+            all_sync_events = list(result.sync_events)
+            if bool(file_finish.success) and not is_download and result.transfer.status == "completed":
+                file_message_sync_events = self._append_file_message(
+                    user_id=user_id,
+                    transfer=result.transfer,
+                    request_id=request_id,
+                    member_ids=member_ids,
+                )
+                all_sync_events.extend(file_message_sync_events)
         ack.success = True
         ack.code = 0
         ack.message = "ok" if result.changed else "ok(idempotent)"
@@ -258,6 +291,11 @@ class FileService:
             completed=result.transfer.status == "completed",
             version=int(result.transfer.version),
             updated_at_ms=int(result.transfer.updated_at_ms),
+            file_size=result.transfer.file_size,
+            sha256=result.transfer.sha256,
+            direction=result.transfer.direction,
+            status=result.transfer.status,
+            file_name=result.transfer.file_name,
         )
         return FileServiceResult(ack=ack, file_updated=updated, sync_events=all_sync_events)
 
@@ -275,44 +313,6 @@ class FileService:
         if transfer is None:
             return None
         return self.m_file_root / transfer.storage_path
-
-    def apply_download_progress(self, user_id: str, file_id: str, received_bytes: int) -> tuple[file_pb2.FileUpdated | None, list[StoredSyncEvent]]:
-        transfer = self.m_file_repo.get_transfer_by_file_id(file_id)
-        if transfer is None or transfer.owner_id != user_id:
-            return None, []
-        member_ids = self.m_conversation_repo.list_member_ids(transfer.conversation_id)
-        result = self.m_file_repo.apply_progress(file_id=file_id, received_bytes=received_bytes, member_ids=member_ids)
-        if result is None:
-            return None, []
-        updated = file_pb2.FileUpdated(
-            event_id=result.sync_events[0].event_id if result.sync_events else "",
-            file_id=result.transfer.file_id,
-            conversation_id=result.transfer.conversation_id,
-            transferred_bytes=int(result.transfer.received_bytes),
-            completed=result.transfer.status == "completed",
-            version=int(result.transfer.version),
-            updated_at_ms=int(result.transfer.updated_at_ms),
-        )
-        return updated, result.sync_events
-
-    def complete_download(self, user_id: str, file_id: str) -> tuple[file_pb2.FileUpdated | None, list[StoredSyncEvent]]:
-        transfer = self.m_file_repo.get_transfer_by_file_id(file_id)
-        if transfer is None or transfer.owner_id != user_id:
-            return None, []
-        member_ids = self.m_conversation_repo.list_member_ids(transfer.conversation_id)
-        result = self.m_file_repo.apply_finish(file_id=file_id, success=True, member_ids=member_ids)
-        if result is None:
-            return None, []
-        updated = file_pb2.FileUpdated(
-            event_id=result.sync_events[0].event_id if result.sync_events else "",
-            file_id=result.transfer.file_id,
-            conversation_id=result.transfer.conversation_id,
-            transferred_bytes=int(result.transfer.received_bytes),
-            completed=result.transfer.status == "completed",
-            version=int(result.transfer.version),
-            updated_at_ms=int(result.transfer.updated_at_ms),
-        )
-        return updated, result.sync_events
 
     def _append_file_message(
         self,
@@ -364,7 +364,7 @@ class FileService:
 
     def _verify_file_sha256(self, transfer: StoredFileTransfer) -> bool:
         target_path = self.m_file_root / transfer.storage_path
-        if not target_path.exists():
+        if not target_path.exists() or target_path.stat().st_size != transfer.file_size:
             return False
         hasher = hashlib.sha256()
         with target_path.open("rb") as file:

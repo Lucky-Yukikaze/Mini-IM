@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS messages (
   recalled INTEGER NOT NULL DEFAULT 0,
   burn_mode INTEGER NOT NULL DEFAULT 0,
   burn_ttl_sec INTEGER NOT NULL DEFAULT 0,
+  content_purged_at_ms INTEGER NOT NULL DEFAULT 0,
   UNIQUE (conversation_id, sender_id, client_msg_id),
   UNIQUE (conversation_id, conversation_seq),
   FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id),
@@ -119,6 +120,7 @@ CREATE TABLE IF NOT EXISTS file_transfers (
   sha256 TEXT NOT NULL,
   storage_path TEXT NOT NULL,
   direction INTEGER NOT NULL,
+  source_file_id TEXT NOT NULL DEFAULT '',
   priority INTEGER NOT NULL DEFAULT 0,
   received_bytes INTEGER NOT NULL DEFAULT 0,
   version INTEGER NOT NULL DEFAULT 1,
@@ -129,6 +131,9 @@ CREATE TABLE IF NOT EXISTS file_transfers (
   FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id),
   FOREIGN KEY (owner_id) REFERENCES users(user_id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_file_transfers_owner_intent
+ON file_transfers(owner_id, client_file_id);
 
 CREATE INDEX IF NOT EXISTS idx_file_transfers_owner_updated
 ON file_transfers(owner_id, updated_at_ms);
@@ -148,6 +153,7 @@ CREATE TABLE IF NOT EXISTS sync_events (
   seq INTEGER NOT NULL,
   conversation_id TEXT NOT NULL,
   event_type TEXT NOT NULL,
+  entity_id TEXT NOT NULL DEFAULT '',
   payload BLOB,
   created_at_ms INTEGER NOT NULL,
   FOREIGN KEY (user_id) REFERENCES users(user_id)
@@ -155,6 +161,9 @@ CREATE TABLE IF NOT EXISTS sync_events (
 
 CREATE INDEX IF NOT EXISTS idx_sync_events_user_seq
 ON sync_events(user_id, seq);
+
+CREATE INDEX IF NOT EXISTS idx_sync_events_entity
+ON sync_events(entity_id, user_id) WHERE event_type = 'message';
 
 CREATE INDEX IF NOT EXISTS idx_message_deliveries_burn_due
 ON message_deliveries(burn_at_ms, burned_at_ms);

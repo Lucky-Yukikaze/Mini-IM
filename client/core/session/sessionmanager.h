@@ -1,3 +1,4 @@
+// Coordinates application requests and native transport events.
 #ifndef MINI_IM_CORE_SESSION_SESSIONMANAGER_H_
 #define MINI_IM_CORE_SESSION_SESSIONMANAGER_H_
 
@@ -6,11 +7,19 @@
 #include <QString>
 #include <QSet>
 #include <QTimer>
+#include <QElapsedTimer>
 #include <QByteArray>
 #include <QVariantList>
 #include <QVariantMap>
 
 #include <msquic.h>
+#include <memory>
+#include "core/sync/statestore.h"
+#include "core/quic/recovery.h"
+
+class MiniImDownloadSink;
+class MiniImUploadStream;
+namespace im { namespace file { class FileUpdated; } }
 
 class QByteArray;
 
@@ -37,6 +46,7 @@ public:
         const QString& text,
         quint32 burn_mode = 0,
         quint32 burn_ttl_sec = 0);
+    bool retryMessage(const QString& conversationId, const QString& clientMsgId);
     bool createConversation(const QString& client_conv_id, const QString& title, const QVariantList& member_ids);
     bool createDirectConversation(const QString& client_conv_id, const QString& peer_user_id);
     bool addMembers(const QString& conversation_id, const QVariantList& member_ids);
@@ -56,6 +66,8 @@ signals:
     void messageUpdated(const QVariantMap& payload);
     void conversationUpdated(const QVariantMap& payload);
     void fileProgress(const QVariantMap& payload);
+    void syncProgress(const QVariantMap& payload);
+    void messageSendsChanged(const QVariantMap& payload);
     void errorRaised(const QString& message);
 
 private slots:
@@ -68,6 +80,8 @@ private:
         QUIC_CONNECTION_EVENT* event);
     static QUIC_STATUS QUIC_API handleStreamEvent(HQUIC stream, void* context, QUIC_STREAM_EVENT* event);
 
+    bool startConnectionAttempt();
+    void restartConnection(const QString& reason, bool clearSession = false);
     bool initializeMsQuic();
     void releaseMsQuic();
     void resetRuntimeState();
@@ -90,23 +104,24 @@ private:
         quint32 priority,
         int direction,
         const QString& source_file_id);
-    bool sendFileFinish(const QString& file_id, bool success);
-    bool sendFileStreamData(const QString& file_id, const QString& file_path, quint64 offset);
-    void handleIncomingFileStream(HQUIC stream, const QByteArray& payload);
+    bool sendFileFinish(
+        const QString& file_id, bool success, quint64 transferredBytes = 0, const QString& sha256 = QString());
+    bool sendFileStreamData(const QString& file_id, const QString& file_path, quint64 offset, quint64 fileSize);
+    void handleIncomingFileStream(quint64 streamId, const QByteArray& payload);
     void handleIncomingEnvelope(const QByteArray& payload);
     void flushPendingDownloadBuffers(const QString& file_id);
-    QVariantMap buildInitialStatePayload(const QString& user_id, quint64 global_cursor) const;
+    void completeFileReceive(quint64 streamId);
+    bool applySyncEvents(const QVector<MiniImStateEvent>& events);
     QString makeRequestId(const QString& suffix = QString()) const;
     void emitConnectionError(const QString& message);
-    void handleFileUpdated(
-        const std::string& event_id,
-        const std::string& file_id,
-        const std::string& conversation_id,
-        quint64 transferred_bytes,
-        bool completed,
-        quint64 version,
-        qlonglong updated_at_ms,
-        bool check_event_id = true);
+    void handleFileUpdated(const im::file::FileUpdated& updated);
+    void finishDownload(const QString& file_id);
+    void pumpMessageOutbox();
+    bool sendQueuedMessage(const QVariantMap& item);
+    void publishMessageSends();
+    void handleMessageResult(const QString& requestId, bool success, int code,
+        const QString& error, const QString& entityId);
+
 
     struct PendingFileUpload
     {
@@ -128,6 +143,8 @@ private:
         QString save_path;
         QString client_file_id;
         QString file_id;
+        std::shared_ptr<MiniImDownloadSink> sink;
+        bool finish_sent = false;
     };
 
     struct DownloadStreamState
@@ -135,8 +152,22 @@ private:
         QByteArray buffer;
         QString file_id;
         bool header_parsed = false;
+        bool finished = false;
+        HQUIC pending_receive = nullptr;
+        quint64 pending_receive_bytes = 0;
     };
 
+    struct CallbackContext
+    {
+        MiniImSessionManager* manager;
+        quint64 generation;
+    };
+
+    MiniImConnectionRecovery m_recovery;
+    QElapsedTimer m_lastResponseTime;
+    quint64 m_connectionGeneration = 0;
+    bool m_transportStopping = false;
+    std::unique_ptr<CallbackContext> m_callbackContext;
     bool m_connected;
     bool m_connecting;
     bool m_hello_sent;
@@ -150,7 +181,15 @@ private:
     quint64 m_seq;
     int m_heartbeat_interval_sec;
     QTimer m_heartbeat_timer;
-    QSet<QString> m_seen_event_ids;
+    QTimer m_messageRetryTimer;
+    QElapsedTimer m_messageAttemptTime;
+    QElapsedTimer m_syncAttemptTime;
+    QString m_activeMessageRequest;
+    std::string m_syncRequestPayload;
+    bool m_messageSyncReady = false;
+    MiniImStateStore m_stateStore;
+    QString m_userId;
+    QString m_syncRequestId;
     QByteArray m_control_stream_buffer;
     QHash<QString, quint64> m_latest_file_versions;
     QHash<QString, PendingFileUpload> m_pending_file_init_requests;
@@ -158,8 +197,9 @@ private:
     QHash<QString, PendingFileDownload> m_pending_file_download_init_requests;
     QHash<QString, PendingFileDownload> m_pending_file_downloads;
     QSet<QString> m_failed_file_downloads;
-    QHash<quintptr, QString> m_file_stream_to_file_id;
-    QHash<quintptr, DownloadStreamState> m_download_stream_states;
+    QHash<QString, QString> m_pending_file_finish_requests;
+    QHash<QString, MiniImUploadStream*> m_upload_streams;
+    QHash<quint64, DownloadStreamState> m_download_stream_states;
 
     const QUIC_API_TABLE* m_msquic;
     HQUIC m_registration;

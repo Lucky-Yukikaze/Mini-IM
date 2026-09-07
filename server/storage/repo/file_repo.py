@@ -5,7 +5,7 @@ import uuid
 from dataclasses import dataclass
 
 from protocol.pb import file_pb2
-from storage.repo.conversation_repo import StoredSyncEvent
+from storage.repo.sync_event import AppendSyncEvents, StoredSyncEvent
 from storage.sqlite.db import MiniImSqliteDb
 
 
@@ -25,6 +25,7 @@ class StoredFileTransfer:
     version: int
     status: str
     updated_at_ms: int
+    source_file_id: str = ""
 
 
 @dataclass
@@ -32,7 +33,7 @@ class FileTransferInitResult:
     transfer: StoredFileTransfer
     sync_events: list[StoredSyncEvent]
     created: bool
-    size_conflict: bool
+    conflict: str = ""
 
 
 @dataclass
@@ -58,361 +59,107 @@ class FileRepo:
         return int(time.time() * 1000)
 
     @staticmethod
-    def _next_global_seq(connection, user_id: str) -> int:
-        row = connection.execute(
-            "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM sync_events WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-        return int(row["next_seq"])
-
-    @staticmethod
     def _is_uploading_status(status: str) -> bool:
         return status in {"init", "uploading", "uploaded"}
 
     def create_or_resume_transfer(
-        self,
-        user_id: str,
-        request_id: str,
-        file_init: file_pb2.FileInit,
-        member_ids: list[str],
-        storage_relative_path: str,
-        stale_timeout_ms: int,
+        self, user_id: str, request_id: str, file_init: file_pb2.FileInit,
+        member_ids: list[str], storage_relative_path: str, stale_timeout_ms: int,
     ) -> FileTransferInitResult:
         now_ms = self._now_ms()
-        connection = self.m_db.m_connection
-        created = False
-        size_conflict = False
-
-        with connection:
-            row = connection.execute(
-                """
-                SELECT
-                  file_id,
-                  conversation_id,
-                  owner_id,
-                  client_file_id,
-                  file_name,
-                  file_size,
-                  sha256,
-                  storage_path,
-                  direction,
-                  priority,
-                  received_bytes,
-                  version,
-                  status,
-                  updated_at_ms
-                FROM file_transfers
-                WHERE owner_id = ? AND conversation_id = ? AND client_file_id = ?
-                """,
-                (user_id, file_init.conversation_id, file_init.client_file_id),
-            ).fetchone()
-
-            if row is None:
-                created = True
+        with self.m_db.transaction() as connection:
+            rows = connection.execute(
+                "SELECT * FROM file_transfers WHERE owner_id = ? AND client_file_id = ? ORDER BY created_at_ms",
+                (user_id, file_init.client_file_id),
+            ).fetchall()
+            created = not rows
+            changed = created
+            if created:
                 file_id = str(uuid.uuid4())
                 connection.execute(
                     """
                     INSERT INTO file_transfers(
-                      file_id,
-                      conversation_id,
-                      owner_id,
-                      client_file_id,
-                      request_id,
-                      file_name,
-                      file_size,
-                      sha256,
-                      storage_path,
-                      direction,
-                      priority,
-                      received_bytes,
-                      version,
-                      status,
-                      created_at_ms,
-                      updated_at_ms
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, 'init', ?, ?)
+                        file_id, conversation_id, owner_id, client_file_id, request_id, file_name,
+                        file_size, sha256, storage_path, direction, source_file_id, priority,
+                        received_bytes, version, status, created_at_ms, updated_at_ms
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, 'init', ?, ?)
                     """,
-                    (
-                        file_id,
-                        file_init.conversation_id,
-                        user_id,
-                        file_init.client_file_id,
-                        request_id,
-                        file_init.file_name,
-                        int(file_init.file_size),
-                        file_init.sha256,
-                        storage_relative_path,
-                        int(file_init.direction),
-                        int(file_init.priority),
-                        now_ms,
-                        now_ms,
-                    ),
+                    (file_id, file_init.conversation_id, user_id, file_init.client_file_id, request_id,
+                     file_init.file_name, int(file_init.file_size), file_init.sha256.lower(),
+                     storage_relative_path, int(file_init.direction), file_init.source_file_id,
+                     int(file_init.priority), now_ms, now_ms),
                 )
-                row = connection.execute(
-                    """
-                    SELECT
-                      file_id,
-                      conversation_id,
-                      owner_id,
-                      client_file_id,
-                      file_name,
-                      file_size,
-                      sha256,
-                      storage_path,
-                      direction,
-                      priority,
-                      received_bytes,
-                      version,
-                      status,
-                      updated_at_ms
-                    FROM file_transfers
-                    WHERE file_id = ?
-                    """,
-                    (file_id,),
-                ).fetchone()
+                transfer = self.get_transfer_by_file_id(file_id)
             else:
-                existing_size = int(row["file_size"])
-                if existing_size != int(file_init.file_size):
-                    size_conflict = True
-                else:
-                    status = str(row["status"])
-                    updated_at_ms = int(row["updated_at_ms"])
-                    if (
-                        stale_timeout_ms > 0
-                        and self._is_uploading_status(status)
-                        and now_ms - updated_at_ms > stale_timeout_ms
-                    ):
-                        next_version = int(row["version"]) + 1
+                transfer = self._row_to_transfer(rows[0])
+                if len(rows) != 1:
+                    return FileTransferInitResult(transfer, [], False, "ambiguous legacy file intent")
+                for field in ("conversation_id", "file_name", "file_size", "sha256", "direction", "source_file_id"):
+                    expected, actual = getattr(transfer, field), getattr(file_init, field)
+                    if field == "sha256":
+                        expected, actual = expected.lower(), actual.lower()
+                    if expected != actual:
+                        return FileTransferInitResult(transfer, [], False, f"intent_id {field} mismatch")
+                stale = (stale_timeout_ms > 0 and self._is_uploading_status(transfer.status)
+                         and now_ms - transfer.updated_at_ms > stale_timeout_ms)
+                if transfer.status != "completed":
+                    next_status = "init" if stale or transfer.status.startswith("failed") else transfer.status
+                    changed = stale or transfer.status != next_status or transfer.priority != int(file_init.priority)
+                    if changed:
+                        transfer.status = next_status
+                        transfer.priority = int(file_init.priority)
+                        transfer.version += 1
+                        transfer.updated_at_ms = max(now_ms, transfer.updated_at_ms + 1)
                         connection.execute(
-                            """
-                            UPDATE file_transfers
-                            SET
-                              status = 'failed_stale',
-                              version = ?,
-                              updated_at_ms = ?
-                            WHERE file_id = ?
-                            """,
-                            (next_version, now_ms, str(row["file_id"])),
+                            "UPDATE file_transfers SET request_id = ?, status = ?, priority = ?, "
+                            "version = ?, updated_at_ms = ? WHERE file_id = ?",
+                            (request_id, transfer.status, transfer.priority, transfer.version,
+                             transfer.updated_at_ms, transfer.file_id),
                         )
-                        connection.execute(
-                            """
-                            UPDATE file_transfers
-                            SET
-                              request_id = ?,
-                              file_name = ?,
-                              file_size = ?,
-                              sha256 = ?,
-                              storage_path = ?,
-                              direction = ?,
-                              priority = ?,
-                              status = 'init',
-                              version = ?,
-                              updated_at_ms = ?
-                            WHERE file_id = ?
-                            """,
-                            (
-                                request_id,
-                                file_init.file_name,
-                                int(file_init.file_size),
-                                file_init.sha256,
-                                storage_relative_path,
-                                int(file_init.direction),
-                                int(file_init.priority),
-                                next_version + 1,
-                                now_ms,
-                                str(row["file_id"]),
-                            ),
-                        )
-                        row = connection.execute(
-                            """
-                            SELECT
-                              file_id,
-                              conversation_id,
-                              owner_id,
-                              client_file_id,
-                              file_name,
-                              file_size,
-                              sha256,
-                              storage_path,
-                              direction,
-                              priority,
-                              received_bytes,
-                              version,
-                              status,
-                              updated_at_ms
-                            FROM file_transfers
-                            WHERE file_id = ?
-                            """,
-                            (str(row["file_id"]),),
-                        ).fetchone()
-
-            transfer = self._row_to_transfer(row)
-            if size_conflict:
-                sync_events = []
-            else:
-                sync_events = self._append_file_updated_sync_events(
-                    connection=connection,
-                    member_ids=member_ids,
-                    transfer=transfer,
-                )
-
-        return FileTransferInitResult(
-            transfer=transfer,
-            sync_events=sync_events,
-            created=created,
-            size_conflict=size_conflict,
-        )
+            events = self._append_file_updated_sync_events(connection, member_ids, transfer) if changed else []
+            return FileTransferInitResult(transfer, events, created)
 
     def get_transfer_by_file_id(self, file_id: str) -> StoredFileTransfer | None:
-        row = self.m_db.execute_fetchone(
-            """
-            SELECT
-              file_id,
-              conversation_id,
-              owner_id,
-              client_file_id,
-              file_name,
-              file_size,
-              sha256,
-              storage_path,
-              direction,
-              priority,
-              received_bytes,
-              version,
-              status,
-              updated_at_ms
-            FROM file_transfers
-            WHERE file_id = ?
-            """,
-            (file_id,),
+        row = self.m_db.execute_fetchone("SELECT * FROM file_transfers WHERE file_id = ?", (file_id,))
+        return self._row_to_transfer(row) if row is not None else None
+
+    def _save_progress(self, connection, transfer: StoredFileTransfer) -> None:
+        transfer.version += 1
+        transfer.updated_at_ms = max(self._now_ms(), transfer.updated_at_ms + 1)
+        connection.execute(
+            "UPDATE file_transfers SET received_bytes = ?, status = ?, version = ?, updated_at_ms = ? WHERE file_id = ?",
+            (transfer.received_bytes, transfer.status, transfer.version, transfer.updated_at_ms, transfer.file_id),
         )
-        if row is None:
-            return None
-        return self._row_to_transfer(row)
 
-    def apply_progress(
-        self,
-        file_id: str,
-        received_bytes: int,
-        member_ids: list[str],
-    ) -> FileTransferProgressResult | None:
-        now_ms = self._now_ms()
-        connection = self.m_db.m_connection
-
-        with connection:
-            row = connection.execute(
-                """
-                SELECT
-                  file_id,
-                  conversation_id,
-                  owner_id,
-                  client_file_id,
-                  file_name,
-                  file_size,
-                  sha256,
-                  storage_path,
-                  direction,
-                  priority,
-                  received_bytes,
-                  version,
-                  status,
-                  updated_at_ms
-                FROM file_transfers
-                WHERE file_id = ?
-                """,
-                (file_id,),
-            ).fetchone()
-            if row is None:
+    def apply_progress(self, file_id: str, received_bytes: int, member_ids: list[str]) -> FileTransferProgressResult | None:
+        with self.m_db.transaction() as connection:
+            transfer = self.get_transfer_by_file_id(file_id)
+            if transfer is None:
                 return None
-
-            transfer = self._row_to_transfer(row)
-            normalized = max(0, min(int(received_bytes), transfer.file_size))
-            changed = normalized > transfer.received_bytes
+            if received_bytes < 0 or received_bytes > transfer.file_size:
+                raise ValueError("invalid transfer progress")
+            changed = transfer.status != "completed" and received_bytes > transfer.received_bytes
             if changed:
-                status = "uploading"
-                if normalized >= transfer.file_size:
-                    status = "uploaded"
-                transfer.received_bytes = normalized
-                transfer.status = status
-                transfer.version += 1
-                transfer.updated_at_ms = now_ms
-                connection.execute(
-                    """
-                    UPDATE file_transfers
-                    SET received_bytes = ?, status = ?, version = ?, updated_at_ms = ?
-                    WHERE file_id = ?
-                    """,
-                    (normalized, status, transfer.version, now_ms, file_id),
-                )
+                transfer.received_bytes = int(received_bytes)
+                transfer.status = "uploaded" if received_bytes == transfer.file_size else "uploading"
+                self._save_progress(connection, transfer)
+            events = self._append_file_updated_sync_events(connection, member_ids, transfer) if changed else []
+            return FileTransferProgressResult(transfer, events, changed)
 
-            sync_events = self._append_file_updated_sync_events(
-                connection=connection,
-                member_ids=member_ids,
-                transfer=transfer,
-            )
-
-        return FileTransferProgressResult(transfer=transfer, sync_events=sync_events, changed=changed)
-
-    def apply_finish(
-        self,
-        file_id: str,
-        success: bool,
-        member_ids: list[str],
-    ) -> FileTransferFinishResult | None:
-        now_ms = self._now_ms()
-        connection = self.m_db.m_connection
-
-        with connection:
-            row = connection.execute(
-                """
-                SELECT
-                  file_id,
-                  conversation_id,
-                  owner_id,
-                  client_file_id,
-                  file_name,
-                  file_size,
-                  sha256,
-                  storage_path,
-                  direction,
-                  priority,
-                  received_bytes,
-                  version,
-                  status,
-                  updated_at_ms
-                FROM file_transfers
-                WHERE file_id = ?
-                """,
-                (file_id,),
-            ).fetchone()
-            if row is None:
+    def apply_finish(self, file_id: str, success: bool, member_ids: list[str]) -> FileTransferFinishResult | None:
+        with self.m_db.transaction() as connection:
+            transfer = self.get_transfer_by_file_id(file_id)
+            if transfer is None:
                 return None
-
-            transfer = self._row_to_transfer(row)
-            target_status = "completed" if success else "failed"
-            target_received = transfer.file_size if success else transfer.received_bytes
-
-            changed = target_status != transfer.status or target_received != transfer.received_bytes
+            target_status = "completed" if success or transfer.status == "completed" else "failed"
+            changed = target_status != transfer.status
             if changed:
-                transfer.received_bytes = target_received
                 transfer.status = target_status
-                transfer.version += 1
-                transfer.updated_at_ms = now_ms
-                connection.execute(
-                    """
-                    UPDATE file_transfers
-                    SET received_bytes = ?, status = ?, version = ?, updated_at_ms = ?
-                    WHERE file_id = ?
-                    """,
-                    (target_received, target_status, transfer.version, now_ms, file_id),
-                )
-
-            sync_events = self._append_file_updated_sync_events(
-                connection=connection,
-                member_ids=member_ids,
-                transfer=transfer,
-            )
-
-        return FileTransferFinishResult(transfer=transfer, sync_events=sync_events, changed=changed)
+                if success:
+                    transfer.received_bytes = transfer.file_size
+                self._save_progress(connection, transfer)
+            events = self._append_file_updated_sync_events(connection, member_ids, transfer) if changed else []
+            return FileTransferFinishResult(transfer, events, changed)
 
     def _append_file_updated_sync_events(
         self,
@@ -428,33 +175,15 @@ class FileRepo:
             completed=transfer.status == "completed",
             version=int(transfer.version),
             updated_at_ms=int(transfer.updated_at_ms),
+            file_size=transfer.file_size,
+            sha256=transfer.sha256,
+            direction=transfer.direction,
+            status=transfer.status,
+            file_name=transfer.file_name,
         )
-        payload_event_id = str(uuid.uuid4())
-        updated.event_id = payload_event_id
-        payload = updated.SerializeToString()
-
-        sync_events: list[StoredSyncEvent] = []
-        for member_id in member_ids:
-            event_id = str(uuid.uuid4())
-            global_seq = self._next_global_seq(connection, member_id)
-            connection.execute(
-                """
-                INSERT INTO sync_events(event_id, user_id, seq, conversation_id, event_type, payload, created_at_ms)
-                VALUES(?, ?, ?, ?, 'file_updated', ?, ?)
-                """,
-                (event_id, member_id, global_seq, transfer.conversation_id, payload, transfer.updated_at_ms),
-            )
-            sync_events.append(
-                StoredSyncEvent(
-                    user_id=member_id,
-                    global_seq=global_seq,
-                    event_id=payload_event_id,
-                    event_type="file_updated",
-                    payload=payload,
-                )
-            )
-
-        return sync_events
+        return AppendSyncEvents(
+            connection, member_ids, transfer.conversation_id, "file_updated", updated, transfer.updated_at_ms,
+        )
 
     @staticmethod
     def _row_to_transfer(row) -> StoredFileTransfer:
@@ -473,4 +202,5 @@ class FileRepo:
             version=int(row["version"]),
             status=str(row["status"]),
             updated_at_ms=int(row["updated_at_ms"]),
+            source_file_id=str(row["source_file_id"]),
         )
