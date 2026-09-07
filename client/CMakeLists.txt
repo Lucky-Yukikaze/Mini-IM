@@ -32,6 +32,8 @@ add_library(mini_im_core STATIC
     core/message/outbox.h
     core/model/eventmapper.cpp
     core/model/eventmapper.h
+    core/sync/coordinator.cpp
+    core/sync/coordinator.h
     core/sync/statestore.cpp
     core/sync/statestore.h
     core/session/sessionmanager.cpp
@@ -91,6 +93,9 @@ if(BUILD_TESTING)
     add_executable(mini_im_upload_tests tests/uploadstream_test.cpp)
     target_link_libraries(mini_im_upload_tests PRIVATE mini_im_core)
     add_test(NAME upload_backpressure COMMAND mini_im_upload_tests)
+    add_executable(mini_im_sync_tests tests/synccoordinator_test.cpp)
+    target_link_libraries(mini_im_sync_tests PRIVATE mini_im_core)
+    add_test(NAME sync_coordination COMMAND mini_im_sync_tests)
     add_executable(mini_im_state_tests tests/statestore_test.cpp core/sync/statestore.cpp core/message/outbox.cpp core/file/taskstore.cpp)
     target_include_directories(mini_im_state_tests PRIVATE .)
     target_link_libraries(mini_im_state_tests PRIVATE Qt6::Core Qt6::Sql)

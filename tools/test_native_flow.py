@@ -193,6 +193,16 @@ class TestProtocol(MiniImQuicProtocol):
                 and envelope.HasField("sync_response") and envelope.request_id):
             self.scenario.held_history_count += 1
             return
+        if self.m_user_id == "bob" and envelope.HasField("sync_response") and envelope.request_id:
+            empty = self.scenario.empty_bob_history_count > 0
+            if empty:
+                self.scenario.empty_bob_history_count -= 1
+                envelope.sync_response.ClearField("events")
+                envelope.sync_response.has_more = False
+            self.scenario.sync_replies.append({
+                "requestId": envelope.request_id, "empty": empty, "time": time.monotonic(),
+                "positions": [event.global_seq for event in envelope.sync_response.events],
+            })
         super()._send(stream_id, envelope)
 
     def _send_file_updated(self, stream_id, request, updated, sender_event):
@@ -279,6 +289,8 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         messages = MessageRepo(self.db)
         deliveries = DeliveryRepo(self.db)
         self.files = RecordingFileService(FileRepo(self.db), conversations, messages, self.root / "files", 900000, scenario=self)
+        self.empty_bob_history_count = 0
+        self.sync_replies = []
         self.hub = OnlineSessionHub()
         cert, key = self.root / "cert.pem", self.root / "key.pem"
         ensure_dev_cert(cert, key)
@@ -315,6 +327,8 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
 
     async def cleanup(self):
         errors = []
+        (self.output_dir / f"{self._testMethodName}-sync-replies.json").write_text(
+            json.dumps(self.sync_replies, indent=2), encoding="utf-8")
         (self.output_dir / f"{self._testMethodName}-file-attempts.json").write_text(
             json.dumps(self.file_attempts, indent=2), encoding="utf-8")
 
@@ -458,6 +472,53 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(await self.synced(self.bob), saved_cursor)
         emitted = [packet["data"]["clientMsgId"] for packet in self.bob.events if packet["event"] == "message"]
         self.assertEqual(["missing"], emitted)
+
+    async def test_sync_history_spans_two_pages_without_duplicate_delivery(self):
+        await self.synced(self.bob)
+        await self.disconnect(self.bob)
+        intents = [f"history-{index}" for index in range(205)]
+        for intent in intents:
+            await self.alice.command("message", conversation=self.conversation, intent=intent, text=intent)
+        await self.alice.wait("message", lambda item: item["clientMsgId"] == intents[-1], timeout=15)
+        start = len(self.sync_replies)
+        mark = len(self.bob.events)
+        await self.bob.connect(self.endpoint, "bob")
+        await self.bob.wait("message", lambda item: item["clientMsgId"] == intents[-1], since=mark)
+        await self.synced(self.bob)
+        delivered = [packet["data"]["clientMsgId"] for packet in self.bob.events[mark:] if packet["event"] == "message"]
+        self.assertEqual(intents, delivered)
+        pages = self.sync_replies[start:]
+        self.assertEqual([200, 5], [len(page["positions"]) for page in pages])
+        self.assertNotEqual(pages[0]["requestId"], pages[1]["requestId"])
+        self.assertEqual(pages[0]["positions"][-1] + 1, pages[1]["positions"][0])
+
+    async def test_empty_sync_page_retries_without_releasing_pending_writes(self):
+        cursor = await self.synced(self.bob)
+        reply_start = len(self.sync_replies)
+        self.drop_next_bob_message = True
+        self.empty_bob_history_count = 1
+        await self.alice.command("message", conversation=self.conversation, intent="gap-missing", text="missing")
+        await self.alice.wait("message", lambda item: item["clientMsgId"] == "gap-missing")
+        mark = await self.alice.command("message", conversation=self.conversation, intent="gap-later", text="later")
+        await self.bob.wait("message", lambda item: item["clientMsgId"] == "gap-later")
+        await self.bob.wait("error", lambda item: "unresolved gap" in item["message"])
+        await self.bob.command("message", conversation=self.conversation, intent="after-gap", text="queued")
+        source = self.root / "after-gap.bin"
+        source.write_bytes(b"file waits for complete history")
+        await self.bob.command("upload", conversation=self.conversation, path=str(source))
+        self.assertFalse(any(item["user"] == "bob" for item in self.message_attempts))
+        self.assertFalse(any(item["user"] == "bob" for item in self.file_attempts))
+        await self.bob.wait("message", lambda item: item["clientMsgId"] == "gap-missing", timeout=8)
+        await self.alice.wait("message", lambda item: item["clientMsgId"] == "after-gap", since=mark)
+        await self.bob.wait("file-tasks", lambda item: not item["items"])
+        self.assertGreater(await self.synced(self.bob), cursor)
+        replies = self.sync_replies[reply_start:]
+        self.assertTrue(replies[0]["empty"])
+        self.assertGreaterEqual(len(replies), 2)
+        self.assertEqual(replies[0]["requestId"], replies[1]["requestId"])
+        emitted = [event["data"]["clientMsgId"] for event in self.bob.events if event["event"] == "message"]
+        self.assertEqual(1, emitted.count("gap-missing"))
+        self.assertEqual(1, emitted.count("gap-later"))
 
     async def test_switch_users_in_one_process_isolates_and_restores_cache(self):
         await self.alice.command("message", conversation=self.conversation, intent="bob-only", text="bob history")

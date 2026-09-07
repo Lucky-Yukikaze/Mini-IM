@@ -58,7 +58,7 @@ npm --prefix ./web run build
 $env:QT_DIR = 'D:/Qt/6.11.0/msvc2022_64'
 $qtToolchain = Join-Path (Get-Location) 'thirdparty_install/vcpkg/scripts/buildsystems/vcpkg.cmake'
 cmake -S ./client -B ./build/client_qt611 -G "Visual Studio 17 2022" -A x64 "-DCMAKE_TOOLCHAIN_FILE=$qtToolchain" "-DVCPKG_TARGET_TRIPLET=x64-windows" "-DCMAKE_PREFIX_PATH=$env:QT_DIR" -DBUILD_TESTING=ON
-cmake --build ./build/client_qt611 --config Release --target mini_im_client mini_im_download_tests mini_im_upload_tests mini_im_state_tests mini_im_native_driver
+cmake --build ./build/client_qt611 --config Release --target mini_im_client mini_im_download_tests mini_im_upload_tests mini_im_state_tests mini_im_sync_tests mini_im_native_driver
 & "$env:QT_DIR/bin/windeployqt.exe" --release --compiler-runtime --dir ./build/client_qt611/Release ./build/client_qt611/Release/mini_im_client.exe
 ~~~
 
@@ -145,6 +145,20 @@ npm --prefix ./web run dev -- --host 127.0.0.1 --port 5173 --strictPort
 消息保存和页面检查见 [发送意图验证](refactoring-progress.md#消息发送意图与确认恢复--2026-09-07)，
 自动重连见 [连接恢复验证](refactoring-progress.md#自动重连与会话恢复--2026-09-07)。
 
+## 同步补拉与等待
+
+[同步协调组件](../client/core/sync/coordinator.cpp) 在登录成功后从本地连续位置请求历史，
+每页最多 200 条事件，同时只保留 1 个活动请求；独立计时器每 500 毫秒检查，
+距上次发送至少 5000 毫秒才以原请求标识和相同内容重试。
+分页请求采用新的标识，从已提交的连续位置继续。
+
+在线事件和补拉事件共用状态存储；当前请求追平且没有缺失事件时，才继续消息与文件任务。
+空页或无法推进连续位置的响应若仍有缺口，会报告 `unresolved gap` 并保留原请求重试；
+同一请求只报告一次该缺口。这个状态下发送意图仍保存在本地，不能直接清除缓存或推进位置。
+断开连接停止补拉；重新登录后读取已保存的位置并建立新请求。
+数据库写入失败会停止同步及断开连接，未提交的事件不会通知页面。
+验证范围见 [同步协调批次](refactoring-progress.md#同步协调与无进展页恢复--2026-09-07)。
+
 ## 文件任务与恢复
 
 上传、下载先保存任务，再通过完成回调告知页面已接受；输入框在保存成功后清空，
@@ -200,12 +214,12 @@ Push-Location ./web
 & ./node_modules/.bin/vue-tsc.cmd --noEmit
 npm run build
 Pop-Location
-cmake --build ./build/client_qt611 --config Release --target mini_im_client mini_im_download_tests mini_im_upload_tests mini_im_state_tests mini_im_native_driver
+cmake --build ./build/client_qt611 --config Release --target mini_im_client mini_im_download_tests mini_im_upload_tests mini_im_state_tests mini_im_sync_tests mini_im_native_driver
 ctest --test-dir ./build/client_qt611 -C Release --output-on-failure
 ~~~
 
 服务端测试包含业务与存储入口，以及使用真实 aioquic 发送器、受控确认和丢包的下载调度检查；
-页面测试检查状态合并；CTest 运行 Qt 下载、上传缓冲、同步状态、消息发送意图及文件任务持久化测试。真实双客户端网络路径使用下述独立入口。
+页面测试检查状态合并；CTest 运行 Qt 下载、上传缓冲、同步协调和状态持久化测试，覆盖消息发送意图及文件任务。真实双客户端网络路径使用下述独立入口。
 类型检查失败、未完成的网络场景及性能测量统一记入执行记录。
 
 ## 真实原生客户端联调
@@ -224,7 +238,7 @@ ctest --test-dir ./build/client_qt611 -C Release --output-on-failure
 
 测试覆盖消息、文件、已接收状态和待确认消息的程序重启恢复，以及确认丢失、重复确认、换用户、自动重连、会话失效和响应超时；
 还覆盖文件原意图续传、完成确认丢失、源文件变化、任务排队、账号隔离和本机取消，
-以及下载或登录等待期间的正常进程退出与重新连接；
+以及下载或登录等待期间的正常进程退出与重新连接、跨页补拉和空同步页恢复；
 Vue 完整桌面页面、其他写入的跨重启恢复及并发性能需另外验收。
 可在上述联调命令后追加 `--test test_process_restart_fills_persisted_sync_gap` 单独复核一个场景，
 重复 `--test` 可选择多个场景；省略时执行全部。当前覆盖及运行结果统一见执行记录。

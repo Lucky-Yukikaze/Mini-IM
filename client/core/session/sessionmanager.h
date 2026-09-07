@@ -15,6 +15,7 @@
 #include <memory>
 #include <string>
 #include "core/sync/statestore.h"
+#include "core/sync/coordinator.h"
 #include "core/quic/recovery.h"
 #include "core/quic/connection.h"
 
@@ -92,7 +93,7 @@ private:
     bool sendHello();
     bool sendHeartbeat();
     void handleIncomingControlStreamData(const QByteArray& payload);
-    bool sendSyncRequest(quint64 global_cursor, quint32 limit = 200);
+    im::envelope::Envelope makeSyncRequest(quint64 cursor, quint32 limit);
     bool sendFileInitRequest(
         const QString& request_id,
         const QString& conversation_id,
@@ -111,7 +112,7 @@ private:
     void handleIncomingEnvelope(const QByteArray& payload);
     void flushPendingDownloadBuffers(const QString& file_id);
     void completeFileReceive(quint64 streamId);
-    bool applySyncEvents(const QVector<MiniImStateEvent>& events);
+    void onSyncEventApplied(const MiniImStateEvent& event);
     QString makeRequestId(const QString& suffix = QString()) const;
     void emitConnectionError(const QString& message);
     void handleFileUpdated(const im::file::FileUpdated& updated);
@@ -162,6 +163,8 @@ private:
         bool finished = false;
     };
 
+    MiniImStateStore m_stateStore;
+    MiniImSyncCoordinator m_sync;
     MiniImQuicConnection m_transport;
     MiniImConnectionRecovery m_recovery;
     QElapsedTimer m_lastResponseTime;
@@ -175,19 +178,13 @@ private:
     QString m_token;
     QString m_device_id;
     QString m_last_acked_request_id;
-    quint64 m_global_cursor;
     quint64 m_seq;
     int m_heartbeat_interval_sec;
     QTimer m_heartbeat_timer;
     QTimer m_messageRetryTimer;
     QElapsedTimer m_messageAttemptTime;
-    QElapsedTimer m_syncAttemptTime;
     QString m_activeMessageRequest;
-    std::string m_syncRequestPayload;
-    bool m_messageSyncReady = false;
-    MiniImStateStore m_stateStore;
     QString m_userId;
-    QString m_syncRequestId;
     QByteArray m_control_stream_buffer;
     QSet<QString> m_activeFileTasks;
     QHash<QString, QElapsedTimer> m_fileControlAttempts;
