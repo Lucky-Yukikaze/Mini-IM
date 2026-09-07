@@ -740,6 +740,49 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload, target.read_bytes())
         self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM file_transfers WHERE direction=2")[0])
 
+    async def test_normal_exit_with_deferred_download_restores_original_task(self):
+        payload = bytes(range(251)) * 4096
+        file_id = await self.upload(payload)
+        self.delay_metadata = True
+        self.hold_metadata = True
+        target = self.root / "exit-deferred.bin"
+        target.write_bytes(b"preserve until verified")
+        mark = await self.bob.command("download", conversation=self.conversation, source=file_id, path=str(target))
+        async with asyncio.timeout(5):
+            while not self.deferred_metadata:
+                await asyncio.sleep(0.001)
+        await self.alice.command("message", conversation=self.conversation, intent="before-exit", text="barrier")
+        await self.bob.wait("message", lambda item: item["clientMsgId"] == "before-exit", since=mark)
+        # Closing the controller exits the Qt event loop, then destroys the still-connected bridge.
+        # close() requires exit code 0; a destructor deadlock is killed after 5 seconds and fails.
+        await self.bob.close()
+        self.assertEqual(b"preserve until verified", target.read_bytes())
+        self.assertFalse(self.db.execute_fetchone(
+            "SELECT 1 FROM file_transfers WHERE direction=2 AND status='completed'"))
+        self.deferred_metadata.clear()
+        self.hold_metadata = False
+        self.delay_metadata = False
+        initial = await self.restart_bob()
+        self.assertEqual(1, len(initial["fileTasks"]))
+        await self.bob.wait("file-tasks", lambda item: not item["items"])
+        self.assert_single_file_intent("bob", 2)
+        self.assertEqual(payload, target.read_bytes())
+
+    async def test_normal_exit_while_waiting_for_welcome(self):
+        await self.disconnect(self.bob)
+        self.drop_welcome_count = 1
+        mark = await self.bob.command(
+            "connect", endpoint=self.endpoint, token="dev-token:bob", device="device-bob")
+        async with asyncio.timeout(5):
+            while self.drop_welcome_count:
+                await asyncio.sleep(0.001)
+        self.assertFalse(any(item["event"] == "initial" for item in self.bob.events[mark:]))
+        await self.bob.close()
+        initial = await self.restart_bob()
+        self.assertEqual("bob", initial["currentUser"]["userId"])
+        await self.alice.command("message", conversation=self.conversation, intent="after-exit", text="restored")
+        await self.bob.wait("message", lambda item: item["clientMsgId"] == "after-exit")
+
     async def test_concurrent_downloads_preserve_distinct_targets(self):
         payload = bytes(range(251)) * 128
         file_id = await self.upload(payload)

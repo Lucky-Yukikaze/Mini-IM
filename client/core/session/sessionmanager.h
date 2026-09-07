@@ -12,13 +12,13 @@
 #include <QVariantList>
 #include <QVariantMap>
 
-#include <msquic.h>
 #include <memory>
+#include <string>
 #include "core/sync/statestore.h"
 #include "core/quic/recovery.h"
+#include "core/quic/connection.h"
 
 class MiniImDownloadSink;
-class MiniImUploadStream;
 namespace im { namespace file { class FileUpdated; } }
 
 class QByteArray;
@@ -77,19 +77,16 @@ private slots:
     void onHeartbeatTimeout();
 
 private:
-    static QUIC_STATUS QUIC_API handleConnectionEvent(
-        HQUIC connection,
-        void* context,
-        QUIC_CONNECTION_EVENT* event);
-    static QUIC_STATUS QUIC_API handleStreamEvent(HQUIC stream, void* context, QUIC_STREAM_EVENT* event);
+    void onTransportConnected();
+    void onTransportDisconnected();
+    void onFileData(quint64 streamId, const QByteArray& payload);
+    void onFileEnded(quint64 streamId);
+    void onFileClosed(quint64 streamId, bool connectionShutdown);
+    void onUploadFinished(const QString& fileId, bool success, const QString& error);
 
     bool startConnectionAttempt();
     void restartConnection(const QString& reason, bool clearSession = false);
-    bool initializeMsQuic();
-    void releaseMsQuic();
     void resetRuntimeState();
-    void closeControlStreamHandle();
-    void closeConnectionHandle();
     bool parseEndpoint(const QString& endpoint, QString* host, uint16_t* port) const;
     bool sendEnvelope(const std::string& payload);
     bool sendHello();
@@ -163,21 +160,12 @@ private:
         QString file_id;
         bool header_parsed = false;
         bool finished = false;
-        HQUIC pending_receive = nullptr;
-        quint64 pending_receive_bytes = 0;
     };
 
-    struct CallbackContext
-    {
-        MiniImSessionManager* manager;
-        quint64 generation;
-    };
-
+    MiniImQuicConnection m_transport;
     MiniImConnectionRecovery m_recovery;
     QElapsedTimer m_lastResponseTime;
-    quint64 m_connectionGeneration = 0;
     bool m_transportStopping = false;
-    std::unique_ptr<CallbackContext> m_callbackContext;
     bool m_connected;
     bool m_connecting;
     bool m_hello_sent;
@@ -210,14 +198,9 @@ private:
     QHash<QString, PendingFileDownload> m_pending_file_downloads;
     QSet<QString> m_failed_file_downloads;
     QHash<QString, QString> m_pending_file_finish_requests;
-    QHash<QString, MiniImUploadStream*> m_upload_streams;
     QHash<quint64, DownloadStreamState> m_download_stream_states;
 
-    const QUIC_API_TABLE* m_msquic;
-    HQUIC m_registration;
-    HQUIC m_configuration;
-    HQUIC m_connection;
-    HQUIC m_stream;
+
 };
 
 #endif  // MINI_IM_CORE_SESSION_SESSIONMANAGER_H_

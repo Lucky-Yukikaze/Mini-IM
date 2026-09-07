@@ -24,6 +24,8 @@ set(MINI_IM_PROTO_FILES
 )
 
 add_library(mini_im_core STATIC
+    core/quic/connection.cpp
+    core/quic/connection.h
     core/quic/recovery.cpp
     core/quic/recovery.h
     core/message/outbox.cpp
