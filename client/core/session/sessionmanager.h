@@ -47,6 +47,8 @@ public:
         quint32 burn_mode = 0,
         quint32 burn_ttl_sec = 0);
     bool retryMessage(const QString& conversationId, const QString& clientMsgId);
+    bool retryFile(const QString& clientFileId);
+    bool cancelFile(const QString& clientFileId);
     bool createConversation(const QString& client_conv_id, const QString& title, const QVariantList& member_ids);
     bool createDirectConversation(const QString& client_conv_id, const QString& peer_user_id);
     bool addMembers(const QString& conversation_id, const QVariantList& member_ids);
@@ -68,6 +70,7 @@ signals:
     void fileProgress(const QVariantMap& payload);
     void syncProgress(const QVariantMap& payload);
     void messageSendsChanged(const QVariantMap& payload);
+    void fileTasksChanged(const QVariantMap& payload);
     void errorRaised(const QString& message);
 
 private slots:
@@ -116,6 +119,12 @@ private:
     void emitConnectionError(const QString& message);
     void handleFileUpdated(const im::file::FileUpdated& updated);
     void finishDownload(const QString& file_id);
+    void pumpFileTasks();
+    void startFileTask(const QVariantMap& task);
+    void publishFileTasks();
+    void failFileTask(const QString& fileId, const QString& error);
+    void handleFileResult(const QString& requestId, bool success, int code,
+        const QString& error, const QString& fileId);
     void pumpMessageOutbox();
     bool sendQueuedMessage(const QVariantMap& item);
     void publishMessageSends();
@@ -145,6 +154,7 @@ private:
         QString file_id;
         std::shared_ptr<MiniImDownloadSink> sink;
         bool finish_sent = false;
+        quint64 resume_offset = 0;
     };
 
     struct DownloadStreamState
@@ -191,6 +201,8 @@ private:
     QString m_userId;
     QString m_syncRequestId;
     QByteArray m_control_stream_buffer;
+    QSet<QString> m_activeFileTasks;
+    QHash<QString, QElapsedTimer> m_fileControlAttempts;
     QHash<QString, quint64> m_latest_file_versions;
     QHash<QString, PendingFileUpload> m_pending_file_init_requests;
     QHash<QString, PendingFileUpload> m_pending_file_uploads;

@@ -54,6 +54,14 @@ bool Dispatch(ImBridge& bridge, const QJsonObject& command)
     {
         return bridge.recallMessage(value("conversation"), value("message"));
     }
+    if (operation == QStringLiteral("retry-file"))
+    {
+        return bridge.retryFile(value("intent"));
+    }
+    if (operation == QStringLiteral("cancel-file"))
+    {
+        return bridge.cancelFile(value("intent"));
+    }
     if (operation == QStringLiteral("upload"))
     {
         return bridge.sendFile(value("conversation"), value("path"), 0);
@@ -89,6 +97,7 @@ int main(int argc, char** argv)
     forward(&ImBridge::messagePushed, QStringLiteral("message"));
     forward(&ImBridge::messageUpdated, QStringLiteral("update"));
     forward(&ImBridge::conversationUpdated, QStringLiteral("conversation"));
+    forward(&ImBridge::fileTasksChanged, QStringLiteral("file-tasks"));
     forward(&ImBridge::fileProgress, QStringLiteral("file"));
     forward(&ImBridge::syncProgress, QStringLiteral("sync"));
     forward(&ImBridge::messageSendsChanged, QStringLiteral("message-sends"));

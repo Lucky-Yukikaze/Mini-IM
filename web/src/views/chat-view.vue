@@ -44,8 +44,8 @@
         :disabled="!canSendToActiveConversation"
         :download-file-id-preset="downloadFileIdPreset"
         :send-message="onSend"
-        @send-file="onSendFile"
-        @download-file="onDownloadFile"
+        :send-file="onSendFile"
+        :download-file="onDownloadFile"
       />
     </main>
 
@@ -94,7 +94,15 @@
       <section class="details-section">
         <div class="details-title">文件</div>
         <div class="file-progress-scroll">
-          <div v-if="currentFileProgress.length === 0" class="muted-text">暂无传输</div>
+          <div v-for="task in session.currentFileTasks" :key="task.clientFileId" class="file-task-card">
+            <div>{{ task.direction === 1 ? '上传' : '下载' }} · {{ task.fileName }}</div>
+            <div class="file-meta">{{ task.status === 'failed' ? '传输失败' : task.status === 'finishing' ? '等待完成确认' : '等待或传输中' }}</div>
+            <div v-if="task.error" class="file-meta">{{ task.error }}</div>
+            <button v-if="task.status === 'failed'" class="secondary-button"
+              :disabled="session.connection.state !== 'connected'" @click="onFileAction(task.clientFileId, false)">重试</button>
+            <button class="secondary-button" @click="onFileAction(task.clientFileId, true)">取消</button>
+          </div>
+          <div v-if="currentFileProgress.length === 0 && session.currentFileTasks.length === 0" class="muted-text">暂无传输</div>
           <div v-for="item in currentFileProgress" :key="item.fileId" class="file-progress-card">
             <div>
               <div class="file-name">传输任务 ID: {{ item.fileId }}</div>
@@ -146,6 +154,8 @@ import {
   leaveConversation,
   recallMessage,
   retryMessage,
+  retryFile,
+  cancelFile,
   removeMembers,
   renameConversation,
   sendFile,
@@ -166,6 +176,7 @@ import type {
   InitialStatePayload,
   MessageItem,
   MessageSendItem,
+  FileTaskItem,
   MessageUpdate
 } from '../types';
 
@@ -256,6 +267,10 @@ bridgeEvents.on('initialStateLoaded', (payload) => {
   }
   pendingMessages.splice(0);
   session.applyInitialState(payload as InitialStatePayload);
+});
+
+bridgeEvents.on('fileTasksChanged', (payload) => {
+  session.applyFileTasks((payload as { items: FileTaskItem[] }).items);
 });
 
 bridgeEvents.on('messageSendsChanged', (payload) => {
@@ -418,22 +433,43 @@ function onFillDownload(fileId: string): void {
   downloadFileIdPreset.value = fileId;
 }
 
-function onSendFile(filePath: string): void {
-  if (!session.activeConversationId) {
-    return;
+async function onSendFile(filePath: string): Promise<boolean> {
+  if (!session.activeConversationId) return false;
+  try {
+    const accepted = await sendFile(session.activeConversationId, filePath, 0);
+    if (!accepted) showNotice('文件任务未保存，请检查路径');
+    return accepted;
+  } catch {
+    showNotice('文件任务调用失败');
+    return false;
   }
-  sendFile(session.activeConversationId, filePath, 0);
 }
 
-function onDownloadFile(fileId: string, savePath: string): void {
-  if (!session.activeConversationId) {
-    return;
+async function onDownloadFile(fileId: string, savePath: string): Promise<boolean> {
+  if (!session.activeConversationId) return false;
+  try {
+    const accepted = await downloadFile(session.activeConversationId, fileId, savePath, 0);
+    if (!accepted) showNotice('下载任务未保存，请检查输入');
+    return accepted;
+  } catch {
+    showNotice('下载任务调用失败');
+    return false;
   }
-  downloadFile(session.activeConversationId, fileId, savePath, 0);
+}
+
+async function onFileAction(clientFileId: string, cancel: boolean): Promise<void> {
+  try {
+    const accepted = await (cancel ? cancelFile(clientFileId) : retryFile(clientFileId));
+    if (!accepted) showNotice('文件任务操作未被接受');
+  } catch {
+    showNotice('文件任务操作失败');
+  }
 }
 </script>
 
 <style scoped>
+.file-task-card { padding: 8px 0; overflow-wrap: anywhere; }
+.file-task-card button { margin-top: 6px; margin-right: 6px; }
 .chat-pane.has-pending-messages { grid-template-rows: auto minmax(0, 1fr) auto auto; }
 .pending-message-list { padding: 8px 20px; max-height: 160px; overflow-y: auto; }
 .pending-message { display: flex; align-items: center; gap: 10px; padding: 6px 0; font-size: 13px; }

@@ -4,6 +4,7 @@ import type {
   ConversationItem,
   InitialStatePayload,
   FileProgressItem,
+  FileTaskItem,
   MessageItem,
   MessageSendItem,
   MessageUpdate
@@ -16,6 +17,7 @@ interface SessionStoreState {
   unreadTotal: number;
   conversations: ConversationItem[];
   messageSends: MessageSendItem[];
+  fileTasks: FileTaskItem[];
   activeConversationId: string;
   activeConversationLabel: string;
   messagesByConversation: Record<string, MessageItem[]>;
@@ -126,6 +128,7 @@ export const useSessionStore = defineStore('session', {
     unreadTotal: 0,
     conversations: [],
     messageSends: [],
+    fileTasks: [],
     activeConversationId: '',
     activeConversationLabel: '-',
     messagesByConversation: {},
@@ -134,6 +137,9 @@ export const useSessionStore = defineStore('session', {
     pendingMessageStateByConversation: {}
   }),
   getters: {
+    currentFileTasks(state): FileTaskItem[] {
+      return state.fileTasks.filter((item) => item.conversationId === state.activeConversationId);
+    },
     currentMessageSends(state): MessageSendItem[] {
       return state.messageSends.filter((item) => item.conversationId === state.activeConversationId);
     },
@@ -154,6 +160,9 @@ export const useSessionStore = defineStore('session', {
     setCurrentConversation(conversationId: string): void {
       this.activeConversationId = conversationId;
       this.activeConversationLabel = getConversationLabel(this.conversations, conversationId, this.currentUserId);
+    },
+    applyFileTasks(items: FileTaskItem[]): void {
+      this.fileTasks = items;
     },
     applyMessageSends(items: MessageSendItem[]): void {
       this.messageSends = items;
@@ -177,6 +186,9 @@ export const useSessionStore = defineStore('session', {
       }
       if (payload.readProgressByConversation !== undefined) {
         this.readProgressByConversation = payload.readProgressByConversation;
+      }
+      if (payload.fileTasks !== undefined) {
+        this.applyFileTasks(payload.fileTasks);
       }
       if (payload.messageSends !== undefined) {
         this.applyMessageSends(payload.messageSends);

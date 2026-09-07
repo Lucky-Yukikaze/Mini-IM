@@ -147,6 +147,13 @@ class TestProtocol(MiniImQuicProtocol):
         self.scenario = scenario
         super().__init__(*args, **kwargs)
         scenario.protocols.append(self)
+        original_pending = self.m_download_sender.buffer.pending_bytes
+        def paused_pending(stream_id):
+            job = self.m_download_sender.jobs.get(stream_id)
+            if scenario.pause_download_at and job and job.offset >= scenario.pause_download_at:
+                return 131072
+            return original_pending(stream_id)
+        self.m_download_sender.buffer.pending_bytes = paused_pending
 
     def _debug(self, message):
         self.scenario.server_log.write(message + "\n")
@@ -159,6 +166,12 @@ class TestProtocol(MiniImQuicProtocol):
         super().send_sync_event(event)
 
     def _send(self, stream_id, envelope):
+        if envelope.HasField("ack") and envelope.ack.success:
+            key = "filefinish" if "-filefinish-" in envelope.request_id else "fileinit"
+            if ("-filefinish-" in envelope.request_id or "-fileinit-" in envelope.request_id
+                    or "-filedl-" in envelope.request_id) and self.scenario.drop_file_acks.get(key, 0):
+                self.scenario.drop_file_acks[key] -= 1
+                return
         if self.scenario.silent_user and self.m_user_id == self.scenario.silent_user:
             return
         if envelope.HasField("welcome") and self.scenario.heartbeat_interval:
@@ -214,6 +227,20 @@ class RecordingMessageService(MessageService):
         return super().handle_send_message(user_id, request_id, send_message)
 
 
+class RecordingFileService(FileService):
+    def __init__(self, *args, scenario, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.scenario = scenario
+
+    def handle_file_init(self, user_id, request_id, file_init):
+        result = super().handle_file_init(user_id, request_id, file_init)
+        self.scenario.file_attempts.append({
+            "user": user_id, "requestId": request_id, "intent": file_init.client_file_id,
+            "offset": file_init.resume_offset, "fileId": result.ack.entity_id,
+        })
+        return result
+
+
 class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
     driver_path: Path
     output_dir: Path
@@ -241,6 +268,9 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         self.drop_welcome_count = 0
         self.silent_user = ""
         self.heartbeat_interval = 0
+        self.pause_download_at = 0
+        self.drop_file_acks = {}
+        self.file_attempts = []
         self.fault = FaultConfig()
         self.db_path = self.root / "test.db"
         init_db(self.db_path)
@@ -248,7 +278,7 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         conversations = ConversationRepo(self.db)
         messages = MessageRepo(self.db)
         deliveries = DeliveryRepo(self.db)
-        self.files = FileService(FileRepo(self.db), conversations, messages, self.root / "files", 900000)
+        self.files = RecordingFileService(FileRepo(self.db), conversations, messages, self.root / "files", 900000, scenario=self)
         self.hub = OnlineSessionHub()
         cert, key = self.root / "cert.pem", self.root / "key.pem"
         ensure_dev_cert(cert, key)
@@ -285,6 +315,9 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
 
     async def cleanup(self):
         errors = []
+        (self.output_dir / f"{self._testMethodName}-file-attempts.json").write_text(
+            json.dumps(self.file_attempts, indent=2), encoding="utf-8")
+
         (self.output_dir / f"{self._testMethodName}-message-attempts.json").write_text(
             json.dumps(self.message_attempts, indent=2), encoding="utf-8",
         )
@@ -700,10 +733,12 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         self.deferred_metadata.clear()
         self.hold_metadata = False
         self.delay_metadata = False
-        await self.bob.connect(self.endpoint, "bob")
-        mark = await self.bob.command("download", conversation=self.conversation, source=file_id, path=str(target))
+        mark = len(self.bob.events)
+        initial = await self.bob.connect(self.endpoint, "bob")
+        self.assertEqual(1, len(initial["fileTasks"]))
         await self.bob.wait("file", lambda item: item["completed"] and item["fileId"] != file_id, since=mark)
         self.assertEqual(payload, target.read_bytes())
+        self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM file_transfers WHERE direction=2")[0])
 
     async def test_concurrent_downloads_preserve_distinct_targets(self):
         payload = bytes(range(251)) * 128
@@ -749,6 +784,182 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         mark = await self.bob.command("download", conversation=self.conversation, source=file_id, path=str(target))
         await self.bob.wait("file", lambda item: item["completed"] and item["fileId"] != file_id, since=mark)
         self.assertEqual(payload, target.read_bytes())
+
+    def assert_single_file_intent(self, user, direction):
+        rows = self.db.execute_fetchall(
+            "SELECT * FROM file_transfers WHERE owner_id=? AND direction=?", (user, direction))
+        self.assertEqual(1, len(rows))
+        row = rows[0]
+        attempts = [item for item in self.file_attempts if item["intent"] == row["client_file_id"]]
+        self.assertGreaterEqual(len(attempts), 2)
+        self.assertEqual(1, len({item["requestId"] for item in attempts}))
+        self.assertEqual({row["file_id"]}, {item["fileId"] for item in attempts})
+        self.assertEqual("completed", row["status"])
+        return row, attempts
+
+    async def test_upload_restart_resumes_original_task_and_offset(self):
+        self.fault.file_drop_after_bytes = 262144
+        payload = bytes(range(251)) * 8192
+        source = self.root / "restart-upload.bin"
+        source.write_bytes(payload)
+        mark = await self.alice.command("upload", conversation=self.conversation, path=str(source))
+        await self.alice.wait("connection", lambda item: item["state"] == "disconnected", since=mark)
+        row = self.db.execute_fetchone("SELECT * FROM file_transfers WHERE direction=1")
+        self.assertGreater(row["received_bytes"], 0)
+        self.assertLess(row["received_bytes"], len(payload))
+        await self.alice.crash()
+        self.fault.file_drop_after_bytes = 0
+        initial = await self.restart_alice()
+        self.assertEqual(row["client_file_id"], initial["fileTasks"][0]["clientFileId"])
+        await self.alice.wait("file-tasks", lambda item: not item["items"])
+        row, _ = self.assert_single_file_intent("alice", 1)
+        self.assertEqual(payload, self.files.get_storage_path(row["file_id"]).read_bytes())
+        self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+
+    async def test_download_restart_uses_existing_partial_file(self):
+        payload = bytes(range(251)) * 4096
+        file_id = await self.upload(payload)
+        self.pause_download_at = 65536
+        target = self.root / "resume-download.bin"
+        target.write_bytes(b"keep until verified")
+        await self.bob.command("download", conversation=self.conversation, source=file_id, path=str(target))
+        async with asyncio.timeout(5):
+            while True:
+                parts = list(self.root.glob("resume-download.bin.miniim-*.part"))
+                if parts and parts[0].stat().st_size >= self.pause_download_at:
+                    break
+                await asyncio.sleep(0.01)
+        partial = parts[0].stat().st_size
+        self.assertEqual(b"keep until verified", target.read_bytes())
+        await self.bob.crash()
+        self.pause_download_at = 0
+        initial = await self.restart_bob()
+        self.assertEqual(1, len(initial["fileTasks"]))
+        await self.bob.wait("file-tasks", lambda item: not item["items"])
+        row, attempts = self.assert_single_file_intent("bob", 2)
+        self.assertEqual(partial, attempts[-1]["offset"])
+        self.assertEqual(payload, target.read_bytes())
+
+    async def test_download_published_before_lost_finish_ack_survives_restart(self):
+        payload = b"published download" * 8192
+        file_id = await self.upload(payload)
+        self.drop_file_acks["filefinish"] = 1
+        target = self.root / "published.bin"
+        mark = await self.bob.command("download", conversation=self.conversation, source=file_id, path=str(target))
+        await self.bob.wait("file", lambda item: item["completed"] and item["fileId"] != file_id, since=mark)
+        self.assertEqual(payload, target.read_bytes())
+        await self.bob.crash()
+        initial = await self.restart_bob()
+        self.assertEqual("finishing", initial["fileTasks"][0]["status"])
+        await self.bob.wait("file-tasks", lambda item: not item["items"])
+        self.assertEqual(payload, target.read_bytes())
+        self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM file_transfers WHERE direction=2")[0])
+
+    async def test_upload_init_ack_loss_reuses_existing_intent(self):
+        self.drop_file_acks["fileinit"] = 1
+        source = self.root / "init-ack.bin"
+        source.write_bytes(b"same intent" * 8192)
+        mark = await self.alice.command("upload", conversation=self.conversation, path=str(source))
+        await self.alice.wait("file", lambda item: item["completed"], since=mark, timeout=12)
+        self.assert_single_file_intent("alice", 1)
+
+    async def test_changed_upload_is_rejected_and_explicit_retry_keeps_intent(self):
+        self.fault.file_drop_after_bytes = 262144
+        source = self.root / "changed-source.bin"
+        payload = b"original source" * 65536
+        source.write_bytes(payload)
+        mark = await self.alice.command("upload", conversation=self.conversation, path=str(source))
+        await self.alice.wait("connection", lambda item: item["state"] == "disconnected", since=mark)
+        await self.alice.crash()
+        source.write_bytes(b"x" * len(payload))
+        self.fault.file_drop_after_bytes = 0
+        initial = await self.restart_alice()
+        intent = initial["fileTasks"][0]["clientFileId"]
+        await self.alice.wait("file-tasks", lambda item: any(x["status"] == "failed" for x in item["items"]))
+        self.assertEqual(0, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+        source.write_bytes(payload)
+        mark = await self.alice.command("retry-file", intent=intent)
+        await self.alice.wait("file", lambda item: item["completed"], since=mark)
+        self.assert_single_file_intent("alice", 1)
+
+    async def test_cancelled_download_stays_cancelled_after_restart(self):
+        payload = b"cancelled body" * 65536
+        file_id = await self.upload(payload)
+        self.pause_download_at = 65536
+        target = self.root / "cancelled.bin"
+        target.write_bytes(b"keep")
+        mark = await self.bob.command("download", conversation=self.conversation, source=file_id, path=str(target))
+        task = await self.bob.wait("file-tasks", lambda item: bool(item["items"]), since=mark)
+        mark = await self.bob.command("cancel-file", intent=task["items"][0]["clientFileId"])
+        await self.bob.wait("file-tasks", lambda item: not item["items"], since=mark)
+        await self.bob.crash()
+        self.pause_download_at = 0
+        attempts = len(self.file_attempts)
+        initial = await self.restart_bob()
+        self.assertEqual([], initial["fileTasks"])
+        await self.synced(self.bob)
+        self.assertEqual(attempts, len(self.file_attempts))
+        self.assertEqual(b"keep", target.read_bytes())
+
+    async def test_corrupt_download_can_retry_original_intent_from_zero(self):
+        payload = b"verified retry" * 4096
+        file_id = await self.upload(payload)
+        source = self.files.get_storage_path(file_id)
+        source.write_bytes(b"x" * len(payload))
+        target = self.root / "retry-corrupt.bin"
+        target.write_bytes(b"existing")
+        mark = await self.bob.command("download", conversation=self.conversation, source=file_id, path=str(target))
+        failed = await self.bob.wait("file-tasks",
+            lambda item: any(task["status"] == "failed" for task in item["items"]), since=mark)
+        task = next(task for task in failed["items"] if task["status"] == "failed")
+        source.write_bytes(payload)
+        mark = await self.bob.command("retry-file", intent=task["clientFileId"])
+        await self.bob.wait("file-tasks", lambda item: not item["items"], since=mark)
+        self.assertEqual(payload, target.read_bytes())
+        _, attempts = self.assert_single_file_intent("bob", 2)
+        self.assertEqual(0, attempts[-1]["offset"])
+
+    async def test_file_tasks_wait_beyond_eight_active_downloads(self):
+        payload = b"queued file" * 8192
+        file_id = await self.upload(payload)
+        self.pause_download_at = 65536
+        targets = [self.root / f"queue-{index}.bin" for index in range(9)]
+        mark = len(self.bob.events)
+        for target in targets:
+            await self.bob.command("download", conversation=self.conversation, source=file_id, path=str(target))
+        async with asyncio.timeout(5):
+            while len([item for item in self.file_attempts if item["user"] == "bob"]) < 8:
+                await asyncio.sleep(0.01)
+        await self.bob.command("message", conversation=self.conversation, intent="queue-barrier", text="responsive")
+        await self.alice.wait("message", lambda item: item["clientMsgId"] == "queue-barrier")
+        self.assertEqual(8, len([item for item in self.file_attempts if item["user"] == "bob"]))
+        self.pause_download_at = 0
+        for protocol in self.protocols:
+            protocol.m_download_sender.notify()
+        await self.bob.wait("file-tasks", lambda item: not item["items"], since=mark)
+        for target in targets:
+            self.assertEqual(payload, target.read_bytes())
+        self.assertEqual(9, self.db.execute_fetchone(
+            "SELECT COUNT(*) FROM file_transfers WHERE direction=2 AND status='completed'")[0])
+
+    async def test_pending_upload_isolated_while_switching_accounts(self):
+        self.fault.file_drop_after_bytes = 262144
+        payload = b"account-private" * 65536
+        source = self.root / "private-upload.bin"
+        source.write_bytes(payload)
+        mark = await self.alice.command("upload", conversation=self.conversation, path=str(source))
+        await self.alice.wait("connection", lambda item: item["state"] == "reconnecting", since=mark)
+        await self.disconnect(self.alice)
+        self.fault.file_drop_after_bytes = 0
+        initial = await self.alice.connect(self.endpoint, "carol")
+        self.assertEqual([], initial["fileTasks"])
+        await self.synced(self.alice, "carol")
+        self.assertEqual(["alice"], [item["user"] for item in self.file_attempts])
+        await self.disconnect(self.alice)
+        mark = len(self.alice.events)
+        await self.alice.connect(self.endpoint, "alice")
+        await self.alice.wait("file-tasks", lambda item: not item["items"], since=mark)
+        self.assert_single_file_intent("alice", 1)
 
     async def test_upload_connection_drop_does_not_complete(self):
         self.fault.file_drop_after_bytes = 65536

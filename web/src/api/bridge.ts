@@ -28,8 +28,10 @@ interface QtImBridge {
   renameConversation?(conversationId: string, title: string): boolean;
   sendReceipt(conversationId: string, lastReadSeq: number): boolean;
   recallMessage(conversationId: string, messageId: string): boolean;
-  sendFile(conversationId: string, filePath: string, priority: number): boolean;
-  downloadFile(conversationId: string, sourceFileId: string, savePath: string, priority: number): boolean;
+  sendFile(conversationId: string, filePath: string, priority: number, done: (accepted: boolean) => void): void;
+  downloadFile(conversationId: string, sourceFileId: string, savePath: string, priority: number, done: (accepted: boolean) => void): void;
+  retryFile(clientFileId: string, done: (accepted: boolean) => void): void;
+  cancelFile(clientFileId: string, done: (accepted: boolean) => void): void;
   connectionChanged?: QtSignal;
   initialStateLoaded?: QtSignal;
   messagePushed?: QtSignal;
@@ -38,6 +40,7 @@ interface QtImBridge {
   fileProgress?: QtSignal;
   syncProgress?: QtSignal;
   messageSendsChanged?: QtSignal;
+  fileTasksChanged?: QtSignal;
   errorRaised?: QtSignal;
 }
 
@@ -88,6 +91,9 @@ function bindSignals(bridge: QtImBridge): void {
   });
   bridge.fileProgress?.connect((payload) => {
     bridgeEvents.emit('fileProgress', payload);
+  });
+  bridge.fileTasksChanged?.connect((payload) => {
+    bridgeEvents.emit('fileTasksChanged', payload);
   });
   bridge.messageSendsChanged?.connect((payload) => {
     bridgeEvents.emit('messageSendsChanged', payload);
@@ -352,9 +358,9 @@ export function recallMessage(conversationId: string, messageId: string): boolea
   return true;
 }
 
-export function sendFile(conversationId: string, filePath: string, priority: number): boolean {
+export async function sendFile(conversationId: string, filePath: string, priority: number): Promise<boolean> {
   if (runtimeWindow.imBridge) {
-    return runtimeWindow.imBridge.sendFile(conversationId, filePath, priority);
+    return new Promise((resolve) => runtimeWindow.imBridge!.sendFile(conversationId, filePath, priority, resolve));
   }
   bridgeEvents.emit('fileProgress', {
     eventId: `file-${Date.now()}`,
@@ -368,15 +374,25 @@ export function sendFile(conversationId: string, filePath: string, priority: num
   return true;
 }
 
-export function downloadFile(
+export async function downloadFile(
   conversationId: string,
   sourceFileId: string,
   savePath: string,
   priority: number
-): boolean {
+): Promise<boolean> {
   if (runtimeWindow.imBridge) {
-    return runtimeWindow.imBridge.downloadFile(conversationId, sourceFileId, savePath, priority);
+    return new Promise((resolve) => runtimeWindow.imBridge!.downloadFile(conversationId, sourceFileId, savePath, priority, resolve));
   }
   bridgeEvents.emit('errorRaised', { message: 'download is unavailable in web-debug mode' });
   return false;
+}
+
+export async function retryFile(clientFileId: string): Promise<boolean> {
+  if (!runtimeWindow.imBridge) return false;
+  return new Promise((resolve) => runtimeWindow.imBridge!.retryFile(clientFileId, resolve));
+}
+
+export async function cancelFile(clientFileId: string): Promise<boolean> {
+  if (!runtimeWindow.imBridge) return false;
+  return new Promise((resolve) => runtimeWindow.imBridge!.cancelFile(clientFileId, resolve));
 }

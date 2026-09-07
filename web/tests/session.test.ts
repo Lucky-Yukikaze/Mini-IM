@@ -129,3 +129,18 @@ test('pending and failed native sends restore per account and clear only when na
   session.applyMessageSends([]);
   assert.equal(session.messageSends.length, 0);
 });
+
+test('native file tasks restore their intent and clear on account switch or native completion', () => {
+  const session = createSession();
+  const task = { clientFileId: 'same-intent', conversationId: 'private', fileId: 'server-file',
+    fileName: 'source.bin', path: '/private/source.bin', direction: 1, status: 'failed' as const, error: 'changed' };
+  session.applyInitialState({ currentUser: { userId: 'alice' }, fileTasks: [task] });
+  assert.equal(session.currentFileTasks[0].clientFileId, 'same-intent');
+  session.applyInitialState({ currentUser: { userId: 'alice' }, globalCursor: 9 });
+  assert.equal(session.currentFileTasks[0].error, 'changed');
+  session.applyInitialState({ currentUser: { userId: 'bob' } });
+  assert.deepEqual(session.fileTasks, []);
+  session.applyInitialState({ currentUser: { userId: 'alice' }, fileTasks: [task] });
+  session.applyFileTasks([]);
+  assert.deepEqual(session.fileTasks, []);
+});

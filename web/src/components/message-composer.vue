@@ -6,7 +6,7 @@
           <span>发送文件路径</span>
           <input v-model="filePath" :disabled="disabled" placeholder="C:\\tmp\\demo.bin" />
         </label>
-        <button :disabled="disabled || !filePath.trim()" @click="submitFile">发送文件</button>
+        <button :disabled="disabled || fileSubmitting || !filePath.trim()" @click="submitFile">发送文件</button>
       </div>
       <div class="attach-grid">
         <label>
@@ -18,7 +18,7 @@
           <input v-model="downloadSavePath" :disabled="disabled" placeholder="C:\\tmp\\download.bin" />
         </label>
         <button
-          :disabled="disabled || !downloadFileId.trim() || !downloadSavePath.trim()"
+          :disabled="disabled || downloadSubmitting || !downloadFileId.trim() || !downloadSavePath.trim()"
           @click="submitDownload"
         >
           下载
@@ -62,16 +62,15 @@ import { ref, watch } from 'vue';
 const props = defineProps<{
   disabled: boolean;
   downloadFileIdPreset: string;
+  sendFile: (path: string) => Promise<boolean>;
+  downloadFile: (fileId: string, path: string) => Promise<boolean>;
   sendMessage: (text: string, burnMode: number, burnTtlSec: number) => Promise<boolean>;
-}>();
-
-const emit = defineEmits<{
-  sendFile: [filePath: string];
-  downloadFile: [fileId: string, savePath: string];
 }>();
 
 const draft = ref('');
 const submitting = ref(false);
+const fileSubmitting = ref(false);
+const downloadSubmitting = ref(false);
 const burnEnabled = ref(false);
 const burnTtlSec = ref(30);
 const attachOpen = ref(false);
@@ -103,22 +102,26 @@ async function submitMessage(): Promise<void> {
   }
 }
 
-function submitFile(): void {
+async function submitFile(): Promise<void> {
   const path = filePath.value.trim();
-  if (!path) {
-    return;
+  if (props.disabled || fileSubmitting.value || !path) return;
+  fileSubmitting.value = true;
+  try {
+    if (await props.sendFile(path) && filePath.value.trim() === path) filePath.value = '';
+  } finally {
+    fileSubmitting.value = false;
   }
-  emit('sendFile', path);
-  filePath.value = '';
 }
 
-function submitDownload(): void {
+async function submitDownload(): Promise<void> {
   const fileId = downloadFileId.value.trim();
   const savePath = downloadSavePath.value.trim();
-  if (!fileId || !savePath) {
-    return;
+  if (props.disabled || downloadSubmitting.value || !fileId || !savePath) return;
+  downloadSubmitting.value = true;
+  try {
+    if (await props.downloadFile(fileId, savePath) && downloadFileId.value.trim() === fileId) downloadFileId.value = '';
+  } finally {
+    downloadSubmitting.value = false;
   }
-  emit('downloadFile', fileId, savePath);
-  downloadFileId.value = '';
 }
 </script>

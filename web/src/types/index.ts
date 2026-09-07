@@ -38,6 +38,7 @@ export interface InitialStatePayload {
   readProgressByConversation?: Record<string, Record<string, number>>;
   files?: FileProgressItem[];
   messageSends?: MessageSendItem[];
+  fileTasks?: FileTaskItem[];
 }
 
 export interface ReceiptUpdate {
@@ -91,4 +92,15 @@ export interface MessageSendItem {
   error: string;
   createdAtMs: number;
   attempts: number;
+}
+
+export interface FileTaskItem {
+  clientFileId: string;
+  conversationId: string;
+  fileId: string;
+  fileName: string;
+  path: string;
+  direction: number;
+  status: 'pending' | 'transferring' | 'finishing' | 'failed';
+  error: string;
 }

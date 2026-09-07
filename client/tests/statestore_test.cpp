@@ -313,6 +313,57 @@ void CheckOutboxFailureAndTerminalCleanup()
         "burned own message remains retrievable from pending payload");
 }
 
+void CheckDurableFileTasks()
+{
+    QTemporaryDir root;
+    MiniImStateStore store;
+    Open(store, root);
+    const QVariantMap task{{"clientFileId", "intent"}, {"requestId", "init-request"},
+        {"finishRequestId", "finish-request"}, {"conversationId", "conversation"}, {"path", "/data/file"},
+        {"direction", 2}, {"sourceFileId", "source"}, {"priority", 0}, {"fileSize", 1},
+        {"sha256", "na"}, {"metadataReady", false}, {"status", "pending"}};
+    Query(store.databasePath(), "CREATE TRIGGER reject_task BEFORE INSERT ON file_tasks BEGIN SELECT RAISE(ABORT,'injected'); END");
+    bool rejected = false;
+    try { store.fileTasks().create(task); } catch (const std::exception&) { rejected = true; }
+    Require(rejected && store.fileTasks().pending().isEmpty(), "failed insertion accepted task");
+    Query(store.databasePath(), "DROP TRIGGER reject_task");
+    store.fileTasks().create(task);
+    store.fileTasks().update("intent", {{"fileId", "server-file"}, {"fileSize", 128},
+        {"sha256", "digest"}, {"metadataReady", true}, {"status", "transferring"}});
+    store.close();
+    Open(store, root, "carol");
+    Require(store.fileTasks().pending().isEmpty(), "file task leaked into another account");
+    Open(store, root);
+    const auto restored = store.fileTasks().byRequest("init-request");
+    Require(restored.value("fileId") == "server-file" && restored.value("fileSize").toInt() == 128,
+        "file identity or metadata lost after restart");
+    Require(store.snapshot().value("fileTasks").toList().size() == 1, "file task absent from snapshot");
+    for (const auto& changes : {QVariantMap{{"path", "/different"}}, QVariantMap{{"sha256", "different"}},
+        QVariantMap{{"fileId", "different"}}})
+    {
+        rejected = false;
+        try { store.fileTasks().update("intent", changes); } catch (const std::exception&) { rejected = true; }
+        Require(rejected, "existing file identity was replaced");
+    }
+    store.fileTasks().update("intent", {{"status", "finishing"}, {"transferredBytes", 128}});
+    store.close();
+    Open(store, root);
+    Require(store.fileTasks().byRequest("finish-request").value("status") == "finishing", "finish intent not recovered");
+    store.fileTasks().update("intent", {{"status", "completed"}});
+    store.fileTasks().update("intent", {{"status", "failed"}});
+    Require(store.fileTasks().pending().isEmpty(), "late failure regressed completed file");
+    auto cancelled = task;
+    cancelled["clientFileId"] = "cancelled";
+    cancelled["requestId"] = "cancel-init";
+    cancelled["finishRequestId"] = "cancel-finish";
+    store.fileTasks().create(cancelled);
+    store.fileTasks().update("cancelled", {{"status", "cancelled"}});
+    store.fileTasks().update("cancelled", {{"status", "transferring"}});
+    store.close();
+    Open(store, root);
+    Require(store.fileTasks().pending().isEmpty(), "cancelled file resumed after restart");
+}
+
 void CheckMonotonicObjectVersions()
 {
     QTemporaryDir root;
@@ -343,6 +394,7 @@ int main(int argc, char* argv[])
         CheckTerminalStatesSurviveReplay();
         CheckReadSnapshotAndAccountIsolation();
         CheckMonotonicObjectVersions();
+        CheckDurableFileTasks();
         CheckOutboxIdentityRecoveryAndConfirmation();
         CheckOutboxFailureAndTerminalCleanup();
         std::cout << "State store: gaps, rollback, terminal states, read snapshots, isolation and versions passed\n";

@@ -34,6 +34,8 @@ add_library(mini_im_core STATIC
     core/sync/statestore.h
     core/session/sessionmanager.cpp
     core/session/sessionmanager.h
+    core/file/taskstore.cpp
+    core/file/taskstore.h
     core/file/downloadsink.cpp
     core/file/downloadsink.h
     core/file/uploadstream.cpp
@@ -87,7 +89,7 @@ if(BUILD_TESTING)
     add_executable(mini_im_upload_tests tests/uploadstream_test.cpp)
     target_link_libraries(mini_im_upload_tests PRIVATE mini_im_core)
     add_test(NAME upload_backpressure COMMAND mini_im_upload_tests)
-    add_executable(mini_im_state_tests tests/statestore_test.cpp core/sync/statestore.cpp core/message/outbox.cpp)
+    add_executable(mini_im_state_tests tests/statestore_test.cpp core/sync/statestore.cpp core/message/outbox.cpp core/file/taskstore.cpp)
     target_include_directories(mini_im_state_tests PRIVATE .)
     target_link_libraries(mini_im_state_tests PRIVATE Qt6::Core Qt6::Sql)
     add_test(NAME state_persistence COMMAND mini_im_state_tests)
