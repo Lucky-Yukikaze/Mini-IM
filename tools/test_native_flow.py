@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
@@ -31,7 +32,7 @@ from services.auth.service import AuthService
 from services.conversation.service import ConversationService
 from services.control.service import ControlWriteService
 from services.delivery.service import DeliveryService
-from services.file.service import FileService
+from services.file.service import FileService, FileServiceResult
 from services.message.service import MessageService, SendMessageResult
 from services.sync.service import SyncService
 from storage.repo import ConversationRepo, DeliveryRepo, FileRepo, MessageRepo, SyncRepo
@@ -275,8 +276,31 @@ class RecordingFileService(FileService):
         self.scenario.file_attempts.append({
             "user": user_id, "requestId": request_id, "intent": file_init.client_file_id,
             "offset": file_init.resume_offset, "fileId": result.ack.entity_id,
+            "acceptedOffset": result.file_updated.transferred_bytes if result.file_updated else None,
         })
         return result
+
+
+    def handle_file_finish(self, user_id, request_id, file_finish):
+        if self.scenario.hold_upload_finish:
+            return FileServiceResult(message_pb2.Ack(request_id=request_id, success=False, code=503,
+                message="injected pending completion"), None, [])
+        return super().handle_file_finish(user_id, request_id, file_finish)
+
+    def append_file_chunk(self, user_id, file_id, chunk):
+        fault = self.scenario.upload_storage_fault
+        self.scenario.upload_storage_fault = ""
+        if fault == "sync":
+            with patch("os.fsync", side_effect=OSError("injected upload sync failure")):
+                return super().append_file_chunk(user_id, file_id, chunk)
+        if fault == "database":
+            self.m_file_repo.m_db.execute_write("CREATE TRIGGER reject_upload_progress BEFORE UPDATE ON file_transfers "
+                "BEGIN SELECT RAISE(ABORT, 'injected upload progress failure'); END")
+            try:
+                return super().append_file_chunk(user_id, file_id, chunk)
+            finally:
+                self.m_file_repo.m_db.execute_write("DROP TRIGGER reject_upload_progress")
+        return super().append_file_chunk(user_id, file_id, chunk)
 
 
 class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
@@ -309,6 +333,8 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         self.pause_download_at = 0
         self.drop_file_acks = {}
         self.file_attempts = []
+        self.upload_storage_fault = ""
+        self.hold_upload_finish = False
         self.control_requests = set()
         self.control_attempts = []
         self.drop_control_acks = 0
@@ -1083,6 +1109,113 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         await self.alice.wait("file-tasks", lambda item: not item["items"])
         row, _ = self.assert_single_file_intent("alice", 1)
         self.assertEqual(payload, self.files.get_storage_path(row["file_id"]).read_bytes())
+        self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+
+    async def _resume_upload_after_storage_damage(self, damage):
+        self.fault.file_drop_after_bytes = 262144
+        payload = bytes(range(251)) * 8192
+        source = self.root / "storage-recovery.bin"
+        source.write_bytes(payload)
+        mark = await self.alice.command("upload", conversation=self.conversation, path=str(source))
+        await self.alice.wait("connection", lambda item: item["state"] == "disconnected", since=mark)
+        await self.alice.crash()
+        row = self.db.execute_fetchone("SELECT * FROM file_transfers WHERE direction=1")
+        self.assertGreater(row["received_bytes"], 0)
+        path = self.files.get_storage_path(row["file_id"])
+        if damage == "missing":
+            path.unlink()
+            offset = 0
+        elif damage == "short":
+            offset = row["received_bytes"] // 2
+            path.write_bytes(payload[:offset])
+        else:
+            offset = row["received_bytes"]
+            with path.open("ab") as file:
+                file.write(b"uncommitted bytes" * 7)
+        self.fault.file_drop_after_bytes = 0
+        initial = await self.restart_alice()
+        self.assertEqual(row["client_file_id"], initial["fileTasks"][0]["clientFileId"])
+        await self.alice.wait("file-tasks", lambda item: not item["items"])
+        restored, attempts = self.assert_single_file_intent("alice", 1)
+        self.assertEqual(offset, attempts[1]["acceptedOffset"])
+        self.assertEqual(payload, self.files.get_storage_path(restored["file_id"]).read_bytes())
+        self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+
+    async def test_upload_restart_recovers_truncated_server_file(self):
+        await self._resume_upload_after_storage_damage("short")
+
+    async def test_upload_restart_recovers_missing_server_file(self):
+        await self._resume_upload_after_storage_damage("missing")
+
+    async def test_upload_restart_discards_uncommitted_server_tail(self):
+        await self._resume_upload_after_storage_damage("tail")
+
+    async def _retry_upload_after_storage_error(self, fault):
+        self.upload_storage_fault = fault
+        payload = bytes(range(251)) * 8192
+        source = self.root / "storage-error.bin"
+        source.write_bytes(payload)
+        mark = await self.alice.command("upload", conversation=self.conversation, path=str(source))
+        await self.alice.wait("connection", lambda item: item["state"] == "disconnected", since=mark)
+        self.assertEqual("", self.upload_storage_fault)
+        await self.alice.wait("file-tasks", lambda item: not item["items"], since=mark)
+        row, attempts = self.assert_single_file_intent("alice", 1)
+        self.assertEqual(0, attempts[1]["acceptedOffset"])
+        self.assertEqual(payload, self.files.get_storage_path(row["file_id"]).read_bytes())
+        self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+
+    async def test_upload_reconnects_after_server_sync_failure(self):
+        await self._retry_upload_after_storage_error("sync")
+
+    async def test_upload_reconnects_after_server_progress_commit_failure(self):
+        await self._retry_upload_after_storage_error("database")
+
+    async def test_upload_finish_restart_rechecks_server_progress(self):
+        self.hold_upload_finish = True
+        payload = bytes(range(251)) * 512
+        source = self.root / "finish-recovery.bin"
+        source.write_bytes(payload)
+        mark = await self.alice.command("upload", conversation=self.conversation, path=str(source))
+        await self.alice.wait("file-tasks", lambda item: any(task["status"] == "finishing"
+            for task in item["items"]), since=mark)
+        await self.alice.crash()
+        row = self.db.execute_fetchone("SELECT * FROM file_transfers WHERE direction=1")
+        self.files.get_storage_path(row["file_id"]).write_bytes(payload[:1024])
+        self.hold_upload_finish = False
+        initial = await self.restart_alice()
+        self.assertEqual(row["client_file_id"], initial["fileTasks"][0]["clientFileId"])
+        await self.alice.wait("file-tasks", lambda item: not item["items"], timeout=8)
+        recovered, attempts = self.assert_single_file_intent("alice", 1)
+        self.assertEqual(1024, attempts[1]["acceptedOffset"])
+        self.assertEqual(payload, self.files.get_storage_path(recovered["file_id"]).read_bytes())
+        self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+
+    async def test_upload_digest_failure_retries_original_intent(self):
+        self.fault.file_drop_after_bytes = 65536
+        payload = bytes(range(251)) * 512
+        source = self.root / "corrupt-upload.bin"
+        source.write_bytes(payload)
+        mark = await self.alice.command("upload", conversation=self.conversation, path=str(source))
+        await self.alice.wait("connection", lambda item: item["state"] == "disconnected", since=mark)
+        await self.alice.crash()
+        row = self.db.execute_fetchone("SELECT * FROM file_transfers WHERE direction=1")
+        self.assertGreater(row["received_bytes"], 0)
+        stored = self.files.get_storage_path(row["file_id"])
+        damaged = bytearray(stored.read_bytes())
+        damaged[0] ^= 0xff
+        stored.write_bytes(damaged)
+        self.fault.file_drop_after_bytes = 0
+        await self.restart_alice()
+        await self.alice.wait("file-tasks", lambda item: any(task["status"] == "failed"
+            and "sha256 mismatch" in task["error"] for task in item["items"]))
+        self.assertEqual("failed_integrity", self.files.get_transfer_by_file_id(row["file_id"]).status)
+        self.assertEqual(0, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+        mark = await self.alice.command("retry-file", intent=row["client_file_id"])
+        await self.alice.wait("file-tasks", lambda item: not item["items"], since=mark)
+        recovered, attempts = self.assert_single_file_intent("alice", 1)
+        self.assertEqual(0, attempts[-1]["acceptedOffset"])
+        self.assertEqual(payload, stored.read_bytes())
+        self.assertEqual(row["file_id"], recovered["file_id"])
         self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
 
     async def test_download_restart_uses_existing_partial_file(self):

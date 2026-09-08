@@ -4,7 +4,7 @@ import time
 import uuid
 from dataclasses import dataclass
 
-from protocol.pb import file_pb2
+from protocol.pb import common_pb2, file_pb2
 from storage.repo.sync_event import AppendSyncEvents, StoredSyncEvent
 from storage.sqlite.db import MiniImSqliteDb
 
@@ -142,6 +142,25 @@ class FileRepo:
             if changed:
                 transfer.received_bytes = int(received_bytes)
                 transfer.status = "uploaded" if received_bytes == transfer.file_size else "uploading"
+                self._save_progress(connection, transfer)
+            events = self._append_file_updated_sync_events(connection, member_ids, transfer) if changed else []
+            return FileTransferProgressResult(transfer, events, changed)
+
+    def rewind_upload(
+        self, file_id: str, received_bytes: int, member_ids: list[str], *, integrity_failed: bool = False,
+    ) -> FileTransferProgressResult | None:
+        """Reconcile an unfinished upload with its verified storage boundary."""
+        with self.m_db.transaction() as connection:
+            transfer = self.get_transfer_by_file_id(file_id)
+            if transfer is None or transfer.direction != common_pb2.FILE_DIRECTION_UPLOAD:
+                return None
+            if not 0 <= received_bytes <= transfer.received_bytes:
+                raise ValueError("invalid upload recovery offset")
+            changed = transfer.status != "completed" and (received_bytes < transfer.received_bytes
+                or (integrity_failed and transfer.status != "failed_integrity"))
+            if changed:
+                transfer.received_bytes = received_bytes
+                transfer.status = "failed_integrity" if integrity_failed else "uploading" if received_bytes else "init"
                 self._save_progress(connection, transfer)
             events = self._append_file_updated_sync_events(connection, member_ids, transfer) if changed else []
             return FileTransferProgressResult(transfer, events, changed)

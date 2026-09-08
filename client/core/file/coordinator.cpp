@@ -55,6 +55,15 @@ void MiniImFileCoordinator::start(const QVariantList& cachedFiles)
 {
     stop();
     m_running = true;
+    for (const auto& value : m_tasks.pending())
+    {
+        const auto task = value.toMap();
+        if (task.value("direction").toInt() == 1 && task.value("status") == "finishing")
+        {
+            // Recheck server storage before resuming an upload's completion after reconnect.
+            m_tasks.update(task.value("clientFileId").toString(), {{"status", "pending"}});
+        }
+    }
     for (const auto& value : cachedFiles)
     {
         const auto file = value.toMap();

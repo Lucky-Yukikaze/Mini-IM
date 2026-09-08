@@ -109,6 +109,7 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
         self.m_control_stream_id: int | None = None
         self.m_control_stream_buffers: dict[int, bytearray] = {}
         self.m_file_stream_states: dict[int, FileStreamState] = {}
+        self.m_file_storage_failed = False
         self.m_download_sender = DownloadScheduler(self)
 
     @staticmethod
@@ -272,11 +273,20 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
                     self.m_file_stream_states.pop(stream_id, None)
                     return
 
-            updated, sync_events = self.m_file_service.append_file_chunk(
-                user_id=self.m_user_id,
-                file_id=state.file_id,
-                chunk=bytes(state.buffer),
-            )
+            try:
+                updated, sync_events = self.m_file_service.append_file_chunk(
+                    user_id=self.m_user_id,
+                    file_id=state.file_id,
+                    chunk=bytes(state.buffer),
+                )
+            except (OSError, sqlite3.Error) as error:
+                self._debug(f"upload storage failed: {error}")
+                self.m_file_storage_failed = True
+                self.m_file_stream_states.clear()
+                self._quic.close(error_code=0x1004, reason_phrase="upload_storage_failed")
+                self.transmit()
+                return
+
             state.buffer.clear()
             if updated is not None and sync_events:
                 self.m_online_hub.fanout_sync_events(sync_events)
@@ -290,7 +300,7 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
             if self.m_user_id:
                 self.m_online_hub.unregister(self.m_user_id, self)
             return
-        if not isinstance(event, StreamDataReceived):
+        if self.m_file_storage_failed or not isinstance(event, StreamDataReceived):
             return
 
         if self.m_control_stream_id is not None and event.stream_id != self.m_control_stream_id:
@@ -384,16 +394,22 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
                         and not self.m_download_sender.can_accept):
                     self._send_error(event.stream_id, envelope, 429, "download queue is full; retry later")
                     continue
-                result = self.m_file_service.handle_file_init(
-                    user_id=session.user_id,
-                    request_id=envelope.request_id,
-                    file_init=envelope.file_init,
-                )
+                try:
+                    result = self.m_file_service.handle_file_init(
+                        user_id=session.user_id,
+                        request_id=envelope.request_id,
+                        file_init=envelope.file_init,
+                    )
+                except (OSError, sqlite3.Error) as error:
+                    self._debug(f"file init storage failed: {error}")
+                    self._send_error(event.stream_id, envelope, 503, "file init could not be committed")
+                    continue
+
                 ack_envelope = self._new_response_from_request(envelope)
                 ack_envelope.ack.CopyFrom(result.ack)
                 self._send(event.stream_id, ack_envelope)
                 sender_event = next(
-                    (item for item in result.sync_events if item.user_id == session.user_id and item.event_type == "file_updated"),
+                    (item for item in reversed(result.sync_events) if item.user_id == session.user_id and item.event_type == "file_updated"),
                     None,
                 )
                 if result.file_updated is not None:
@@ -409,16 +425,22 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
                 continue
 
             if envelope.HasField("file_finish"):
-                result = self.m_file_service.handle_file_finish(
-                    user_id=session.user_id,
-                    request_id=envelope.request_id,
-                    file_finish=envelope.file_finish,
-                )
+                try:
+                    result = self.m_file_service.handle_file_finish(
+                        user_id=session.user_id,
+                        request_id=envelope.request_id,
+                        file_finish=envelope.file_finish,
+                    )
+                except (OSError, sqlite3.Error) as error:
+                    self._debug(f"file finish storage failed: {error}")
+                    self._send_error(event.stream_id, envelope, 503, "file finish could not be committed")
+                    continue
+
                 ack_envelope = self._new_response_from_request(envelope)
                 ack_envelope.ack.CopyFrom(result.ack)
                 self._send(event.stream_id, ack_envelope)
                 sender_event = next(
-                    (item for item in result.sync_events if item.user_id == session.user_id and item.event_type == "file_updated"),
+                    (item for item in reversed(result.sync_events) if item.user_id == session.user_id and item.event_type == "file_updated"),
                     None,
                 )
                 if result.file_updated is not None:

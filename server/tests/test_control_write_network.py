@@ -1,5 +1,6 @@
-"""Real QUIC checks for replaying control writes after later changes and reconnects."""
+"""Real QUIC checks for durable writes, replay and storage error replies."""
 import asyncio
+import hashlib
 from contextlib import asynccontextmanager
 from pathlib import Path
 import ssl
@@ -7,13 +8,14 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from aioquic.asyncio import connect
 from aioquic.quic.configuration import QuicConfiguration
 from protocol.codec import EnvelopeCodec
-from protocol.pb import common_pb2, conversation_pb2, envelope_pb2
+from protocol.pb import common_pb2, conversation_pb2, envelope_pb2, file_pb2
 from quic.endpoint import serve_quic
 from quic.server import FaultConfig, MiniImQuicProtocol, OnlineSessionHub, ensure_dev_cert
 from services.auth.service import AuthService
@@ -56,7 +58,7 @@ class ControlWriteNetworkTest(unittest.IsolatedAsyncioTestCase):
         conversations, messages = ConversationRepo(self.db), MessageRepo(self.db)
         self.conversations = ConversationService(conversations)
         deliveries = DeliveryService(DeliveryRepo(self.db))
-        files = FileService(FileRepo(self.db), conversations, messages, self.root / "files", 900000)
+        files = self.files = FileService(FileRepo(self.db), conversations, messages, self.root / "files", 900000)
         auth, hub = AuthService(), OnlineSessionHub()
         dropped = self.drop_ack
 
@@ -190,6 +192,75 @@ class ControlWriteNetworkTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(1, observer.execute_fetchone("SELECT COUNT(*) FROM control_write_results")[0])
             finally:
                 observer.close()
+
+
+    def upload_request(self):
+        payload = b"file storage recovery"
+        return payload, file_pb2.FileInit(conversation_id=self.conversation, client_file_id="upload",
+            file_name="source.bin", file_size=len(payload), sha256=hashlib.sha256(payload).hexdigest(),
+            direction=common_pb2.FILE_DIRECTION_UPLOAD)
+
+    async def test_file_init_database_failure_returns_retryable_error_without_partial_rows(self):
+        _, request = self.upload_request()
+        count = self.event_count()
+        self.db.execute_write("CREATE TRIGGER reject_file_init BEFORE INSERT ON file_transfers "
+            "BEGIN SELECT RAISE(ABORT, 'injected initialization failure'); END")
+        async with self.peer() as (reader, send):
+            send("file-init", file_init=request)
+            response = await self.read(reader, "file-init")
+            self.assertEqual(503, response.error.code)
+            self.assertEqual(count, self.event_count())
+            self.assertEqual(0, self.db.execute_fetchone("SELECT COUNT(*) FROM file_transfers")[0])
+            self.db.execute_write("DROP TRIGGER reject_file_init")
+            send("file-init", file_init=request)
+            self.assertTrue((await self.read(reader, "file-init", "ack")).ack.success)
+            self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM file_transfers")[0])
+
+    async def test_file_repair_disk_failure_returns_retryable_error(self):
+        payload, request = self.upload_request()
+        initialized = self.files.handle_file_init("alice", "setup-upload", request)
+        file_id = initialized.ack.entity_id
+        self.files.append_file_chunk("alice", file_id, payload[:5])
+        path = self.files.get_storage_path(file_id)
+        path.write_bytes(payload[:10])
+        original = Path.open
+        def unavailable(target, *args, **kwargs):
+            if target == path:
+                raise OSError("injected storage unavailable")
+            return original(target, *args, **kwargs)
+        async with self.peer() as (reader, send):
+            with patch.object(Path, "open", unavailable):
+                send("repair", file_init=request)
+                response = await self.read(reader, "repair")
+            self.assertEqual(503, response.error.code)
+            self.assertEqual(payload[:10], path.read_bytes())
+            self.assertEqual(5, self.files.get_transfer_by_file_id(file_id).received_bytes)
+            send("repair", file_init=request)
+            self.assertTrue((await self.read(reader, "repair", "ack")).ack.success)
+            self.assertEqual(5, (await self.read(reader, "repair", "file_updated")).file_updated.transferred_bytes)
+            self.assertEqual(payload[:5], path.read_bytes())
+
+    async def test_file_finish_failure_rolls_back_completion_and_message_before_retry(self):
+        payload, request = self.upload_request()
+        initialized = self.files.handle_file_init("alice", "setup-upload", request)
+        file_id = initialized.ack.entity_id
+        self.files.append_file_chunk("alice", file_id, payload)
+        count = self.event_count()
+        self.db.execute_write("CREATE TRIGGER reject_file_message BEFORE INSERT ON messages "
+            "BEGIN SELECT RAISE(ABORT, 'injected file message failure'); END")
+        finish = file_pb2.FileFinish(file_id=file_id, success=True)
+        async with self.peer() as (reader, send):
+            send("finish", file_finish=finish)
+            response = await self.read(reader, "finish")
+            self.assertEqual(503, response.error.code)
+            self.assertEqual("uploaded", self.files.get_transfer_by_file_id(file_id).status)
+            self.assertEqual(0, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+            self.assertEqual(count, self.event_count())
+            self.db.execute_write("DROP TRIGGER reject_file_message")
+            send("finish", file_finish=finish)
+            self.assertTrue((await self.read(reader, "finish", "ack")).ack.success)
+            self.assertEqual("completed", self.files.get_transfer_by_file_id(file_id).status)
+            self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
 
 
 if __name__ == "__main__":

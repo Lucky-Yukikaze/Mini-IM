@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from protocol.pb import common_pb2, file_pb2, message_pb2
@@ -129,14 +130,20 @@ class FileService:
             priority=file_init.priority,
             source_file_id=file_init.source_file_id,
         )
-        result = self.m_file_repo.create_or_resume_transfer(
-            user_id=user_id,
-            request_id=request_id,
-            file_init=normalized_init,
-            member_ids=member_ids,
-            storage_relative_path=relative_path,
-            stale_timeout_ms=self.m_stale_timeout_ms,
-        )
+        with self.m_file_repo.m_db.transaction():
+            result = self.m_file_repo.create_or_resume_transfer(
+                user_id=user_id,
+                request_id=request_id,
+                file_init=normalized_init,
+                member_ids=member_ids,
+                storage_relative_path=relative_path,
+                stale_timeout_ms=self.m_stale_timeout_ms,
+            )
+            if not result.conflict and not is_download and result.transfer.status != "completed":
+                repaired = self._reconcile_upload(result.transfer, member_ids)
+                result = replace(result, transfer=repaired.transfer,
+                    sync_events=[*result.sync_events, *repaired.sync_events])
+
         if result.conflict:
             ack.code = 409
             ack.message = result.conflict
@@ -147,20 +154,7 @@ class FileService:
         ack.message = "ok" if result.created else "ok(idempotent)"
         ack.entity_id = result.transfer.file_id
         ack.server_time_ms = self._now_ms()
-        updated = file_pb2.FileUpdated(
-            event_id=result.sync_events[0].event_id if result.sync_events else "",
-            file_id=result.transfer.file_id,
-            conversation_id=result.transfer.conversation_id,
-            transferred_bytes=int(result.transfer.received_bytes),
-            completed=result.transfer.status == "completed",
-            version=int(result.transfer.version),
-            updated_at_ms=int(result.transfer.updated_at_ms),
-            file_size=result.transfer.file_size,
-            sha256=result.transfer.sha256,
-            direction=result.transfer.direction,
-            status=result.transfer.status,
-            file_name=result.transfer.file_name,
-        )
+        updated = self._file_updated(result.transfer, result.sync_events, user_id)
         return FileServiceResult(
             ack=ack,
             file_updated=updated,
@@ -179,17 +173,26 @@ class FileService:
         transfer = self.m_file_repo.get_transfer_by_file_id(file_id)
         if (transfer is None or transfer.owner_id != user_id
                 or transfer.direction != common_pb2.FILE_DIRECTION_UPLOAD
-                or transfer.status == "completed"):
+                or transfer.status not in {"init", "uploading", "uploaded"}):
             return None, []
         if not chunk or transfer.received_bytes + len(chunk) > transfer.file_size:
             return None, []
 
         target_path = self.m_file_root / transfer.storage_path
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        mode = "r+b" if target_path.exists() else "wb"
+        mode = "r+b" if target_path.exists() else "w+b"
         with target_path.open(mode) as file:
-            file.seek(int(transfer.received_bytes))
-            file.write(chunk)
+            file.seek(0, os.SEEK_END)
+            if file.tell() != transfer.received_bytes:
+                raise OSError("upload storage diverged; initialize the original intent again")
+            remaining = memoryview(chunk)
+            while remaining:
+                written = file.write(remaining)
+                if written is None or written <= 0 or written > len(remaining):
+                    raise OSError("upload storage write made no valid progress")
+                remaining = remaining[written:]
+            file.flush()
+            os.fsync(file.fileno())
 
         member_ids = self.m_conversation_repo.list_member_ids(transfer.conversation_id)
         result = self.m_file_repo.apply_progress(
@@ -200,20 +203,7 @@ class FileService:
         if result is None:
             return None, []
 
-        updated = file_pb2.FileUpdated(
-            event_id=result.sync_events[0].event_id if result.sync_events else "",
-            file_id=result.transfer.file_id,
-            conversation_id=result.transfer.conversation_id,
-            transferred_bytes=int(result.transfer.received_bytes),
-            completed=result.transfer.status == "completed",
-            version=int(result.transfer.version),
-            updated_at_ms=int(result.transfer.updated_at_ms),
-            file_size=result.transfer.file_size,
-            sha256=result.transfer.sha256,
-            direction=result.transfer.direction,
-            status=result.transfer.status,
-            file_name=result.transfer.file_name,
-        )
+        updated = self._file_updated(result.transfer, result.sync_events, user_id)
         return updated, result.sync_events
 
     def handle_file_finish(
@@ -256,8 +246,11 @@ class FileService:
                     return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
                 if not self._verify_file_sha256(transfer):
                     ack.code = 409
-                    ack.message = "sha256 mismatch"
-                    return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
+                    ack.message = "sha256 mismatch; retry the original upload"
+                    member_ids = self.m_conversation_repo.list_member_ids(transfer.conversation_id)
+                    repaired = self.m_file_repo.rewind_upload(transfer.file_id, 0, member_ids, integrity_failed=True)
+                    updated = self._file_updated(repaired.transfer, repaired.sync_events, user_id)
+                    return FileServiceResult(ack=ack, file_updated=updated, sync_events=repaired.sync_events)
 
         with self.m_file_repo.m_db.transaction():
             member_ids = self.m_conversation_repo.list_member_ids(transfer.conversation_id)
@@ -283,21 +276,34 @@ class FileService:
         ack.message = "ok" if result.changed else "ok(idempotent)"
         ack.entity_id = transfer.file_id
         ack.server_time_ms = self._now_ms()
-        updated = file_pb2.FileUpdated(
-            event_id=result.sync_events[0].event_id if result.sync_events else "",
-            file_id=result.transfer.file_id,
-            conversation_id=result.transfer.conversation_id,
-            transferred_bytes=int(result.transfer.received_bytes),
-            completed=result.transfer.status == "completed",
-            version=int(result.transfer.version),
-            updated_at_ms=int(result.transfer.updated_at_ms),
-            file_size=result.transfer.file_size,
-            sha256=result.transfer.sha256,
-            direction=result.transfer.direction,
-            status=result.transfer.status,
-            file_name=result.transfer.file_name,
-        )
+        updated = self._file_updated(result.transfer, result.sync_events, user_id)
         return FileServiceResult(ack=ack, file_updated=updated, sync_events=all_sync_events)
+
+    def _reconcile_upload(self, transfer: StoredFileTransfer, member_ids: list[str]):
+        target = self.m_file_root / transfer.storage_path
+        try:
+            disk_size = target.stat().st_size
+        except FileNotFoundError:
+            disk_size = 0
+        offset = min(disk_size, transfer.received_bytes, transfer.file_size)
+        if disk_size > offset:
+            with target.open("r+b") as file:
+                file.truncate(offset)
+                file.flush()
+                os.fsync(file.fileno())
+        return self.m_file_repo.rewind_upload(transfer.file_id, offset, member_ids)
+
+    @staticmethod
+    def _file_updated(transfer: StoredFileTransfer, events: list[StoredSyncEvent], user_id: str) -> file_pb2.FileUpdated:
+        event = next((event for event in reversed(events)
+            if event.user_id == user_id and event.event_type == "file_updated"), None)
+        return file_pb2.FileUpdated(
+            event_id=event.event_id if event else "", file_id=transfer.file_id,
+            conversation_id=transfer.conversation_id, transferred_bytes=transfer.received_bytes,
+            completed=transfer.status == "completed", version=transfer.version,
+            updated_at_ms=transfer.updated_at_ms, file_size=transfer.file_size, sha256=transfer.sha256,
+            direction=transfer.direction, status=transfer.status, file_name=transfer.file_name,
+        )
 
     def get_transfer_for_upload(self, user_id: str, file_id: str) -> StoredFileTransfer | None:
         transfer = self.m_file_repo.get_transfer_by_file_id(file_id)
