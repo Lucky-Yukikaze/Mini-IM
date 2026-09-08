@@ -3,24 +3,20 @@
 #define MINI_IM_CORE_SESSION_SESSIONMANAGER_H_
 
 #include <QObject>
-#include <QHash>
 #include <QString>
-#include <QSet>
 #include <QTimer>
 #include <QElapsedTimer>
 #include <QByteArray>
 #include <QVariantList>
 #include <QVariantMap>
 
-#include <memory>
 #include <string>
 #include "core/sync/statestore.h"
 #include "core/sync/coordinator.h"
 #include "core/quic/recovery.h"
 #include "core/quic/connection.h"
+#include "core/file/coordinator.h"
 
-class MiniImDownloadSink;
-namespace im { namespace file { class FileUpdated; } }
 
 class QByteArray;
 
@@ -80,11 +76,8 @@ private slots:
 private:
     void onTransportConnected();
     void onTransportDisconnected();
-    void onFileData(quint64 streamId, const QByteArray& payload);
-    void onFileEnded(quint64 streamId);
-    void onFileClosed(quint64 streamId, bool connectionShutdown);
-    void onUploadFinished(const QString& fileId, bool success, const QString& error);
 
+    void connectFileSignals();
     bool startConnectionAttempt();
     void restartConnection(const QString& reason, bool clearSession = false);
     void resetRuntimeState();
@@ -93,79 +86,22 @@ private:
     bool sendHello();
     bool sendHeartbeat();
     void handleIncomingControlStreamData(const QByteArray& payload);
+    im::envelope::Envelope makeRequestEnvelope(const QString& requestId, im::common::Channel channel);
     im::envelope::Envelope makeSyncRequest(quint64 cursor, quint32 limit);
-    bool sendFileInitRequest(
-        const QString& request_id,
-        const QString& conversation_id,
-        const QString& client_file_id,
-        const QString& file_name,
-        quint64 file_size,
-        const QString& sha256,
-        quint64 resume_offset,
-        quint32 priority,
-        int direction,
-        const QString& source_file_id);
-    bool sendFileFinish(
-        const QString& file_id, bool success, quint64 transferredBytes = 0, const QString& sha256 = QString());
-    bool sendFileStreamData(const QString& file_id, const QString& file_path, quint64 offset, quint64 fileSize);
-    void handleIncomingFileStream(quint64 streamId, const QByteArray& payload);
     void handleIncomingEnvelope(const QByteArray& payload);
-    void flushPendingDownloadBuffers(const QString& file_id);
-    void completeFileReceive(quint64 streamId);
     void onSyncEventApplied(const MiniImStateEvent& event);
     QString makeRequestId(const QString& suffix = QString()) const;
     void emitConnectionError(const QString& message);
-    void handleFileUpdated(const im::file::FileUpdated& updated);
-    void finishDownload(const QString& file_id);
-    void pumpFileTasks();
-    void startFileTask(const QVariantMap& task);
-    void publishFileTasks();
-    void failFileTask(const QString& fileId, const QString& error);
-    void handleFileResult(const QString& requestId, bool success, int code,
-        const QString& error, const QString& fileId);
     void pumpMessageOutbox();
     bool sendQueuedMessage(const QVariantMap& item);
     void publishMessageSends();
     void handleMessageResult(const QString& requestId, bool success, int code,
         const QString& error, const QString& entityId);
 
-
-    struct PendingFileUpload
-    {
-        QString conversation_id;
-        QString file_path;
-        QString file_name;
-        QString client_file_id;
-        QString sha256;
-        quint64 file_size = 0;
-        quint32 priority = 0;
-        QString file_id;
-        bool stream_started = false;
-    };
-
-    struct PendingFileDownload
-    {
-        QString conversation_id;
-        QString source_file_id;
-        QString save_path;
-        QString client_file_id;
-        QString file_id;
-        std::shared_ptr<MiniImDownloadSink> sink;
-        bool finish_sent = false;
-        quint64 resume_offset = 0;
-    };
-
-    struct DownloadStreamState
-    {
-        QByteArray buffer;
-        QString file_id;
-        bool header_parsed = false;
-        bool finished = false;
-    };
-
     MiniImStateStore m_stateStore;
     MiniImSyncCoordinator m_sync;
     MiniImQuicConnection m_transport;
+    MiniImFileCoordinator m_files;
     MiniImConnectionRecovery m_recovery;
     QElapsedTimer m_lastResponseTime;
     bool m_transportStopping = false;
@@ -186,18 +122,6 @@ private:
     QString m_activeMessageRequest;
     QString m_userId;
     QByteArray m_control_stream_buffer;
-    QSet<QString> m_activeFileTasks;
-    QHash<QString, QElapsedTimer> m_fileControlAttempts;
-    QHash<QString, quint64> m_latest_file_versions;
-    QHash<QString, PendingFileUpload> m_pending_file_init_requests;
-    QHash<QString, PendingFileUpload> m_pending_file_uploads;
-    QHash<QString, PendingFileDownload> m_pending_file_download_init_requests;
-    QHash<QString, PendingFileDownload> m_pending_file_downloads;
-    QSet<QString> m_failed_file_downloads;
-    QHash<QString, QString> m_pending_file_finish_requests;
-    QHash<quint64, DownloadStreamState> m_download_stream_states;
-
-
 };
 
 #endif  // MINI_IM_CORE_SESSION_SESSIONMANAGER_H_

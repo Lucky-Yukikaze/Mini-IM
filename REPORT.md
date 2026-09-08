@@ -8,7 +8,7 @@
 
 | 组件 | 职责与源码入口 |
 | --- | --- |
-| 桌面客户端 | [窗口宿主](client/ui/mainwindow.cpp) 承载页面；[Qt 会话管理](client/core/session/sessionmanager.cpp) 处理协议、登录和文件任务协调，[原生连接](client/core/quic/connection.cpp) 管理 MsQuic 连接与流收发；[下载落盘组件](client/core/file/downloadsink.cpp) 负责校验与目标替换，[上传流组件](client/core/file/uploadstream.cpp) 随发送完成回调分批读取文件。 |
+| 桌面客户端 | [窗口宿主](client/ui/mainwindow.cpp) 承载页面；[Qt 会话管理](client/core/session/sessionmanager.cpp) 协调登录、协议请求与业务接口，[原生连接](client/core/quic/connection.cpp) 管理 MsQuic 连接与流收发；[下载落盘组件](client/core/file/downloadsink.cpp) 负责校验与目标替换，[上传流组件](client/core/file/uploadstream.cpp) 随发送完成回调分批读取文件。 |
 | 页面与接口 | [Bridge](client/bridge/imbridge.h) = Qt 向页面提供业务操作和事件的接口；[页面调用封装](web/src/api/bridge.ts) 转发操作并订阅事件，[Pinia 状态](web/src/store/session.ts) 保存界面展示数据。 |
 | 服务端与存储 | [监听入口](server/quic/endpoint.py) 配置接收端口，[QUIC 入口](server/quic/server.py) 分派请求；[业务服务](server/services/) 校验业务；[仓储](server/storage/repo/) = 执行业务数据读写的代码；[SQLite 层](server/storage/sqlite/) 管理连接、表结构及升级。 |
 
@@ -16,10 +16,12 @@
 [原生状态存储](client/core/sync/statestore.cpp) 保存消息、会话、状态事件与同步位置；
 [同步协调组件](client/core/sync/coordinator.cpp) 统一应用在线及历史事件，管理分页请求、超时重试和写入恢复时机；
 [消息发送队列](client/core/message/outbox.cpp) 保存发送意图、确认状态和失败原因；
-[文件任务存储](client/core/file/taskstore.cpp) 保存文件路径、稳定请求、校验信息及任务状态。
+[文件任务存储](client/core/file/taskstore.cpp) 保存文件路径、稳定请求、校验信息及任务状态；
+[文件协调组件](client/core/file/coordinator.cpp) 管理初始化/完成确认、续传、并发任务和独立重试计时器。
 [连接恢复组件](client/core/quic/recovery.cpp) 管理重连等待和登录超时；
-原生连接组件管理连接和流的生命周期、发送缓冲及接收暂停，向会话类交付控制数据和文件流事件。
-会话类判断文件何时可落盘，再通知连接组件继续接收；登录和文件任务调度仍由会话类协调。
+原生连接组件管理连接和流的生命周期、发送缓冲及接收暂停，将控制数据交给会话类解析，
+将文件流事件交给文件协调组件；后者判断何时可落盘，再通知连接组件继续接收。
+同步组件通知文件组件是否可以调度任务，会话类协调登录和各组件之间的业务接口。
 拆分进度与验收缺口见执行记录。
 历史 [Python 客户端脚本](client/core/quic/quic_client_worker.py) 未被当前 CMake 客户端目标引用，
 原生运行路径以 [CMake 定义](client/CMakeLists.txt) 和 Qt 会话管理代码为准；桌面程序与原生联调驱动共用同一原生库。
@@ -73,7 +75,8 @@ Qt 在同步追平后重发未确认消息，成功 ACK 到达后清空该意图
 上传以服务端已保存位置续传，下载以本地临时文件实际长度续传；
 完成确认单独保存并重试，已有目标文件在补发下载确认前再次核对。
 页面可重试失败任务或取消本机任务；取消通过释放连接停止当前传输，其他任务随后恢复。
-当前文件调度仍由会话类协调，服务端取消状态和磁盘故障下的数据协调仍需完善。
+文件协调组件独立处理定时重试，消息发送尝试记录失败不会停止其计时器；
+服务端取消状态和磁盘故障下的数据协调仍需完善。
 
 群聊使用独立成员关系，已读位置以 `conversation_members.last_read_seq` 为准；
 消息未读人数保存为可重算的展示数据。撤回和阅后即焚通过同步事件传播，

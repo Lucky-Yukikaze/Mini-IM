@@ -68,6 +68,7 @@ void MiniImSyncCoordinator::stop()
     m_retryTimer.stop();
     m_running = false;
     m_caughtUp = false;
+    emit readinessChanged(false);
     clearRequest();
 }
 
@@ -91,6 +92,7 @@ void MiniImSyncCoordinator::requestNext()
         return;
     }
     m_caughtUp = false;
+    emit readinessChanged(false);
     m_requestCursor = m_store.cursor();
     const auto request = m_factory(m_requestCursor, kPageSize);
     m_requestId = QString::fromStdString(request.request_id());
@@ -187,6 +189,7 @@ void MiniImSyncCoordinator::handleResponse(const im::envelope::Envelope& envelop
     else
     {
         m_caughtUp = true;
+        emit readinessChanged(true);
         emit ready();
     }
 }

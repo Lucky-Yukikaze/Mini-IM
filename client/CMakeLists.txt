@@ -24,6 +24,10 @@ set(MINI_IM_PROTO_FILES
 )
 
 add_library(mini_im_core STATIC
+    core/logging.cpp
+    core/logging.h
+    core/file/coordinator.cpp
+    core/file/coordinator.h
     core/quic/connection.cpp
     core/quic/connection.h
     core/quic/recovery.cpp

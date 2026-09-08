@@ -1,15 +1,9 @@
 #include "core/session/sessionmanager.h"
-#include "core/file/downloadsink.h"
-#include "core/model/eventmapper.h"
+#include "core/logging.h"
 
 #include <QByteArray>
-#include <QCoreApplication>
-#include <QCryptographicHash>
 #include <QDateTime>
 #include <QDir>
-#include <QFile>
-#include <QFileInfo>
-#include <QTextStream>
 #include <QUuid>
 #include <QUrl>
 #include <QStringList>
@@ -40,53 +34,6 @@ constexpr int kDefaultHeartbeatIntervalSec = 15;
 constexpr quint32 kEnvelopeFrameHeaderSize = 4;
 constexpr int kRequestRetryMs = 5000;
 
-bool IsClientDebugLogEnabled()
-{
-    static const QString value = qEnvironmentVariable("MINIIM_DEBUG_LOG");
-    static const bool enabled = value.isEmpty() || value != QStringLiteral("0");
-    return enabled;
-}
-
-void AppendClientLog(const QString& message)
-{
-    if (!IsClientDebugLogEnabled())
-    {
-        return;
-    }
-    const QString base_dir = QCoreApplication::applicationDirPath();
-    QFile file(QDir(base_dir).filePath(QStringLiteral("mini_im_client.log")));
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
-    {
-        return;
-    }
-
-    QTextStream stream(&file);
-    stream << QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss.zzz"))
-           << QStringLiteral(" | ")
-           << message
-           << Qt::endl;
-}
-
-QString FileDigest(const QString& path, quint64 expectedSize)
-{
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly) || static_cast<quint64>(file.size()) != expectedSize)
-    {
-        return {};
-    }
-    QCryptographicHash hash(QCryptographicHash::Sha256);
-    while (!file.atEnd())
-    {
-        const auto bytes = file.read(65536);
-        if (bytes.isEmpty())
-        {
-            return {};
-        }
-        hash.addData(bytes);
-    }
-    return QString::fromLatin1(hash.result().toHex());
-}
-
 QByteArray BuildEnvelopeFrame(const std::string& payload)
 {
     QByteArray frame;
@@ -107,22 +54,28 @@ MiniImSessionManager::MiniImSessionManager(QObject* parent)
       m_sync(m_stateStore,
           [this](quint64 cursor, quint32 limit) { return makeSyncRequest(cursor, limit); },
           [this](const std::string& payload) { return sendEnvelope(payload); }),
+      m_files(m_stateStore.fileTasks(), m_transport,
+          [this](const QString& id) { return makeRequestEnvelope(id, im::common::CHANNEL_FILE); },
+          [this](const std::string& payload) { return sendEnvelope(payload); },
+          [this](const QString& suffix) { return makeRequestId(suffix); }),
       m_connected(false),
       m_connecting(false),
       m_hello_sent(false),
       m_seq(0),
       m_heartbeat_interval_sec(kDefaultHeartbeatIntervalSec)
 {
+    connectFileSignals();
     QObject::connect(&m_sync, &MiniImSyncCoordinator::eventApplied, this,
         &MiniImSessionManager::onSyncEventApplied);
     QObject::connect(&m_sync, &MiniImSyncCoordinator::stateApplied, this,
         &MiniImSessionManager::publishMessageSends);
     QObject::connect(&m_sync, &MiniImSyncCoordinator::progressChanged, this, &MiniImSessionManager::syncProgress);
-    QObject::connect(&m_sync, &MiniImSyncCoordinator::fileUpdated, this, &MiniImSessionManager::handleFileUpdated);
+    QObject::connect(&m_sync, &MiniImSyncCoordinator::fileUpdated, &m_files, &MiniImFileCoordinator::handleFileUpdated);
     QObject::connect(&m_sync, &MiniImSyncCoordinator::errorRaised, this, &MiniImSessionManager::errorRaised);
     QObject::connect(&m_sync, &MiniImSyncCoordinator::failed, this, &MiniImSessionManager::disconnectFromServer);
     QObject::connect(&m_sync, &MiniImSyncCoordinator::ready, this, &MiniImSessionManager::pumpMessageOutbox);
-    QObject::connect(&m_sync, &MiniImSyncCoordinator::ready, this, &MiniImSessionManager::pumpFileTasks);
+    QObject::connect(&m_sync, &MiniImSyncCoordinator::readinessChanged, &m_files, &MiniImFileCoordinator::setSyncReady);
+    QObject::connect(&m_sync, &MiniImSyncCoordinator::ready, &m_files, &MiniImFileCoordinator::pumpFileTasks);
     QObject::connect(&m_transport, &MiniImQuicConnection::connected, this,
         &MiniImSessionManager::onTransportConnected);
     QObject::connect(&m_transport, &MiniImQuicConnection::disconnected, this,
@@ -131,11 +84,6 @@ MiniImSessionManager::MiniImSessionManager(QObject* parent)
         &MiniImSessionManager::errorRaised);
     QObject::connect(&m_transport, &MiniImQuicConnection::controlData, this,
         &MiniImSessionManager::handleIncomingControlStreamData);
-    QObject::connect(&m_transport, &MiniImQuicConnection::fileData, this, &MiniImSessionManager::onFileData);
-    QObject::connect(&m_transport, &MiniImQuicConnection::fileEnded, this, &MiniImSessionManager::onFileEnded);
-    QObject::connect(&m_transport, &MiniImQuicConnection::fileClosed, this, &MiniImSessionManager::onFileClosed);
-    QObject::connect(&m_transport, &MiniImQuicConnection::uploadFinished, this,
-        &MiniImSessionManager::onUploadFinished);
     QObject::connect(&m_recovery, &MiniImConnectionRecovery::attemptRequested, this,
         [this]() { startConnectionAttempt(); });
     QObject::connect(&m_recovery, &MiniImConnectionRecovery::loginTimedOut, this,
@@ -149,9 +97,18 @@ MiniImSessionManager::MiniImSessionManager(QObject* parent)
     m_heartbeat_timer.setTimerType(Qt::PreciseTimer);
     m_messageRetryTimer.setInterval(500);
     QObject::connect(&m_messageRetryTimer, &QTimer::timeout, this, &MiniImSessionManager::pumpMessageOutbox);
-    QObject::connect(&m_messageRetryTimer, &QTimer::timeout, this, &MiniImSessionManager::pumpFileTasks);
     m_heartbeat_timer.setSingleShot(false);
     QObject::connect(&m_heartbeat_timer, &QTimer::timeout, this, &MiniImSessionManager::onHeartbeatTimeout);
+}
+
+void MiniImSessionManager::connectFileSignals()
+{
+    QObject::connect(&m_files, &MiniImFileCoordinator::fileProgress, this, &MiniImSessionManager::fileProgress);
+    QObject::connect(&m_files, &MiniImFileCoordinator::fileTasksChanged, this, &MiniImSessionManager::fileTasksChanged);
+    QObject::connect(&m_files, &MiniImFileCoordinator::errorRaised, this, &MiniImSessionManager::errorRaised);
+    QObject::connect(&m_files, &MiniImFileCoordinator::restartRequested, this,
+        [this](const QString& reason) { restartConnection(reason); });
+    QObject::connect(&m_files, &MiniImFileCoordinator::failed, this, &MiniImSessionManager::disconnectFromServer);
 }
 
 MiniImSessionManager::~MiniImSessionManager()
@@ -243,7 +200,6 @@ bool MiniImSessionManager::startConnectionAttempt()
     m_recovery.beginAttempt();
     m_resume_session_id = m_stateStore.sessionId();
     m_last_acked_request_id = m_stateStore.lastAck();
-    m_latest_file_versions.clear();
     m_seq = 0;
     m_heartbeat_interval_sec = kDefaultHeartbeatIntervalSec;
     m_hello_sent = false;
@@ -356,78 +312,14 @@ void MiniImSessionManager::onTransportDisconnected()
     m_recovery.connectionLost();
 }
 
-void MiniImSessionManager::onFileData(quint64 streamId, const QByteArray& payload)
-{
-    handleIncomingFileStream(streamId, payload);
-    const auto state = m_download_stream_states.constFind(streamId);
-    if (state == m_download_stream_states.cend())
-    {
-        m_transport.completeFileReceive(streamId, true);
-    }
-    else if (!state->header_parsed || state->buffer.isEmpty() || m_failed_file_downloads.contains(state->file_id))
-    {
-        completeFileReceive(streamId);
-    }
-}
-
-void MiniImSessionManager::onFileEnded(quint64 streamId)
-{
-    auto& state = m_download_stream_states[streamId];
-    state.finished = true;
-    flushPendingDownloadBuffers(state.file_id);
-}
-
-void MiniImSessionManager::onFileClosed(quint64 streamId, bool connectionShutdown)
-{
-    const auto state = m_download_stream_states.constFind(streamId);
-    if (state == m_download_stream_states.cend())
-    {
-        return;
-    }
-    const QString fileId = state->file_id;
-    if (!state->finished || connectionShutdown)
-    {
-        m_failed_file_downloads.insert(fileId);
-        m_download_stream_states.remove(streamId);
-        emit errorRaised(QStringLiteral("download stream interrupted"));
-        return;
-    }
-    flushPendingDownloadBuffers(fileId);
-    if (m_failed_file_downloads.contains(fileId))
-    {
-        m_download_stream_states.remove(streamId);
-    }
-}
-
-void MiniImSessionManager::onUploadFinished(const QString& fileId, bool success, const QString& error)
-{
-    if (!success)
-    {
-        restartConnection(error);
-    }
-    else if (!sendFileFinish(fileId, true))
-    {
-        emit errorRaised(QStringLiteral("failed to send file finish"));
-    }
-}
-
 void MiniImSessionManager::resetRuntimeState()
 {
+    m_files.stop();
     m_sync.stop();
     m_messageRetryTimer.stop();
-    m_activeFileTasks.clear();
-    m_fileControlAttempts.clear();
     m_activeMessageRequest.clear();
     m_messageAttemptTime.invalidate();
     m_control_stream_buffer.clear();
-    m_download_stream_states.clear();
-    m_latest_file_versions.clear();
-    m_pending_file_init_requests.clear();
-    m_pending_file_uploads.clear();
-    m_pending_file_download_init_requests.clear();
-    m_pending_file_downloads.clear();
-    m_failed_file_downloads.clear();
-    m_pending_file_finish_requests.clear();
 }
 
 bool MiniImSessionManager::parseEndpoint(const QString& endpoint, QString* host, uint16_t* port) const
@@ -979,63 +871,7 @@ bool MiniImSessionManager::recallMessage(const QString& conversation_id, const Q
 
 bool MiniImSessionManager::sendFile(const QString& conversation_id, const QString& file_path, quint32 priority)
 {
-    if (!m_connected || m_session_id.isEmpty() || conversation_id.trimmed().isEmpty() || file_path.trimmed().isEmpty())
-    {
-        return false;
-    }
-
-    QFile file(file_path);
-    if (!file.exists() || !file.open(QIODevice::ReadOnly))
-    {
-        emit errorRaised(QStringLiteral("failed to open file"));
-        return false;
-    }
-
-    QCryptographicHash hash(QCryptographicHash::Sha256);
-    while (!file.atEnd())
-    {
-        const QByteArray chunk = file.read(64 * 1024);
-        if (chunk.isEmpty() && file.error() != QFileDevice::NoError)
-        {
-            emit errorRaised(QStringLiteral("failed to read file"));
-            return false;
-        }
-        if (!chunk.isEmpty())
-        {
-            hash.addData(chunk);
-        }
-    }
-    const quint64 file_size = static_cast<quint64>(file.size());
-    file.close();
-    if (file_size == 0)
-    {
-        emit errorRaised(QStringLiteral("empty file is not supported"));
-        return false;
-    }
-
-    const QFileInfo info(file_path);
-    const QString file_name = info.fileName();
-    const QString sha256 = QString::fromLatin1(hash.result().toHex());
-    const QString client_file_id = QStringLiteral("intent-%1")
-        .arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
-    const QString request_id = makeRequestId(QStringLiteral("fileinit"));
-
-    try
-    {
-        m_stateStore.fileTasks().create({{"clientFileId", client_file_id}, {"requestId", request_id},
-            {"finishRequestId", makeRequestId(QStringLiteral("filefinish"))}, {"conversationId", conversation_id},
-            {"path", info.absoluteFilePath()}, {"fileName", file_name}, {"fileSize", QVariant::fromValue(file_size)},
-            {"sha256", sha256}, {"priority", priority}, {"direction", 1}, {"sourceFileId", ""},
-            {"metadataReady", true}, {"status", "pending"}, {"fileId", ""}, {"error", ""}});
-        publishFileTasks();
-        pumpFileTasks();
-        return true;
-    }
-    catch (const std::exception& error)
-    {
-        emit errorRaised(QString::fromUtf8(error.what()));
-        return false;
-    }
+    return m_files.sendFile(conversation_id, file_path, priority);
 }
 
 bool MiniImSessionManager::downloadFile(
@@ -1044,568 +880,41 @@ bool MiniImSessionManager::downloadFile(
     const QString& save_path,
     quint32 priority)
 {
-    if (!m_connected || m_session_id.isEmpty() || conversation_id.trimmed().isEmpty() || source_file_id.trimmed().isEmpty() || save_path.trimmed().isEmpty())
-    {
-        return false;
-    }
-
-    const QString client_file_id = QStringLiteral("intent-%1")
-        .arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
-    const QString request_id = makeRequestId(QStringLiteral("filedl"));
-    QString normalized_save_path = save_path.trimmed();
-    const QFileInfo save_info(normalized_save_path);
-    if (save_info.fileName().isEmpty() || save_info.isDir())
-    {
-        QString safe_name = source_file_id.trimmed();
-        safe_name.replace(QChar('/'), QChar('_'));
-        safe_name.replace(QChar('\\'), QChar('_'));
-        safe_name.replace(QChar(':'), QChar('_'));
-        if (safe_name.isEmpty())
-        {
-            safe_name = QStringLiteral("download");
-        }
-        normalized_save_path = QDir(normalized_save_path).filePath(safe_name + QStringLiteral(".bin"));
-    }
-    try
-    {
-        m_stateStore.fileTasks().create({{"clientFileId", client_file_id}, {"requestId", request_id},
-            {"finishRequestId", makeRequestId(QStringLiteral("filefinish"))}, {"conversationId", conversation_id},
-            {"path", QFileInfo(normalized_save_path).absoluteFilePath()}, {"fileName", "download.bin"},
-            {"fileSize", 1}, {"sha256", "na"}, {"priority", priority}, {"direction", 2},
-            {"sourceFileId", source_file_id}, {"metadataReady", false}, {"status", "pending"},
-            {"fileId", ""}, {"error", ""}});
-        publishFileTasks();
-        pumpFileTasks();
-        return true;
-    }
-    catch (const std::exception& error)
-    {
-        emit errorRaised(QString::fromUtf8(error.what()));
-        return false;
-    }
-}
-
-void MiniImSessionManager::publishFileTasks()
-{
-    emit fileTasksChanged({{"items", m_stateStore.fileTasks().pending()}});
-}
-
-void MiniImSessionManager::failFileTask(const QString& fileId, const QString& error)
-{
-    const auto task = m_stateStore.fileTasks().byFile(fileId);
-    if (!task.isEmpty())
-    {
-        m_stateStore.fileTasks().update(task.value("clientFileId").toString(), {{"status", "failed"}, {"error", error},
-             {"restartFromZero", error.contains(QStringLiteral("sha256 mismatch"))
-                 || error.contains(QStringLiteral("staging size"))}});
-        m_activeFileTasks.remove(task.value("clientFileId").toString());
-        m_fileControlAttempts.remove(task.value("requestId").toString());
-        m_fileControlAttempts.remove(task.value("finishRequestId").toString());
-        publishFileTasks();
-    }
-    emit errorRaised(error);
-}
-
-void MiniImSessionManager::handleFileResult(
-    const QString& requestId, bool success, int code, const QString& error, const QString& fileId)
-{
-    const auto task = m_stateStore.fileTasks().byRequest(requestId);
-    if (task.isEmpty())
-    {
-        return;
-    }
-    const QString id = task.value("clientFileId").toString();
-    if (success)
-    {
-        if (fileId.isEmpty())
-        {
-            throw std::runtime_error("file confirmation has no entity id");
-        }
-        const bool finishing = requestId == task.value("finishRequestId").toString();
-        m_stateStore.fileTasks().update(id,
-            {{"fileId", fileId}, {"status", finishing ? "completed" : "transferring"}, {"error", ""}});
-        if (finishing)
-        {
-            m_activeFileTasks.remove(id);
-            m_fileControlAttempts.remove(requestId);
-        }
-    }
-    else if (code != 401 && code != 408 && code != 429 && code < 500)
-    {
-        m_stateStore.fileTasks().update(id, {{"status", "failed"}, {"error", error}});
-        m_activeFileTasks.remove(id);
-        m_fileControlAttempts.remove(requestId);
-    }
-    publishFileTasks();
+    return m_files.downloadFile(conversation_id, source_file_id, save_path, priority);
 }
 
 bool MiniImSessionManager::retryFile(const QString& clientFileId)
 {
-    try
-    {
-        const auto task = m_stateStore.fileTasks().task(clientFileId);
-        if (!m_connected || task.value("status").toString() != QStringLiteral("failed"))
-        {
-            return false;
-        }
-        m_stateStore.fileTasks().update(clientFileId, {{"status", "pending"}, {"error", ""}});
-        publishFileTasks();
-        // Releasing the old stream prevents duplicate writes when retrying the same intent.
-        restartConnection(QStringLiteral("resuming file task"));
-        return true;
-    }
-    catch (const std::exception& error)
-    {
-        emit errorRaised(QString::fromUtf8(error.what()));
-        return false;
-    }
+    return m_files.retryFile(clientFileId);
 }
 
 bool MiniImSessionManager::cancelFile(const QString& clientFileId)
 {
-    try
-    {
-        const auto task = m_stateStore.fileTasks().task(clientFileId);
-        if (task.isEmpty() || task.value("status") == "completed" || task.value("status") == "cancelled")
-        {
-            return false;
-        }
-        m_stateStore.fileTasks().update(clientFileId, {{"status", "cancelled"}, {"error", ""}});
-        publishFileTasks();
-        if (m_connected)
-        {
-            restartConnection(QStringLiteral("file task cancelled"));
-        }
-        return true;
-    }
-    catch (const std::exception& error)
-    {
-        emit errorRaised(QString::fromUtf8(error.what()));
-        return false;
-    }
+    return m_files.cancelFile(clientFileId);
 }
 
-void MiniImSessionManager::pumpFileTasks()
+im::envelope::Envelope MiniImSessionManager::makeRequestEnvelope(
+    const QString& requestId, im::common::Channel channel)
 {
-    if (!m_connected || !m_sync.isReady() || m_transportStopping)
-    {
-        return;
-    }
-    try
-    {
-        for (const auto& value : m_stateStore.fileTasks().pending())
-        {
-            const auto task = value.toMap();
-            const QString id = task.value("clientFileId").toString();
-            if (task.value("status") == "failed")
-            {
-                continue;
-            }
-            const bool finishing = task.value("status") == "finishing";
-            const QString request = task.value(finishing ? "finishRequestId" : "requestId").toString();
-            if (m_activeFileTasks.contains(id))
-            {
-                const auto attempt = m_fileControlAttempts.constFind(request);
-                if (attempt == m_fileControlAttempts.constEnd() || attempt->elapsed() < kRequestRetryMs)
-                {
-                    continue;
-                }
-                if (!finishing)
-                {
-                    restartConnection(QStringLiteral("file initialization timed out"));
-                    return;
-                }
-            }
-            else
-            {
-                if (m_activeFileTasks.size() >= 8)
-                {
-                    continue;
-                }
-                m_activeFileTasks.insert(id);
-            }
-            startFileTask(task);
-        }
-    }
-    catch (const std::exception& error)
-    {
-        emit errorRaised(QString::fromUtf8(error.what()));
-        disconnectFromServer();
-    }
-}
-
-void MiniImSessionManager::startFileTask(const QVariantMap& task)
-{
-    const QString id = task.value("clientFileId").toString();
-    const QString requestId = task.value("requestId").toString();
-    const QString fileId = task.value("fileId").toString();
-    const QString path = task.value("path").toString();
-    const bool download = task.value("direction").toInt() == 2;
-    const quint64 size = task.value("fileSize").toULongLong();
-    const QString hash = task.value("sha256").toString();
-    if (task.value("status") == "finishing")
-    {
-        if (download && FileDigest(path, size) != hash)
-        {
-            failFileTask(fileId, QStringLiteral("completed download is missing or changed"));
-            return;
-        }
-        sendFileFinish(fileId, true, task.value("transferredBytes").toULongLong(),
-            task.value("verifiedSha256").toString());
-        return;
-    }
-    quint64 offset = 0;
-    if (download)
-    {
-        if (!fileId.isEmpty() && task.value("metadataReady").toBool() && FileDigest(path, size) == hash)
-        {
-            sendFileFinish(fileId, true, size, hash);
-            return;
-        }
-        if (!fileId.isEmpty() && !task.value("restartFromZero").toBool())
-        {
-            const MiniImDownloadSink sink(path, fileId);
-            const auto stagingSize = QFileInfo(sink.stagingPath()).size();
-            if (stagingSize < 0 || static_cast<quint64>(stagingSize) > size)
-            {
-                failFileTask(fileId, QStringLiteral("download staging size is invalid"));
-                return;
-            }
-            offset = static_cast<quint64>(stagingSize);
-        }
-        PendingFileDownload pending;
-        pending.conversation_id = task.value("conversationId").toString();
-        pending.source_file_id = task.value("sourceFileId").toString();
-        pending.save_path = path;
-        pending.client_file_id = id;
-        pending.resume_offset = offset;
-        m_pending_file_download_init_requests.insert(requestId, pending);
-    }
-    else
-    {
-        PendingFileUpload pending;
-        pending.conversation_id = task.value("conversationId").toString();
-        pending.file_path = path;
-        pending.file_name = task.value("fileName").toString();
-        pending.client_file_id = id;
-        pending.sha256 = hash;
-        pending.file_size = size;
-        pending.priority = task.value("priority").toUInt();
-        m_pending_file_init_requests.insert(requestId, pending);
-    }
-    m_fileControlAttempts[requestId].start();
-    sendFileInitRequest(requestId, task.value("conversationId").toString(), id,
-        task.value("fileName").toString(), size, hash, offset, task.value("priority").toUInt(),
-        download ? 2 : 1, task.value("sourceFileId").toString());
+    im::envelope::Envelope envelope;
+    envelope.set_version(1);
+    envelope.set_request_id(requestId.toStdString());
+    envelope.set_channel(channel);
+    envelope.set_session_id(m_session_id.toStdString());
+    envelope.set_device_id(m_device_id.toStdString());
+    envelope.set_seq(++m_seq);
+    envelope.set_client_time_ms(QDateTime::currentMSecsSinceEpoch());
+    envelope.set_trace_id(requestId.toStdString());
+    return envelope;
 }
 
 im::envelope::Envelope MiniImSessionManager::makeSyncRequest(quint64 cursor, quint32 limit)
 {
-    im::envelope::Envelope envelope;
-    const auto now_ms = QDateTime::currentMSecsSinceEpoch();
-    const QString request_id = makeRequestId(QStringLiteral("sync"));
-
-    envelope.set_version(1);
-    envelope.set_request_id(request_id.toStdString());
-    envelope.set_channel(im::common::CHANNEL_CONTROL);
-    envelope.set_session_id(m_session_id.toStdString());
-    envelope.set_device_id(m_device_id.toStdString());
-    envelope.set_seq(++m_seq);
-    envelope.set_client_time_ms(now_ms);
-    envelope.set_trace_id(request_id.toStdString());
-
-    auto* sync_request = envelope.mutable_sync_request();
-    sync_request->set_global_cursor(cursor);
-    sync_request->set_limit(limit);
-
+    auto envelope = makeRequestEnvelope(makeRequestId(QStringLiteral("sync")), im::common::CHANNEL_CONTROL);
+    auto* request = envelope.mutable_sync_request();
+    request->set_global_cursor(cursor);
+    request->set_limit(limit);
     return envelope;
-}
-
-bool MiniImSessionManager::sendFileInitRequest(
-    const QString& request_id,
-    const QString& conversation_id,
-    const QString& client_file_id,
-    const QString& file_name,
-    quint64 file_size,
-    const QString& sha256,
-    quint64 resume_offset,
-    quint32 priority,
-    int direction,
-    const QString& source_file_id)
-{
-    if (!m_connected || m_session_id.isEmpty() || request_id.trimmed().isEmpty())
-    {
-        return false;
-    }
-
-    im::envelope::Envelope envelope;
-    const auto now_ms = QDateTime::currentMSecsSinceEpoch();
-
-    envelope.set_version(1);
-    envelope.set_request_id(request_id.toStdString());
-    envelope.set_channel(im::common::CHANNEL_FILE);
-    envelope.set_session_id(m_session_id.toStdString());
-    envelope.set_device_id(m_device_id.toStdString());
-    envelope.set_seq(++m_seq);
-    envelope.set_client_time_ms(now_ms);
-    envelope.set_trace_id(request_id.toStdString());
-
-    auto* file_init = envelope.mutable_file_init();
-    file_init->set_conversation_id(conversation_id.toStdString());
-    file_init->set_client_file_id(client_file_id.toStdString());
-    file_init->set_file_name(file_name.toStdString());
-    file_init->set_file_size(file_size);
-    file_init->set_sha256(sha256.toStdString());
-    file_init->set_direction(static_cast<im::common::FileTransferDirection>(direction));
-    file_init->set_resume_offset(resume_offset);
-    file_init->set_priority(priority);
-    file_init->set_source_file_id(source_file_id.toStdString());
-
-    return sendEnvelope(envelope.SerializeAsString());
-}
-
-bool MiniImSessionManager::sendFileFinish(
-    const QString& file_id, bool success, quint64 transferredBytes, const QString& sha256)
-{
-    if (!m_connected || m_session_id.isEmpty() || file_id.isEmpty())
-    {
-        return false;
-    }
-    try
-    {
-        auto task = m_stateStore.fileTasks().byFile(file_id);
-        if (task.isEmpty())
-        {
-            return false;
-        }
-        const QString requestId = task.value("finishRequestId").toString();
-        m_stateStore.fileTasks().update(task.value("clientFileId").toString(),
-            {{"status", "finishing"}, {"finishSuccess", success},
-             {"transferredBytes", QVariant::fromValue(transferredBytes)}, {"verifiedSha256", sha256}});
-        im::envelope::Envelope envelope;
-        envelope.set_version(1);
-        envelope.set_request_id(requestId.toStdString());
-        envelope.set_channel(im::common::CHANNEL_FILE);
-        envelope.set_session_id(m_session_id.toStdString());
-        envelope.set_device_id(m_device_id.toStdString());
-        envelope.set_seq(++m_seq);
-        envelope.set_client_time_ms(QDateTime::currentMSecsSinceEpoch());
-        envelope.set_trace_id(requestId.toStdString());
-        auto* finish = envelope.mutable_file_finish();
-        finish->set_file_id(file_id.toStdString());
-        finish->set_success(success);
-        finish->set_transferred_bytes(transferredBytes);
-        finish->set_sha256(sha256.toStdString());
-        m_pending_file_finish_requests.insert(requestId, file_id);
-        m_fileControlAttempts[requestId].start();
-        publishFileTasks();
-        return sendEnvelope(envelope.SerializeAsString());
-    }
-    catch (const std::exception& error)
-    {
-        emit errorRaised(QString::fromUtf8(error.what()));
-        return false;
-    }
-}
-
-bool MiniImSessionManager::sendFileStreamData(
-    const QString& file_id, const QString& file_path, quint64 offset, quint64 fileSize)
-{
-    return m_transport.sendFile(file_id, file_path, offset, fileSize);
-}
-
-void MiniImSessionManager::handleFileUpdated(const im::file::FileUpdated& updated)
-{
-    const QString fileId = QString::fromStdString(updated.file_id());
-    if (updated.version() < m_latest_file_versions.value(fileId, 0))
-    {
-        return;
-    }
-    m_latest_file_versions.insert(fileId, updated.version());
-    emit fileProgress(miniim::BuildFileProgressPayload(
-        updated.event_id(), updated.file_id(), updated.conversation_id(), updated.transferred_bytes(),
-        updated.completed(), updated.version(), updated.updated_at_ms()));
-
-    auto task = m_stateStore.fileTasks().byFile(fileId);
-    if (!task.isEmpty() && updated.file_size() > 0)
-    {
-        m_stateStore.fileTasks().update(task.value("clientFileId").toString(),
-            {{"fileSize", QVariant::fromValue(updated.file_size())},
-             {"sha256", QString::fromStdString(updated.sha256())}, {"metadataReady", true}});
-        m_fileControlAttempts.remove(task.value("requestId").toString());
-        if (task.value("direction").toInt() == 1 && updated.completed())
-        {
-            m_stateStore.fileTasks().update(task.value("clientFileId").toString(), {{"status", "completed"}});
-            m_activeFileTasks.remove(task.value("clientFileId").toString());
-            publishFileTasks();
-        }
-    }
-    if (task.value("status") == "failed" || task.value("status") == "cancelled")
-    {
-        return;
-    }
-    auto download = m_pending_file_downloads.find(fileId);
-    if (download != m_pending_file_downloads.end() && !download->sink && updated.file_size() > 0)
-    {
-        download->sink = std::make_shared<MiniImDownloadSink>(download->save_path, fileId);
-        if (!download->sink->open(updated.file_size(), QString::fromStdString(updated.sha256()), download->resume_offset))
-        {
-            m_failed_file_downloads.insert(fileId);
-            failFileTask(fileId, download->sink->errorString());
-            for (auto it = m_download_stream_states.begin(); it != m_download_stream_states.end(); ++it)
-            {
-                if (it->file_id == fileId)
-                {
-                    completeFileReceive(it.key());
-                }
-            }
-            return;
-        }
-        flushPendingDownloadBuffers(fileId);
-    }
-    auto upload = m_pending_file_uploads.find(fileId);
-    if (upload == m_pending_file_uploads.end() || upload->stream_started || updated.completed())
-    {
-        return;
-    }
-    if (FileDigest(upload->file_path, upload->file_size) != upload->sha256)
-    {
-        failFileTask(fileId, QStringLiteral("upload source has changed or is unavailable"));
-        return;
-    }
-    if (sendFileStreamData(fileId, upload->file_path, updated.transferred_bytes(), upload->file_size))
-    {
-        upload->stream_started = true;
-    }
-    else
-    {
-        failFileTask(fileId, QStringLiteral("failed to send file stream"));
-    }
-}
-
-void MiniImSessionManager::handleIncomingFileStream(quint64 streamId, const QByteArray& payload)
-{
-    const quint64 key = streamId;
-    AppendClientLog(
-        QStringLiteral("handleIncomingFileStream stream=%1 append=%2")
-            .arg(key)
-            .arg(payload.size()));
-    auto state_it = m_download_stream_states.find(key);
-    if (state_it == m_download_stream_states.end())
-    {
-        state_it = m_download_stream_states.insert(key, DownloadStreamState());
-    }
-    DownloadStreamState& state = state_it.value();
-    state.buffer.append(payload);
-
-    if (!state.header_parsed)
-    {
-        const int split = state.buffer.indexOf('\n');
-        if (split < 0)
-        {
-            if (state.buffer.size() >= 512)
-            {
-                AppendClientLog(QStringLiteral("handleIncomingFileStream header too large stream=%1").arg(key));
-                m_download_stream_states.remove(key);
-            }
-            return;
-        }
-        if (split >= 512)
-        {
-            m_download_stream_states.remove(key);
-            return;
-        }
-        const QByteArray header = state.buffer.left(split);
-        state.buffer.remove(0, split + 1);
-        const QByteArray prefix("MINIIMFILE1 ");
-        if (!header.startsWith(prefix))
-        {
-            AppendClientLog(QStringLiteral("handleIncomingFileStream invalid header stream=%1").arg(key));
-            m_download_stream_states.remove(key);
-            return;
-        }
-        state.file_id = QString::fromUtf8(header.mid(prefix.size())).trimmed();
-        AppendClientLog(
-            QStringLiteral("handleIncomingFileStream header parsed stream=%1 fileId=%2")
-                .arg(key)
-                .arg(state.file_id));
-        state.header_parsed = true;
-    }
-
-    if (state.file_id.isEmpty())
-    {
-        AppendClientLog(QStringLiteral("handleIncomingFileStream empty file id stream=%1").arg(key));
-        m_download_stream_states.remove(key);
-        return;
-    }
-    flushPendingDownloadBuffers(state.file_id);
-}
-
-void MiniImSessionManager::flushPendingDownloadBuffers(const QString& file_id)
-{
-    auto pending = m_pending_file_downloads.find(file_id);
-    if (pending == m_pending_file_downloads.end() || !pending->sink || m_failed_file_downloads.contains(file_id))
-    {
-        return;
-    }
-    bool finished = false;
-    for (auto it = m_download_stream_states.begin(); it != m_download_stream_states.end(); ++it)
-    {
-        auto& state = it.value();
-        if (state.file_id != file_id)
-        {
-            continue;
-        }
-        if (!state.buffer.isEmpty() && !pending->sink->append(state.buffer))
-        {
-            m_failed_file_downloads.insert(file_id);
-            failFileTask(file_id, pending->sink->errorString());
-            completeFileReceive(it.key());
-            return;
-        }
-        state.buffer.clear();
-        completeFileReceive(it.key());
-        finished = finished || state.finished;
-    }
-    if (finished)
-    {
-        finishDownload(file_id);
-    }
-}
-
-void MiniImSessionManager::completeFileReceive(quint64 streamId)
-{
-    auto state = m_download_stream_states.find(streamId);
-    if (state == m_download_stream_states.end())
-    {
-        return;
-    }
-    const bool abort = m_failed_file_downloads.contains(state->file_id);
-    if (abort)
-    {
-        state->buffer.clear();
-    }
-    m_transport.completeFileReceive(streamId, abort);
-}
-
-void MiniImSessionManager::finishDownload(const QString& file_id)
-{
-    auto pending = m_pending_file_downloads.find(file_id);
-    if (pending == m_pending_file_downloads.end() || pending->finish_sent || !pending->sink)
-    {
-        return;
-    }
-    if (!pending->sink->finish())
-    {
-        m_failed_file_downloads.insert(file_id);
-        failFileTask(file_id, pending->sink->errorString());
-        return;
-    }
-    pending->finish_sent = sendFileFinish(file_id, true, pending->sink->receivedBytes(), pending->sink->sha256());
-    if (!pending->finish_sent)
-    {
-        emit errorRaised(QStringLiteral("failed to confirm downloaded file"));
-    }
 }
 
 void MiniImSessionManager::handleIncomingEnvelope(const QByteArray& payload)
@@ -1662,12 +971,7 @@ void MiniImSessionManager::handleIncomingEnvelope(const QByteArray& payload)
             disconnectFromServer();
             return;
         }
-        for (const auto& value : initial.value(QStringLiteral("files")).toList())
-        {
-            const auto file = value.toMap();
-            m_latest_file_versions.insert(file.value(QStringLiteral("fileId")).toString(),
-                file.value(QStringLiteral("version")).toULongLong());
-        }
+        m_files.start(initial.value(QStringLiteral("files")).toList());
         emit initialStateLoaded(initial);
         m_heartbeat_timer.start(m_heartbeat_interval_sec * 1000);
         m_messageRetryTimer.start();
@@ -1694,53 +998,7 @@ void MiniImSessionManager::handleIncomingEnvelope(const QByteArray& payload)
                 emit errorRaised(m_stateStore.errorString());
             }
         }
-        handleFileResult(request_id, ack.success(), ack.code(), QString::fromStdString(ack.message()),
-            QString::fromStdString(ack.entity_id()));
-        const QString finishedFileId = m_pending_file_finish_requests.take(request_id);
-        if (!finishedFileId.isEmpty())
-        {
-            if (ack.success())
-            {
-                m_pending_file_uploads.remove(finishedFileId);
-                m_pending_file_downloads.remove(finishedFileId);
-                for (auto it = m_download_stream_states.begin(); it != m_download_stream_states.end();)
-                {
-                    it = it->file_id == finishedFileId ? m_download_stream_states.erase(it) : ++it;
-                }
-            }
-            else if (m_pending_file_downloads.contains(finishedFileId))
-            {
-                m_pending_file_downloads[finishedFileId].finish_sent = false;
-            }
-        }
-        auto pending_init = m_pending_file_init_requests.find(request_id);
-        if (pending_init != m_pending_file_init_requests.end())
-        {
-            if (ack.success())
-            {
-                PendingFileUpload pending = pending_init.value();
-                pending.file_id = QString::fromStdString(ack.entity_id());
-                pending.stream_started = false;
-                m_pending_file_uploads.insert(pending.file_id, pending);
-            }
-            m_pending_file_init_requests.erase(pending_init);
-        }
-        auto pending_download_init = m_pending_file_download_init_requests.find(request_id);
-        if (pending_download_init != m_pending_file_download_init_requests.end())
-        {
-            if (ack.success())
-            {
-                PendingFileDownload pending = pending_download_init.value();
-                pending.file_id = QString::fromStdString(ack.entity_id());
-                m_failed_file_downloads.remove(pending.file_id);
-                m_pending_file_downloads.insert(pending.file_id, pending);
-                AppendClientLog(
-                    QStringLiteral("download ack ready fileId=%1 savePath=%2")
-                        .arg(pending.file_id, pending.save_path));
-                flushPendingDownloadBuffers(pending.file_id);
-            }
-            m_pending_file_download_init_requests.erase(pending_download_init);
-        }
+        m_files.handleAck(ack);
         if (!ack.success())
         {
             const QString message = ack.message().empty()
@@ -1764,7 +1022,7 @@ void MiniImSessionManager::handleIncomingEnvelope(const QByteArray& payload)
         {
             restartConnection(QStringLiteral("session rejected; reconnecting"), true);
         }
-        handleFileResult(QString::fromStdString(envelope.request_id()), false, error.code(),
+        m_files.handleFileResult(QString::fromStdString(envelope.request_id()), false, error.code(),
             QString::fromStdString(error.message()), QString());
         handleMessageResult(QString::fromStdString(envelope.request_id()), false, error.code(),
             QString::fromStdString(error.message()), QString());

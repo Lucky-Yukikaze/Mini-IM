@@ -32,6 +32,7 @@ signals:
     void stateApplied();
     void progressChanged(const QVariantMap& payload);
     void fileUpdated(const im::file::FileUpdated& updated);
+    void readinessChanged(bool ready);
     void ready();
     void errorRaised(const QString& error);
     void failed();

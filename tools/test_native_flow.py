@@ -11,6 +11,7 @@ from contextlib import closing, suppress
 import hashlib
 import json
 import os
+import sqlite3
 from pathlib import Path
 import subprocess
 import sys
@@ -958,6 +959,32 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         await self.bob.wait("file-tasks", lambda item: not item["items"])
         self.assertEqual(payload, target.read_bytes())
         self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM file_transfers WHERE direction=2")[0])
+
+    async def test_file_finish_retry_survives_message_store_failure(self):
+        payload = b"file confirmation stays independent" * 2048
+        file_id = await self.upload(payload)
+        self.drop_file_acks["filefinish"] = 1
+        target = self.root / "independent-finish.bin"
+        mark = await self.bob.command("download", conversation=self.conversation, source=file_id, path=str(target))
+        await self.bob.wait("file", lambda item: item["completed"] and item["fileId"] != file_id, since=mark)
+        self.assertEqual(payload, target.read_bytes())
+        cache = next((self.root / "state-bob").glob("*.sqlite"))
+        with closing(sqlite3.connect(cache)) as native_db:
+            native_db.execute("CREATE TRIGGER reject_message_attempt BEFORE UPDATE OF attempts ON message_outbox "
+                              "BEGIN SELECT RAISE(ABORT,'injected message attempt failure'); END")
+            native_db.commit()
+            try:
+                mark = await self.bob.command("message", conversation=self.conversation,
+                                              intent="stored-but-not-sent", text="saved")
+                await self.bob.wait("error", lambda item: "injected message attempt failure" in item["message"], since=mark)
+                await self.bob.wait("file-tasks", lambda item: not item["items"], since=mark, timeout=8)
+                self.assertEqual("completed", native_db.execute("SELECT status FROM file_tasks").fetchone()[0])
+                self.assertEqual(("pending", 0), native_db.execute(
+                    "SELECT status,attempts FROM message_outbox WHERE client_msg_id='stored-but-not-sent'").fetchone())
+                self.assertEqual(payload, target.read_bytes())
+            finally:
+                native_db.execute("DROP TRIGGER reject_message_attempt")
+                native_db.commit()
 
     async def test_upload_init_ack_loss_reuses_existing_intent(self):
         self.drop_file_acks["fileinit"] = 1
