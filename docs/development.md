@@ -167,9 +167,14 @@ npm --prefix ./web run dev -- --host 127.0.0.1 --port 5173 --strictPort
 恢复数据库后可重新连接。401、408、429 和不小于 500 的错误保留为待重试，确定失败保存原结果，
 后续新的用户操作使用新请求；重复确认不能改写已确认或确定失败的状态。
 `initialStateLoaded.controlWrites` 与 `controlWritesChanged` 提供待处理和失败操作、次数及原因，
-不向页面提供协议字节。原生保存/恢复已接入，页面完成回调和操作状态展示仍需完成。
+不向页面提供协议字节。页面等待完成回调后才关闭建群、私聊和加群表单，保存失败保留输入；
+提交期间禁用重复操作。右侧“操作状态”显示已保存但待确认的请求和确定失败原因；
+临时失败由 Qt 沿用原请求重试，确定失败后用户按原因重新操作。
+已读在本地保存失败后可点击“标为已读”重试；原已读请求确认后继续提交后来读到的消息。
+切换用户清空所属操作展示，回到原用户时从其数据库恢复。
 验证分别见 [服务端控制写入批次](refactoring-progress.md#控制写入持久去重与事务失败回滚--2026-09-08)
-和 [原生控制写入批次](refactoring-progress.md#原生控制写入队列与重启恢复--2026-09-08)。
+和 [原生控制写入批次](refactoring-progress.md#原生控制写入队列与重启恢复--2026-09-08)；
+页面验证见 [页面控制操作批次](refactoring-progress.md#页面控制操作与真实桌面验证--2026-09-08)。
 
 ## 同步补拉与等待
 
@@ -251,7 +256,7 @@ ctest --test-dir ./build/client_qt611 -C Release --output-on-failure
 
 服务端测试包含业务与存储入口、使用真实 aioquic 发送器与受控确认的下载调度检查，
 以及 [控制写入网络测试](../server/tests/test_control_write_network.py) 的真实 QUIC 重连、确认丢失和提交失败回滚；
-页面测试检查状态合并；CTest 运行 Qt 下载、上传缓冲、同步协调、控制写入恢复和状态持久化测试，覆盖消息发送意图及文件任务。真实双客户端网络路径使用下述独立入口。
+页面测试检查状态合并、异步回调和接口缺失时拒绝操作；CTest 运行 Qt 下载、上传缓冲、同步协调、控制写入恢复和状态持久化测试，覆盖消息发送意图及文件任务。真实双客户端网络路径使用下述独立入口。
 类型检查失败、未完成的网络场景及性能测量统一记入执行记录。
 
 ## 真实原生客户端联调
@@ -275,6 +280,34 @@ ctest --test-dir ./build/client_qt611 -C Release --output-on-failure
 Vue 完整桌面页面、真实服务端进程重启、多设备并发及传输性能需另外验收。
 可在上述联调命令后追加 `--test test_process_restart_fills_persisted_sync_gap` 单独复核一个场景，
 重复 `--test` 可选择多个场景；省略时执行全部。当前覆盖及运行结果统一见执行记录。
+
+## 真实桌面页面联调
+
+[桌面隔离环境](../tools/desktop_fixture.py) 启动真实 Qt WebEngine 客户端和临时 QUIC 服务，
+使用随机本机端口、独立证书、服务端数据库和客户端状态目录；加载已打包的 `web/dist/index.html`。
+运行前完成 Web 打包及 `mini_im_client` 构建，并准备包含 `plugins/platforms` 的 Qt 安装目录。
+该入口只在测试环境开放本机页面调试端口，默认 900 秒后退出，也可在其终端按 Ctrl+C 停止。
+
+~~~powershell
+& ./.venv/Scripts/python.exe ./tools/desktop_fixture.py --qt-root D:/Qt/6.11.0/msvc2022_64 --timeout 900
+~~~
+
+保持上述终端运行，在另一终端将两个示例路径替换为本轮输出的 `context.json` 和已安装的
+Playwright CLI JavaScript 入口；Playwright CLI = 通过命令行驱动浏览器及 Qt 内嵌页面的工具。
+该检查需要 Node 和 Playwright CLI，不会自动安装依赖。
+
+~~~powershell
+& ./.venv/Scripts/python.exe ./tools/test_desktop_ui.py --context ./tmp/desktop-integration/<运行时间>/context.json --playwright-cli 'C:/tools/playwright-core/lib/tools/cli-client/cli.js'
+~~~
+
+[页面检查脚本](../tools/test_desktop_ui.py) 通过 [浏览器操作步骤](../tools/desktop_ui.js)
+点击真实界面，检查完成回调等待、保存失败保留输入、成员操作、改名重试、撤回、已读及用户隔离。
+建群检查只暂缓真实 Qt 返回值的交付以观察等待状态，不伪造保存结果；
+服务端故障和数据库写入故障仅注入隔离环境，消息从真实服务经 QUIC 推送。
+检查须使用全新隔离环境；结果与日志保存在 `tmp/desktop-integration/<运行时间>/`，
+截图在 `output/playwright/<运行时间>/`，均被 Git 忽略。
+`ui-result.json` 的 `ok` 必须为 `true`，每个阶段和数据库断言均通过才可计为验收。
+本入口不覆盖同时运行的多设备、独立服务端进程宕机、文件页面全流程或其他平台。
 
 ## 现有脚本与历史环境
 

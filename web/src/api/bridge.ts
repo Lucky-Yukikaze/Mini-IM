@@ -19,15 +19,15 @@ interface QtImBridge {
     done: (accepted: boolean) => void
   ): void;
   retryMessage(conversationId: string, clientMsgId: string, done: (accepted: boolean) => void): void;
-  createConversation(clientConvId: string, title: string, memberIds: string[]): boolean;
-  createDirectConversation?(clientConvId: string, peerUserId: string): boolean;
-  addMembers?(conversationId: string, memberIds: string[]): boolean;
-  removeMembers?(conversationId: string, memberIds: string[]): boolean;
-  leaveConversation?(conversationId: string): boolean;
-  joinConversation?(conversationId: string): boolean;
-  renameConversation?(conversationId: string, title: string): boolean;
-  sendReceipt(conversationId: string, lastReadSeq: number): boolean;
-  recallMessage(conversationId: string, messageId: string): boolean;
+  createConversation(clientConvId: string, title: string, memberIds: string[], done: (accepted: boolean) => void): void;
+  createDirectConversation?(clientConvId: string, peerUserId: string, done: (accepted: boolean) => void): void;
+  addMembers?(conversationId: string, memberIds: string[], done: (accepted: boolean) => void): void;
+  removeMembers?(conversationId: string, memberIds: string[], done: (accepted: boolean) => void): void;
+  leaveConversation?(conversationId: string, done: (accepted: boolean) => void): void;
+  joinConversation?(conversationId: string, done: (accepted: boolean) => void): void;
+  renameConversation?(conversationId: string, title: string, done: (accepted: boolean) => void): void;
+  sendReceipt(conversationId: string, lastReadSeq: number, done: (accepted: boolean) => void): void;
+  recallMessage(conversationId: string, messageId: string, done: (accepted: boolean) => void): void;
   sendFile(conversationId: string, filePath: string, priority: number, done: (accepted: boolean) => void): void;
   downloadFile(conversationId: string, sourceFileId: string, savePath: string, priority: number, done: (accepted: boolean) => void): void;
   retryFile(clientFileId: string, done: (accepted: boolean) => void): void;
@@ -41,6 +41,7 @@ interface QtImBridge {
   syncProgress?: QtSignal;
   messageSendsChanged?: QtSignal;
   fileTasksChanged?: QtSignal;
+  controlWritesChanged?: QtSignal;
   errorRaised?: QtSignal;
 }
 
@@ -91,6 +92,9 @@ function bindSignals(bridge: QtImBridge): void {
   });
   bridge.fileProgress?.connect((payload) => {
     bridgeEvents.emit('fileProgress', payload);
+  });
+  bridge.controlWritesChanged?.connect((payload) => {
+    bridgeEvents.emit('controlWritesChanged', payload);
   });
   bridge.fileTasksChanged?.connect((payload) => {
     bridgeEvents.emit('fileTasksChanged', payload);
@@ -217,10 +221,12 @@ export async function retryMessage(conversationId: string, clientMsgId: string):
   });
 }
 
-export function createConversation(title: string, memberIds: string[]): boolean {
+export async function createConversation(title: string, memberIds: string[]): Promise<boolean> {
+  if (runtimeWindow.qt?.webChannelTransport && !runtimeWindow.imBridge) return false;
   if (runtimeWindow.imBridge) {
-    const clientConvId = `cc-${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
-    return runtimeWindow.imBridge.createConversation(clientConvId, title, memberIds);
+    const clientConvId = crypto.randomUUID();
+    if (typeof runtimeWindow.imBridge.createConversation !== 'function') return false;
+    return new Promise<boolean>((resolve) => runtimeWindow.imBridge!.createConversation!(clientConvId, title, memberIds, resolve));
   }
 
   const item: ConversationItem = {
@@ -235,10 +241,12 @@ export function createConversation(title: string, memberIds: string[]): boolean 
   return true;
 }
 
-export function createDirectConversation(peerUserId: string): boolean {
-  if (runtimeWindow.imBridge?.createDirectConversation) {
-    const clientConvId = `dc-${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
-    return runtimeWindow.imBridge.createDirectConversation(clientConvId, peerUserId);
+export async function createDirectConversation(peerUserId: string): Promise<boolean> {
+  if (runtimeWindow.qt?.webChannelTransport && !runtimeWindow.imBridge) return false;
+  if (runtimeWindow.imBridge) {
+    const clientConvId = crypto.randomUUID();
+    if (typeof runtimeWindow.imBridge.createDirectConversation !== 'function') return false;
+    return new Promise<boolean>((resolve) => runtimeWindow.imBridge!.createDirectConversation!(clientConvId, peerUserId, resolve));
   }
 
   const item: ConversationItem = {
@@ -253,9 +261,11 @@ export function createDirectConversation(peerUserId: string): boolean {
   return true;
 }
 
-export function addMembers(conversationId: string, memberIds: string[]): boolean {
-  if (runtimeWindow.imBridge?.addMembers) {
-    return runtimeWindow.imBridge.addMembers(conversationId, memberIds);
+export async function addMembers(conversationId: string, memberIds: string[]): Promise<boolean> {
+  if (runtimeWindow.qt?.webChannelTransport && !runtimeWindow.imBridge) return false;
+  if (runtimeWindow.imBridge) {
+    if (typeof runtimeWindow.imBridge.addMembers !== 'function') return false;
+    return new Promise<boolean>((resolve) => runtimeWindow.imBridge!.addMembers!(conversationId, memberIds, resolve));
   }
   bridgeEvents.emit('conversationUpdated', {
     conversationId,
@@ -268,9 +278,11 @@ export function addMembers(conversationId: string, memberIds: string[]): boolean
   return true;
 }
 
-export function removeMembers(conversationId: string, memberIds: string[]): boolean {
-  if (runtimeWindow.imBridge?.removeMembers) {
-    return runtimeWindow.imBridge.removeMembers(conversationId, memberIds);
+export async function removeMembers(conversationId: string, memberIds: string[]): Promise<boolean> {
+  if (runtimeWindow.qt?.webChannelTransport && !runtimeWindow.imBridge) return false;
+  if (runtimeWindow.imBridge) {
+    if (typeof runtimeWindow.imBridge.removeMembers !== 'function') return false;
+    return new Promise<boolean>((resolve) => runtimeWindow.imBridge!.removeMembers!(conversationId, memberIds, resolve));
   }
   bridgeEvents.emit('messageUpdated', {
     type: 'receipt',
@@ -283,9 +295,11 @@ export function removeMembers(conversationId: string, memberIds: string[]): bool
   return true;
 }
 
-export function leaveConversation(conversationId: string): boolean {
-  if (runtimeWindow.imBridge?.leaveConversation) {
-    return runtimeWindow.imBridge.leaveConversation(conversationId);
+export async function leaveConversation(conversationId: string): Promise<boolean> {
+  if (runtimeWindow.qt?.webChannelTransport && !runtimeWindow.imBridge) return false;
+  if (runtimeWindow.imBridge) {
+    if (typeof runtimeWindow.imBridge.leaveConversation !== 'function') return false;
+    return new Promise<boolean>((resolve) => runtimeWindow.imBridge!.leaveConversation!(conversationId, resolve));
   }
   bridgeEvents.emit('messageUpdated', {
     type: 'receipt',
@@ -298,9 +312,11 @@ export function leaveConversation(conversationId: string): boolean {
   return true;
 }
 
-export function joinConversation(conversationId: string): boolean {
-  if (runtimeWindow.imBridge?.joinConversation) {
-    return runtimeWindow.imBridge.joinConversation(conversationId);
+export async function joinConversation(conversationId: string): Promise<boolean> {
+  if (runtimeWindow.qt?.webChannelTransport && !runtimeWindow.imBridge) return false;
+  if (runtimeWindow.imBridge) {
+    if (typeof runtimeWindow.imBridge.joinConversation !== 'function') return false;
+    return new Promise<boolean>((resolve) => runtimeWindow.imBridge!.joinConversation!(conversationId, resolve));
   }
   bridgeEvents.emit('conversationUpdated', {
     conversationId,
@@ -313,9 +329,11 @@ export function joinConversation(conversationId: string): boolean {
   return true;
 }
 
-export function renameConversation(conversationId: string, title: string): boolean {
-  if (runtimeWindow.imBridge?.renameConversation) {
-    return runtimeWindow.imBridge.renameConversation(conversationId, title);
+export async function renameConversation(conversationId: string, title: string): Promise<boolean> {
+  if (runtimeWindow.qt?.webChannelTransport && !runtimeWindow.imBridge) return false;
+  if (runtimeWindow.imBridge) {
+    if (typeof runtimeWindow.imBridge.renameConversation !== 'function') return false;
+    return new Promise<boolean>((resolve) => runtimeWindow.imBridge!.renameConversation!(conversationId, title, resolve));
   }
   bridgeEvents.emit('conversationUpdated', {
     conversationId,
@@ -328,9 +346,11 @@ export function renameConversation(conversationId: string, title: string): boole
   return true;
 }
 
-export function sendReceipt(conversationId: string, lastReadSeq: number): boolean {
+export async function sendReceipt(conversationId: string, lastReadSeq: number): Promise<boolean> {
+  if (runtimeWindow.qt?.webChannelTransport && !runtimeWindow.imBridge) return false;
   if (runtimeWindow.imBridge) {
-    return runtimeWindow.imBridge.sendReceipt(conversationId, lastReadSeq);
+    if (typeof runtimeWindow.imBridge.sendReceipt !== 'function') return false;
+    return new Promise<boolean>((resolve) => runtimeWindow.imBridge!.sendReceipt!(conversationId, lastReadSeq, resolve));
   }
   bridgeEvents.emit('messageUpdated', {
     type: 'receipt',
@@ -343,9 +363,11 @@ export function sendReceipt(conversationId: string, lastReadSeq: number): boolea
   return true;
 }
 
-export function recallMessage(conversationId: string, messageId: string): boolean {
+export async function recallMessage(conversationId: string, messageId: string): Promise<boolean> {
+  if (runtimeWindow.qt?.webChannelTransport && !runtimeWindow.imBridge) return false;
   if (runtimeWindow.imBridge) {
-    return runtimeWindow.imBridge.recallMessage(conversationId, messageId);
+    if (typeof runtimeWindow.imBridge.recallMessage !== 'function') return false;
+    return new Promise<boolean>((resolve) => runtimeWindow.imBridge!.recallMessage!(conversationId, messageId, resolve));
   }
   bridgeEvents.emit('messageUpdated', {
     type: 'recall',

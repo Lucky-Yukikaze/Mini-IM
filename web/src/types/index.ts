@@ -39,6 +39,7 @@ export interface InitialStatePayload {
   files?: FileProgressItem[];
   messageSends?: MessageSendItem[];
   fileTasks?: FileTaskItem[];
+  controlWrites?: ControlWriteItem[];
 }
 
 export interface ReceiptUpdate {
@@ -103,4 +104,18 @@ export interface FileTaskItem {
   direction: number;
   status: 'pending' | 'transferring' | 'finishing' | 'failed';
   error: string;
+}
+
+export interface ControlWriteItem {
+  requestId: string;
+  operation: 'create_conversation' | 'add_members' | 'remove_members' | 'leave_conversation'
+    | 'join_conversation' | 'rename_conversation' | 'receipt' | 'recall';
+  conversationId: string;
+  clientConvId: string;
+  status: 'pending' | 'failed';
+  code: number;
+  error: string;
+  entityId: string;
+  createdAtMs: number;
+  attempts: number;
 }

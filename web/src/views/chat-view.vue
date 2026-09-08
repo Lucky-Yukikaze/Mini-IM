@@ -25,6 +25,7 @@
         :conversation-id="session.activeConversationId"
         :conversation-type="session.currentConversation?.type ?? ''"
         :current-user-id="session.currentUserId"
+        :recall-disabled="controlDisabled || hasPendingRecall"
         :messages="session.currentMessages"
         @recall="onRecall"
         @fill-download="onFillDownload"
@@ -55,8 +56,8 @@
         <h3>{{ session.activeConversationLabel }}</h3>
         <div class="details-line">{{ session.activeConversationId || '-' }}</div>
         <div v-if="isGroupConversation" class="group-actions">
-          <input v-model="renameTitle" :disabled="!isOwner" placeholder="群名称" />
-          <button class="secondary-button" :disabled="!isOwner || !renameTitle.trim()" @click="onRenameConversation">
+          <input v-model="renameTitle" :disabled="!isOwner || controlDisabled" placeholder="群名称" />
+          <button class="secondary-button" :disabled="!isOwner || controlDisabled || !renameTitle.trim()" @click="onRenameConversation">
             改名
           </button>
         </div>
@@ -69,6 +70,7 @@
             <button
               v-if="isGroupConversation && isOwner && member !== session.currentUserId"
               class="member-remove"
+              :disabled="controlDisabled"
               @click="onRemoveMember(member)"
             >
               移除
@@ -77,19 +79,34 @@
           <span v-if="activeMembers.length === 0" class="muted-text">暂无成员</span>
         </div>
         <div v-if="isGroupConversation" class="group-actions">
-          <input v-model="memberDraft" :disabled="!isOwner" placeholder="成员 ID，逗号分隔" />
-          <button class="secondary-button" :disabled="!isOwner || !memberDraft.trim()" @click="onAddMembers">
+          <input v-model="memberDraft" :disabled="!isOwner || controlDisabled" placeholder="成员 ID，逗号分隔" />
+          <button class="secondary-button" :disabled="!isOwner || controlDisabled || !memberDraft.trim()" @click="onAddMembers">
             邀请
           </button>
         </div>
         <button
           v-if="isGroupConversation"
           class="danger-button"
-          :disabled="!session.activeConversationId || !isActiveMember"
+          :disabled="controlDisabled || !session.activeConversationId || !isActiveMember"
           @click="onLeaveConversation"
         >
           退出群聊
         </button>
+      </section>
+      <section class="details-section" aria-label="操作状态">
+        <div class="details-title">操作状态</div>
+        <button class="secondary-button" :disabled="!canSendToActiveConversation || controlDisabled"
+          @click="syncReceiptForCurrentConversation(true)">标为已读</button>
+        <div v-if="session.controlWrites.length" class="control-write-list">
+          <article v-for="item in session.controlWrites" :key="item.requestId" class="control-write-card">
+            <strong>{{ operationLabel(item.operation) }} · {{ item.status === 'failed' ? '未成功' : '等待确认' }}</strong>
+            <span>{{ controlTarget(item) }}</span>
+            <span v-if="item.status === 'pending'">{{ session.connection.state !== 'connected' ? '等待重新连接' : item.code ? '等待自动重试' : '已保存，正在处理' }}</span>
+            <span v-if="item.error" class="control-write-error">{{ item.error }}</span>
+            <span v-if="item.status === 'failed'">请检查原因后重新操作</span>
+          </article>
+        </div>
+        <span v-else class="muted-text">没有待确认或失败的操作</span>
       </section>
       <section class="details-section">
         <div class="details-title">文件</div>
@@ -116,11 +133,13 @@
 
     <ConversationDialog
       v-if="dialogMode"
+      :key="session.currentUserId + dialogMode"
       :mode="dialogMode"
+      :disabled="controlDisabled"
+      :create="onCreateConversation"
+      :join="onJoinConversation"
+      :direct="onCreateDirectConversation"
       @close="dialogMode = null"
-      @create="onCreateConversation"
-      @join="onJoinConversation"
-      @direct="onCreateDirectConversation"
     />
 
     <DebugDrawer
@@ -141,7 +160,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import {
   addMembers,
   connect,
@@ -171,6 +190,7 @@ import { bridgeEvents } from '../events/bridge-event-store';
 import { useSessionStore } from '../store/session';
 import type {
   ConnectionState,
+  ControlWriteItem,
   ConversationItem,
   FileProgressItem,
   InitialStatePayload,
@@ -189,6 +209,17 @@ const renameTitle = ref('');
 const downloadFileIdPreset = ref('');
 const pendingMessages: MessageItem[] = [];
 let messageFlushFrame = 0;
+let accountEpoch = 0;
+const controlSubmitting = ref(false);
+const receiptInFlight = new Map<string, number>();
+const receiptSaved = new Map<string, number>();
+const subscriptions: (() => void)[] = [];
+const controlDisabled = computed(() => controlSubmitting.value || session.connection.state !== 'connected');
+const hasPendingRecall = computed(() => session.controlWrites.some(item => item.operation === 'recall'
+  && item.status === 'pending' && item.conversationId === session.activeConversationId));
+function listen(name: string, handler: (payload: unknown) => void): void {
+  subscriptions.push(bridgeEvents.on(name, handler));
+}
 
 const currentFileProgress = computed(() => session.currentFileProgress);
 const activeMembers = computed(() => session.currentConversation?.memberIds ?? []);
@@ -196,7 +227,7 @@ const isOwner = computed(() => session.currentConversation?.ownerId === session.
 const isActiveMember = computed(() => activeMembers.value.includes(session.currentUserId));
 const isGroupConversation = computed(() => session.currentConversation?.type === 'group');
 const canSendToActiveConversation = computed(
-  () => Boolean(session.activeConversationId) && isActiveMember.value
+  () => session.connection.state === 'connected' && Boolean(session.activeConversationId) && isActiveMember.value
 );
 const activeSubtitle = computed(() => {
   const conversation = session.currentConversation;
@@ -217,13 +248,60 @@ function showNotice(message: string): void {
   }, 2200);
 }
 
-function syncReceiptForCurrentConversation(): void {
-  const receivedMessages = session.currentMessages.filter((item) => item.senderId !== session.currentUserId);
-  const lastMessage = receivedMessages[receivedMessages.length - 1];
-  if (!lastMessage || !session.activeConversationId) {
-    return;
+async function syncReceiptForCurrentConversation(explicit = false): Promise<void> {
+  const conversationId = session.activeConversationId;
+  if (!canSendToActiveConversation.value || receiptInFlight.has(conversationId)) return;
+  const received = session.currentMessages.filter(item => item.senderId !== session.currentUserId);
+  const seq = received[received.length - 1]?.seq ?? 0;
+  const confirmed = session.readProgressByConversation[conversationId]?.[session.currentUserId] ?? 0;
+  if (seq <= confirmed || (!explicit && seq <= (receiptSaved.get(conversationId) ?? 0))) return;
+  if (session.controlWrites.some(item => item.operation === 'receipt' && item.status === 'pending'
+    && item.conversationId === conversationId)) return;
+  if (!explicit && session.controlWrites.some(item => item.operation === 'receipt' && item.status === 'failed'
+    && item.conversationId === conversationId)) return;
+  const epoch = accountEpoch;
+  receiptInFlight.set(conversationId, seq);
+  let accepted = false;
+  try {
+    accepted = await sendReceipt(conversationId, seq);
+    if (epoch !== accountEpoch) return;
+    if (accepted) receiptSaved.set(conversationId, seq);
+    else showNotice('已读操作未保存，可点击“标为已读”重试');
+  } catch {
+    if (epoch === accountEpoch) showNotice('已读操作提交失败');
+  } finally {
+    if (epoch === accountEpoch) receiptInFlight.delete(conversationId);
   }
-  sendReceipt(session.activeConversationId, lastMessage.seq);
+  if (accepted && epoch === accountEpoch) void syncReceiptForCurrentConversation();
+}
+
+function operationLabel(operation: ControlWriteItem['operation']): string {
+  return { create_conversation: '建立会话', add_members: '邀请成员', remove_members: '移除成员',
+    leave_conversation: '退出群聊', join_conversation: '加入群聊', rename_conversation: '修改群名',
+    receipt: '标记已读', recall: '撤回消息' }[operation] ?? '会话操作';
+}
+
+function controlTarget(item: ControlWriteItem): string {
+  if (!item.conversationId) return '新会话';
+  const conversation = session.conversations.find(entry => entry.conversationId === item.conversationId);
+  return conversation?.title || item.conversationId;
+}
+
+async function performControl(action: () => Promise<boolean>): Promise<boolean> {
+  if (controlDisabled.value) return false;
+  const epoch = accountEpoch;
+  controlSubmitting.value = true;
+  try {
+    const accepted = await action();
+    if (epoch !== accountEpoch) return false;
+    if (!accepted) showNotice('操作未保存，请检查连接和输入');
+    return accepted;
+  } catch {
+    if (epoch === accountEpoch) showNotice('提交失败，请重试');
+    return false;
+  } finally {
+    if (epoch === accountEpoch) controlSubmitting.value = false;
+  }
 }
 
 function queueMessage(item: MessageItem): void {
@@ -252,7 +330,7 @@ function flushPendingMessages(): void {
   }
 }
 
-bridgeEvents.on('connectionChanged', (payload) => {
+listen('connectionChanged', (payload) => {
   const connection = payload as Partial<ConnectionState>;
   session.setConnection({
     state: (connection.state ?? 'error') as ConnectionState['state'],
@@ -260,47 +338,63 @@ bridgeEvents.on('connectionChanged', (payload) => {
   });
 });
 
-bridgeEvents.on('initialStateLoaded', (payload) => {
+listen('initialStateLoaded', (payload) => {
+  accountEpoch++;
+  controlSubmitting.value = false;
+  receiptSaved.clear();
+  receiptInFlight.clear();
+  if ((payload as InitialStatePayload).currentUser.userId !== session.currentUserId) {
+    dialogMode.value = null;
+    memberDraft.value = '';
+    notice.value = '';
+  }
   if (messageFlushFrame > 0) {
     window.cancelAnimationFrame(messageFlushFrame);
     messageFlushFrame = 0;
   }
   pendingMessages.splice(0);
   session.applyInitialState(payload as InitialStatePayload);
+  void syncReceiptForCurrentConversation();
 });
 
-bridgeEvents.on('fileTasksChanged', (payload) => {
+listen('controlWritesChanged', (payload) => {
+  session.applyControlWrites((payload as { items: ControlWriteItem[] }).items);
+  void syncReceiptForCurrentConversation();
+});
+
+listen('fileTasksChanged', (payload) => {
   session.applyFileTasks((payload as { items: FileTaskItem[] }).items);
 });
 
-bridgeEvents.on('messageSendsChanged', (payload) => {
+listen('messageSendsChanged', (payload) => {
   session.applyMessageSends((payload as { items: MessageSendItem[] }).items);
 });
 
-bridgeEvents.on('syncProgress', (payload) => {
+listen('syncProgress', (payload) => {
   session.globalCursor = (payload as { globalCursor: number }).globalCursor;
 });
 
-bridgeEvents.on('conversationUpdated', (payload) => {
+listen('conversationUpdated', (payload) => {
   flushPendingMessages();
   session.applyConversationUpdated(payload as ConversationItem);
 });
 
-bridgeEvents.on('messagePushed', (payload) => {
+listen('messagePushed', (payload) => {
   queueMessage(payload as MessageItem);
 });
 
-bridgeEvents.on('messageUpdated', (payload) => {
+listen('messageUpdated', (payload) => {
   flushPendingMessages();
   session.applyMessageUpdated(payload as MessageUpdate);
+  if ((payload as MessageUpdate).type === 'receipt') void syncReceiptForCurrentConversation();
 });
 
-bridgeEvents.on('fileProgress', (payload) => {
+listen('fileProgress', (payload) => {
   flushPendingMessages();
   session.applyFileProgress(payload as FileProgressItem);
 });
 
-bridgeEvents.on('errorRaised', (payload) => {
+listen('errorRaised', (payload) => {
   if (typeof payload === 'string') {
     showNotice(payload);
     return;
@@ -312,6 +406,7 @@ bridgeEvents.on('errorRaised', (payload) => {
 watch(
   () => session.activeConversationId,
   () => {
+    memberDraft.value = '';
     renameTitle.value = session.currentConversation?.title ?? '';
     syncReceiptForCurrentConversation();
   }
@@ -319,16 +414,23 @@ watch(
 
 watch(
   () => session.currentConversation?.title,
-  (title) => {
-    renameTitle.value = title ?? '';
+  (title, previous) => {
+    if (renameTitle.value === (previous ?? '')) renameTitle.value = title ?? '';
   }
 );
+
+onUnmounted(() => {
+  accountEpoch++;
+  for (const unsubscribe of subscriptions) unsubscribe();
+  if (messageFlushFrame) window.cancelAnimationFrame(messageFlushFrame);
+  pendingMessages.splice(0);
+});
 
 onMounted(async () => {
   try {
     await initBridge();
   } catch {
-    showNotice('未检测到 Qt Bridge，已进入 Web 调试模式');
+    showNotice('Qt 接口初始化失败，请重新打开客户端');
   }
 });
 
@@ -349,12 +451,12 @@ function onDisconnect(): void {
   disconnect();
 }
 
-function onCreateConversation(title: string, memberIds: string[]): void {
-  createConversation(title, memberIds);
+function onCreateConversation(title: string, memberIds: string[]): Promise<boolean> {
+  return performControl(() => createConversation(title, memberIds));
 }
 
-function onCreateDirectConversation(peerUserId: string): void {
-  createDirectConversation(peerUserId);
+function onCreateDirectConversation(peerUserId: string): Promise<boolean> {
+  return performControl(() => createDirectConversation(peerUserId));
 }
 
 function parseMemberDraft(): string[] {
@@ -364,12 +466,15 @@ function parseMemberDraft(): string[] {
     .filter(Boolean);
 }
 
-function onAddMembers(): void {
+async function onAddMembers(): Promise<void> {
   const members = parseMemberDraft();
   if (!session.activeConversationId || members.length === 0) {
     return;
   }
-  if (addMembers(session.activeConversationId, members)) {
+  const conversationId = session.activeConversationId;
+  const draft = memberDraft.value;
+  if (await performControl(() => addMembers(conversationId, members))
+    && session.activeConversationId === conversationId && memberDraft.value === draft) {
     memberDraft.value = '';
   }
 }
@@ -378,14 +483,14 @@ function onRemoveMember(memberId: string): void {
   if (!session.activeConversationId || !memberId) {
     return;
   }
-  removeMembers(session.activeConversationId, [memberId]);
+  void performControl(() => removeMembers(session.activeConversationId, [memberId]));
 }
 
 function onLeaveConversation(): void {
   if (!session.activeConversationId) {
     return;
   }
-  leaveConversation(session.activeConversationId);
+  void performControl(() => leaveConversation(session.activeConversationId));
 }
 
 function onRenameConversation(): void {
@@ -393,16 +498,11 @@ function onRenameConversation(): void {
   if (!session.activeConversationId || !title) {
     return;
   }
-  renameConversation(session.activeConversationId, title);
+  void performControl(() => renameConversation(session.activeConversationId, title));
 }
 
-function onJoinConversation(conversationId: string): void {
-  if (!conversationId) {
-    return;
-  }
-  if (joinConversation(conversationId)) {
-    showNotice('已发送加群请求');
-  }
+function onJoinConversation(conversationId: string): Promise<boolean> {
+  return performControl(() => joinConversation(conversationId));
 }
 
 async function onSend(text: string, burnMode: number, burnTtlSec: number): Promise<boolean> {
@@ -426,7 +526,7 @@ async function onRetryMessage(clientMsgId: string): Promise<void> {
 }
 
 function onRecall(conversationId: string, messageId: string): void {
-  recallMessage(conversationId, messageId);
+  if (!hasPendingRecall.value) void performControl(() => recallMessage(conversationId, messageId));
 }
 
 function onFillDownload(fileId: string): void {
@@ -468,6 +568,10 @@ async function onFileAction(clientFileId: string, cancel: boolean): Promise<void
 </script>
 
 <style scoped>
+.control-write-list { display: grid; gap: 8px; max-height: 240px; overflow-y: auto; }
+.control-write-card { display: grid; gap: 4px; padding: 8px; border: 1px solid #d9e1ea; border-radius: 8px;
+  background: white; font-size: 12px; overflow-wrap: anywhere; }
+.control-write-error { color: #b42318; }
 .file-task-card { padding: 8px 0; overflow-wrap: anywhere; }
 .file-task-card button { margin-top: 6px; margin-right: 6px; }
 .chat-pane.has-pending-messages { grid-template-rows: auto minmax(0, 1fr) auto auto; }

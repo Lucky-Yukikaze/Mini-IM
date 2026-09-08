@@ -1,6 +1,7 @@
 ﻿import { defineStore } from 'pinia';
 import type {
   ConnectionState,
+  ControlWriteItem,
   ConversationItem,
   InitialStatePayload,
   FileProgressItem,
@@ -18,6 +19,7 @@ interface SessionStoreState {
   conversations: ConversationItem[];
   messageSends: MessageSendItem[];
   fileTasks: FileTaskItem[];
+  controlWrites: ControlWriteItem[];
   activeConversationId: string;
   activeConversationLabel: string;
   messagesByConversation: Record<string, MessageItem[]>;
@@ -129,6 +131,7 @@ export const useSessionStore = defineStore('session', {
     conversations: [],
     messageSends: [],
     fileTasks: [],
+    controlWrites: [],
     activeConversationId: '',
     activeConversationLabel: '-',
     messagesByConversation: {},
@@ -161,6 +164,9 @@ export const useSessionStore = defineStore('session', {
       this.activeConversationId = conversationId;
       this.activeConversationLabel = getConversationLabel(this.conversations, conversationId, this.currentUserId);
     },
+    applyControlWrites(items: ControlWriteItem[]): void {
+      this.controlWrites = items;
+    },
     applyFileTasks(items: FileTaskItem[]): void {
       this.fileTasks = items;
     },
@@ -186,6 +192,9 @@ export const useSessionStore = defineStore('session', {
       }
       if (payload.readProgressByConversation !== undefined) {
         this.readProgressByConversation = payload.readProgressByConversation;
+      }
+      if (payload.controlWrites !== undefined) {
+        this.applyControlWrites(payload.controlWrites);
       }
       if (payload.fileTasks !== undefined) {
         this.applyFileTasks(payload.fileTasks);

@@ -55,6 +55,7 @@
             <button
               v-if="item.senderId === currentUserId && !item.recalled"
               class="text-button"
+              :disabled="recallDisabled"
               @click="$emit('recall', item.conversationId, item.id)"
             >
               撤回
@@ -93,6 +94,7 @@ const props = defineProps<{
   conversationType: 'direct' | 'group' | '';
   currentUserId: string;
   messages: MessageItem[];
+  recallDisabled: boolean;
 }>();
 
 defineEmits<{

@@ -144,3 +144,23 @@ test('native file tasks restore their intent and clear on account switch or nati
   session.applyFileTasks([]);
   assert.deepEqual(session.fileTasks, []);
 });
+
+test('control operations restore, remain until native replacement, and isolate accounts', () => {
+  const session = createSession();
+  const pending = { requestId: 'control-1', conversationId: 'private', clientConvId: '',
+    operation: 'rename_conversation' as const, status: 'pending' as const, code: 0, error: '',
+    entityId: '', createdAtMs: 1, attempts: 1 };
+  const failed = { ...pending, requestId: 'control-2', operation: 'add_members' as const,
+    status: 'failed' as const, code: 403, error: 'denied' };
+  session.applyInitialState({ currentUser: { userId: 'alice' }, controlWrites: [pending, failed] });
+  session.applyInitialState({ currentUser: { userId: 'alice' }, globalCursor: 10 });
+  assert.deepEqual(session.controlWrites.map(item => item.requestId), ['control-1', 'control-2']);
+  session.applyControlWrites([failed]);
+  assert.equal(session.controlWrites[0].error, 'denied');
+  session.applyInitialState({ currentUser: { userId: 'bob' } });
+  assert.deepEqual(session.controlWrites, []);
+  session.applyInitialState({ currentUser: { userId: 'alice' }, controlWrites: [failed] });
+  assert.equal(session.controlWrites[0].requestId, 'control-2');
+  session.applyControlWrites([]);
+  assert.deepEqual(session.controlWrites, []);
+});
