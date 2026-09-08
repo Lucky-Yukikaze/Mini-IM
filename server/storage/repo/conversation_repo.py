@@ -234,7 +234,7 @@ class ConversationRepo:
             sync_events = AppendSyncEvents(
                 connection, record.member_ids, record.conversation_id,
                 "conversation_updated", conversation_updated, now_ms,
-            )
+            ) if created else []
 
         return CreateConversationResult(
             conversation=conversation_updated,

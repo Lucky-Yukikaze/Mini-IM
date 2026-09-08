@@ -29,12 +29,14 @@ from protocol.pb import common_pb2, message_pb2
 from quic.server import FaultConfig, MiniImQuicProtocol, OnlineSessionHub, ensure_dev_cert
 from services.auth.service import AuthService
 from services.conversation.service import ConversationService
+from services.control.service import ControlWriteService
 from services.delivery.service import DeliveryService
 from services.file.service import FileService
 from services.message.service import MessageService, SendMessageResult
 from services.sync.service import SyncService
 from storage.repo import ConversationRepo, DeliveryRepo, FileRepo, MessageRepo, SyncRepo
 from storage.sqlite.db import MiniImSqliteDb
+from storage.repo.control_write_repo import ControlWriteRepo
 from storage.sqlite.init_db import init_db
 
 
@@ -303,7 +305,8 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
             create_protocol=lambda *args, **kwargs: TestProtocol(
                 *args, scenario=self, auth_service=auth,
                 conversation_service=ConversationService(conversations),
-                delivery_service=DeliveryService(deliveries),
+                control_write_service=ControlWriteService(
+                    ControlWriteRepo(self.db), ConversationService(conversations), DeliveryService(deliveries)),
                 file_service=self.files, message_service=RecordingMessageService(messages, conversations, scenario=self),
                 sync_service=SyncService(SyncRepo(self.db)), online_hub=self.hub, fault_config=self.fault, **kwargs,
             ),

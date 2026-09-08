@@ -8,6 +8,17 @@ CREATE TABLE IF NOT EXISTS users (
   created_at_ms INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS control_write_results (
+  user_id TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  fingerprint BLOB NOT NULL,
+  ack BLOB NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (user_id, request_id),
+  FOREIGN KEY (user_id) REFERENCES users(user_id)
+);
+
 CREATE TABLE IF NOT EXISTS devices (
   device_id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,

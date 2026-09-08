@@ -29,16 +29,22 @@ class MiniImSqliteDb:
     def transaction(self):
         """Keep nested repository operations inside their caller's transaction."""
         connection = self.m_connection
+        outermost = not connection.in_transaction
         savepoint = "miniim_" + uuid.uuid4().hex
         connection.execute(f"SAVEPOINT {savepoint}")
         try:
             yield connection
+            connection.execute(f"RELEASE SAVEPOINT {savepoint}")
         except BaseException:
-            connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-            connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            # RELEASE of the outermost savepoint commits and can itself fail (for example SQLITE_BUSY).
+            # Some SQLite errors already roll back the whole transaction; do not mask those errors.
+            if connection.in_transaction:
+                if outermost:
+                    connection.rollback()
+                else:
+                    connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    connection.execute(f"RELEASE SAVEPOINT {savepoint}")
             raise
-        else:
-            connection.execute(f"RELEASE SAVEPOINT {savepoint}")
 
     def execute_fetchone(self, sql: str, params: tuple[object, ...] = ()) -> sqlite3.Row | None:
         cursor = self.m_connection.execute(sql, params)

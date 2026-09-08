@@ -61,13 +61,15 @@ Web 按 web/src/api、store、components、views、events、types 分职责。
 - Protobuf 定义在 proto/；字段号不可重用，兼容扩展用新字段；生成文件通过工具生成。
 - 幂等 = 同一个写入意图重复执行，不增加重复业务实体或重复业务效果。
 - request_id 标识请求；client_msg_id、client_conv_id、client_file_id 分别标识消息、建会话、文件意图。
-  重试复用原 ID；新的用户意图使用新 ID。请求 ID 在会话内唯一，避免仅靠毫秒时间戳。
+  重试复用原 ID；新的用户意图使用新 ID。请求 ID 在同一用户的设备和历次会话间唯一，避免仅靠毫秒时间戳。
 - event_id 是一次事件的稳定标识，在单用户同步流内唯一；在线推送与历史重放必须一致。
 - 消息的 conversation_seq 用于会话内排序，SyncEvent.global_seq 是事件在单用户全局同步流中的位置；
   event_id 用于去重。客户端事件去重集中在 Qt 核心，禁止直接用请求序号推进同步位置。
 - 同步游标 = 已完整应用并保存的连续事件位置；不能因为收到更大的在线事件位置而跳过未处理历史。
 - ACK = 服务端处理请求后返回的应用确认；成功 ACK 必须晚于相应业务事务提交。
   QUIC 到达确认、应用 ACK、已读等业务确认分别处理，不混用。
+- 控制写入的请求结果与业务变化、同步事件共同提交；同一用户复用请求 ID 时核对操作和内容，
+  重放返回原结果，不重复执行已处理操作；认证会话标识不参与持久去重键。
 - 收到重复 ACK、断连和进程重启时，待确认写入仍须可恢复并使用原意图重试。
 
 四条底线：传输层负责到达，应用层负责语义，每个写操作可重试，每个状态可恢复。
@@ -91,7 +93,7 @@ Web 按 web/src/api、store、components、views、events、types 分职责。
   不把“服务端写入成功”当成“客户端已收到”。
 
 核心表按实现演进：users、devices、sessions、conversations、conversation_create_requests、
-conversation_members、messages、message_deliveries、message_read_counters、attachments、
+control_write_results、conversation_members、messages、message_deliveries、message_read_counters、attachments、
 file_transfers、sync_events、sync_cursors。
 
 ## 已读、撤回与焚毁

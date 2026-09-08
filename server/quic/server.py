@@ -1,6 +1,7 @@
 import asyncio
 import os
 import random
+import sqlite3
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -20,12 +21,14 @@ from protocol.codec import EnvelopeCodec
 from protocol.pb import common_pb2, auth_pb2, conversation_pb2, envelope_pb2, file_pb2, message_pb2, sync_pb2
 from services.auth.service import AuthService
 from services.conversation.service import ConversationService
+from services.control.service import ControlWriteService
 from services.delivery.service import DeliveryService
 from services.file.service import FileService
 from services.message.service import MessageService
 from services.sync.service import SyncService
 from storage.repo import ConversationRepo, DeliveryRepo, FileRepo, MessageRepo, StoredSyncEvent, SyncRepo
 from storage.sqlite.db import MiniImSqliteDb
+from storage.repo.control_write_repo import ControlWriteRepo
 from storage.sqlite.init_db import init_db
 from storage.sqlite.write_queue import SqliteWriteQueue
 
@@ -83,7 +86,7 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
         *args,
         auth_service: AuthService,
         conversation_service: ConversationService,
-        delivery_service: DeliveryService,
+        control_write_service: ControlWriteService,
         file_service: FileService,
         message_service: MessageService,
         sync_service: SyncService,
@@ -94,7 +97,7 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
         super().__init__(*args, **kwargs)
         self.m_auth_service = auth_service
         self.m_conversation_service = conversation_service
-        self.m_delivery_service = delivery_service
+        self.m_control_writes = control_write_service
         self.m_file_service = file_service
         self.m_message_service = message_service
         self.m_sync_service = sync_service
@@ -363,96 +366,13 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
                 self.m_online_hub.fanout_sync_events(result.sync_events, exclude_protocol=self)
                 continue
 
-            if envelope.HasField("create_conversation"):
-                result = self.m_conversation_service.handle_create_conversation(
-                    user_id=session.user_id,
-                    request_id=envelope.request_id,
-                    create_conversation=envelope.create_conversation,
-                )
-                ack_envelope = self._new_response_from_request(envelope)
-                ack_envelope.ack.CopyFrom(result.ack)
-                self._send(event.stream_id, ack_envelope)
-                self.m_online_hub.fanout_sync_events(result.sync_events)
-                continue
-
-            if envelope.HasField("add_members"):
-                result = self.m_conversation_service.handle_add_members(
-                    user_id=session.user_id,
-                    request_id=envelope.request_id,
-                    add_members=envelope.add_members,
-                )
-                ack_envelope = self._new_response_from_request(envelope)
-                ack_envelope.ack.CopyFrom(result.ack)
-                self._send(event.stream_id, ack_envelope)
-                self.m_online_hub.fanout_sync_events(result.sync_events)
-                continue
-
-            if envelope.HasField("remove_members"):
-                result = self.m_conversation_service.handle_remove_members(
-                    user_id=session.user_id,
-                    request_id=envelope.request_id,
-                    remove_members=envelope.remove_members,
-                )
-                ack_envelope = self._new_response_from_request(envelope)
-                ack_envelope.ack.CopyFrom(result.ack)
-                self._send(event.stream_id, ack_envelope)
-                self.m_online_hub.fanout_sync_events(result.sync_events)
-                continue
-
-            if envelope.HasField("leave_conversation"):
-                result = self.m_conversation_service.handle_leave_conversation(
-                    user_id=session.user_id,
-                    request_id=envelope.request_id,
-                    leave_conversation=envelope.leave_conversation,
-                )
-                ack_envelope = self._new_response_from_request(envelope)
-                ack_envelope.ack.CopyFrom(result.ack)
-                self._send(event.stream_id, ack_envelope)
-                self.m_online_hub.fanout_sync_events(result.sync_events)
-                continue
-
-            if envelope.HasField("join_conversation"):
-                result = self.m_conversation_service.handle_join_conversation(
-                    user_id=session.user_id,
-                    request_id=envelope.request_id,
-                    join_conversation=envelope.join_conversation,
-                )
-                ack_envelope = self._new_response_from_request(envelope)
-                ack_envelope.ack.CopyFrom(result.ack)
-                self._send(event.stream_id, ack_envelope)
-                self.m_online_hub.fanout_sync_events(result.sync_events)
-                continue
-
-            if envelope.HasField("rename_conversation"):
-                result = self.m_conversation_service.handle_rename_conversation(
-                    user_id=session.user_id,
-                    request_id=envelope.request_id,
-                    rename_conversation=envelope.rename_conversation,
-                )
-                ack_envelope = self._new_response_from_request(envelope)
-                ack_envelope.ack.CopyFrom(result.ack)
-                self._send(event.stream_id, ack_envelope)
-                self.m_online_hub.fanout_sync_events(result.sync_events)
-                continue
-
-            if envelope.HasField("receipt"):
-                result = self.m_delivery_service.handle_receipt(
-                    user_id=session.user_id,
-                    request_id=envelope.request_id,
-                    receipt=envelope.receipt,
-                )
-                ack_envelope = self._new_response_from_request(envelope)
-                ack_envelope.ack.CopyFrom(result.ack)
-                self._send(event.stream_id, ack_envelope)
-                self.m_online_hub.fanout_sync_events(result.sync_events)
-                continue
-
-            if envelope.HasField("recall"):
-                result = self.m_delivery_service.handle_recall(
-                    user_id=session.user_id,
-                    request_id=envelope.request_id,
-                    recall=envelope.recall,
-                )
+            if self.m_control_writes.handles(envelope):
+                try:
+                    result = self.m_control_writes.handle(session.user_id, envelope)
+                except sqlite3.Error as error:
+                    self._debug(f"control write transaction failed: {error}")
+                    self._send_error(event.stream_id, envelope, 503, "control write could not be committed")
+                    continue
                 ack_envelope = self._new_response_from_request(envelope)
                 ack_envelope.ack.CopyFrom(result.ack)
                 self._send(event.stream_id, ack_envelope)
@@ -616,6 +536,7 @@ async def run_server() -> None:
     file_repo = FileRepo(db)
     conversation_service = ConversationService(conversation_repo)
     delivery_service = DeliveryService(delivery_repo)
+    control_write_service = ControlWriteService(ControlWriteRepo(db), conversation_service, delivery_service)
     file_service = FileService(
         file_repo,
         conversation_repo,
@@ -639,7 +560,7 @@ async def run_server() -> None:
             *args,
             auth_service=auth_service,
             conversation_service=conversation_service,
-            delivery_service=delivery_service,
+            control_write_service=control_write_service,
             file_service=file_service,
             message_service=message_service,
             sync_service=sync_service,
