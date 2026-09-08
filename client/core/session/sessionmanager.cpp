@@ -58,6 +58,9 @@ MiniImSessionManager::MiniImSessionManager(QObject* parent)
           [this](const QString& id) { return makeRequestEnvelope(id, im::common::CHANNEL_FILE); },
           [this](const std::string& payload) { return sendEnvelope(payload); },
           [this](const QString& suffix) { return makeRequestId(suffix); }),
+      m_controlWrites(m_stateStore.controlWrites(),
+          [this](im::envelope::Envelope envelope) { return sendQueuedControl(std::move(envelope)); },
+          [this]() { return makeRequestId(QStringLiteral("control")); }),
       m_connected(false),
       m_connecting(false),
       m_hello_sent(false),
@@ -65,6 +68,16 @@ MiniImSessionManager::MiniImSessionManager(QObject* parent)
       m_heartbeat_interval_sec(kDefaultHeartbeatIntervalSec)
 {
     connectFileSignals();
+    QObject::connect(&m_controlWrites, &MiniImControlWriteCoordinator::writesChanged,
+        this, &MiniImSessionManager::controlWritesChanged);
+    QObject::connect(&m_controlWrites, &MiniImControlWriteCoordinator::errorRaised,
+        this, &MiniImSessionManager::errorRaised);
+    QObject::connect(&m_controlWrites, &MiniImControlWriteCoordinator::failed,
+        this, &MiniImSessionManager::disconnectFromServer);
+    QObject::connect(&m_sync, &MiniImSyncCoordinator::readinessChanged,
+        &m_controlWrites, &MiniImControlWriteCoordinator::setSyncReady);
+    QObject::connect(&m_sync, &MiniImSyncCoordinator::ready,
+        &m_controlWrites, &MiniImControlWriteCoordinator::pump);
     QObject::connect(&m_sync, &MiniImSyncCoordinator::eventApplied, this,
         &MiniImSessionManager::onSyncEventApplied);
     QObject::connect(&m_sync, &MiniImSyncCoordinator::stateApplied, this,
@@ -314,6 +327,7 @@ void MiniImSessionManager::onTransportDisconnected()
 
 void MiniImSessionManager::resetRuntimeState()
 {
+    m_controlWrites.stop();
     m_files.stop();
     m_sync.stop();
     m_messageRetryTimer.stop();
@@ -605,6 +619,17 @@ void MiniImSessionManager::handleMessageResult(
     }
 }
 
+bool MiniImSessionManager::sendQueuedControl(im::envelope::Envelope envelope)
+{
+    envelope.set_version(1);
+    envelope.set_channel(im::common::CHANNEL_CONTROL);
+    envelope.set_session_id(m_session_id.toStdString());
+    envelope.set_device_id(m_device_id.toStdString());
+    envelope.set_seq(++m_seq);
+    envelope.set_trace_id(envelope.request_id());
+    return sendEnvelope(envelope.SerializeAsString());
+}
+
 bool MiniImSessionManager::createConversation(
     const QString& client_conv_id,
     const QString& title,
@@ -616,17 +641,6 @@ bool MiniImSessionManager::createConversation(
     }
 
     im::envelope::Envelope envelope;
-    const auto now_ms = QDateTime::currentMSecsSinceEpoch();
-    const QString request_id = makeRequestId(QStringLiteral("conv"));
-
-    envelope.set_version(1);
-    envelope.set_request_id(request_id.toStdString());
-    envelope.set_channel(im::common::CHANNEL_CONTROL);
-    envelope.set_session_id(m_session_id.toStdString());
-    envelope.set_device_id(m_device_id.toStdString());
-    envelope.set_seq(++m_seq);
-    envelope.set_client_time_ms(now_ms);
-    envelope.set_trace_id(request_id.toStdString());
 
     auto* create_conversation = envelope.mutable_create_conversation();
     create_conversation->set_client_conv_id(client_conv_id.toStdString());
@@ -641,7 +655,7 @@ bool MiniImSessionManager::createConversation(
         }
     }
 
-    return sendEnvelope(envelope.SerializeAsString());
+    return m_controlWrites.enqueue(envelope);
 }
 
 bool MiniImSessionManager::createDirectConversation(const QString& client_conv_id, const QString& peer_user_id)
@@ -652,17 +666,6 @@ bool MiniImSessionManager::createDirectConversation(const QString& client_conv_i
     }
 
     im::envelope::Envelope envelope;
-    const auto now_ms = QDateTime::currentMSecsSinceEpoch();
-    const QString request_id = makeRequestId(QStringLiteral("direct"));
-
-    envelope.set_version(1);
-    envelope.set_request_id(request_id.toStdString());
-    envelope.set_channel(im::common::CHANNEL_CONTROL);
-    envelope.set_session_id(m_session_id.toStdString());
-    envelope.set_device_id(m_device_id.toStdString());
-    envelope.set_seq(++m_seq);
-    envelope.set_client_time_ms(now_ms);
-    envelope.set_trace_id(request_id.toStdString());
 
     auto* create_conversation = envelope.mutable_create_conversation();
     create_conversation->set_client_conv_id(client_conv_id.toStdString());
@@ -670,7 +673,7 @@ bool MiniImSessionManager::createDirectConversation(const QString& client_conv_i
     create_conversation->set_title(QString().toStdString());
     create_conversation->add_member_ids(peer_user_id.trimmed().toStdString());
 
-    return sendEnvelope(envelope.SerializeAsString());
+    return m_controlWrites.enqueue(envelope);
 }
 
 bool MiniImSessionManager::addMembers(const QString& conversation_id, const QVariantList& member_ids)
@@ -681,17 +684,6 @@ bool MiniImSessionManager::addMembers(const QString& conversation_id, const QVar
     }
 
     im::envelope::Envelope envelope;
-    const auto now_ms = QDateTime::currentMSecsSinceEpoch();
-    const QString request_id = makeRequestId(QStringLiteral("addmembers"));
-
-    envelope.set_version(1);
-    envelope.set_request_id(request_id.toStdString());
-    envelope.set_channel(im::common::CHANNEL_CONTROL);
-    envelope.set_session_id(m_session_id.toStdString());
-    envelope.set_device_id(m_device_id.toStdString());
-    envelope.set_seq(++m_seq);
-    envelope.set_client_time_ms(now_ms);
-    envelope.set_trace_id(request_id.toStdString());
 
     auto* add_members = envelope.mutable_add_members();
     add_members->set_conversation_id(conversation_id.toStdString());
@@ -704,7 +696,7 @@ bool MiniImSessionManager::addMembers(const QString& conversation_id, const QVar
         }
     }
 
-    return sendEnvelope(envelope.SerializeAsString());
+    return m_controlWrites.enqueue(envelope);
 }
 
 bool MiniImSessionManager::removeMembers(const QString& conversation_id, const QVariantList& member_ids)
@@ -715,17 +707,6 @@ bool MiniImSessionManager::removeMembers(const QString& conversation_id, const Q
     }
 
     im::envelope::Envelope envelope;
-    const auto now_ms = QDateTime::currentMSecsSinceEpoch();
-    const QString request_id = makeRequestId(QStringLiteral("removemembers"));
-
-    envelope.set_version(1);
-    envelope.set_request_id(request_id.toStdString());
-    envelope.set_channel(im::common::CHANNEL_CONTROL);
-    envelope.set_session_id(m_session_id.toStdString());
-    envelope.set_device_id(m_device_id.toStdString());
-    envelope.set_seq(++m_seq);
-    envelope.set_client_time_ms(now_ms);
-    envelope.set_trace_id(request_id.toStdString());
 
     auto* remove_members = envelope.mutable_remove_members();
     remove_members->set_conversation_id(conversation_id.toStdString());
@@ -738,7 +719,7 @@ bool MiniImSessionManager::removeMembers(const QString& conversation_id, const Q
         }
     }
 
-    return sendEnvelope(envelope.SerializeAsString());
+    return m_controlWrites.enqueue(envelope);
 }
 
 bool MiniImSessionManager::leaveConversation(const QString& conversation_id)
@@ -749,20 +730,9 @@ bool MiniImSessionManager::leaveConversation(const QString& conversation_id)
     }
 
     im::envelope::Envelope envelope;
-    const auto now_ms = QDateTime::currentMSecsSinceEpoch();
-    const QString request_id = makeRequestId(QStringLiteral("leaveconv"));
-
-    envelope.set_version(1);
-    envelope.set_request_id(request_id.toStdString());
-    envelope.set_channel(im::common::CHANNEL_CONTROL);
-    envelope.set_session_id(m_session_id.toStdString());
-    envelope.set_device_id(m_device_id.toStdString());
-    envelope.set_seq(++m_seq);
-    envelope.set_client_time_ms(now_ms);
-    envelope.set_trace_id(request_id.toStdString());
 
     envelope.mutable_leave_conversation()->set_conversation_id(conversation_id.toStdString());
-    return sendEnvelope(envelope.SerializeAsString());
+    return m_controlWrites.enqueue(envelope);
 }
 
 bool MiniImSessionManager::joinConversation(const QString& conversation_id)
@@ -773,20 +743,9 @@ bool MiniImSessionManager::joinConversation(const QString& conversation_id)
     }
 
     im::envelope::Envelope envelope;
-    const auto now_ms = QDateTime::currentMSecsSinceEpoch();
-    const QString request_id = makeRequestId(QStringLiteral("joinconv"));
-
-    envelope.set_version(1);
-    envelope.set_request_id(request_id.toStdString());
-    envelope.set_channel(im::common::CHANNEL_CONTROL);
-    envelope.set_session_id(m_session_id.toStdString());
-    envelope.set_device_id(m_device_id.toStdString());
-    envelope.set_seq(++m_seq);
-    envelope.set_client_time_ms(now_ms);
-    envelope.set_trace_id(request_id.toStdString());
 
     envelope.mutable_join_conversation()->set_conversation_id(conversation_id.toStdString());
-    return sendEnvelope(envelope.SerializeAsString());
+    return m_controlWrites.enqueue(envelope);
 }
 
 bool MiniImSessionManager::renameConversation(const QString& conversation_id, const QString& title)
@@ -797,22 +756,11 @@ bool MiniImSessionManager::renameConversation(const QString& conversation_id, co
     }
 
     im::envelope::Envelope envelope;
-    const auto now_ms = QDateTime::currentMSecsSinceEpoch();
-    const QString request_id = makeRequestId(QStringLiteral("renameconv"));
-
-    envelope.set_version(1);
-    envelope.set_request_id(request_id.toStdString());
-    envelope.set_channel(im::common::CHANNEL_CONTROL);
-    envelope.set_session_id(m_session_id.toStdString());
-    envelope.set_device_id(m_device_id.toStdString());
-    envelope.set_seq(++m_seq);
-    envelope.set_client_time_ms(now_ms);
-    envelope.set_trace_id(request_id.toStdString());
 
     auto* rename_conversation = envelope.mutable_rename_conversation();
     rename_conversation->set_conversation_id(conversation_id.toStdString());
     rename_conversation->set_title(title.toStdString());
-    return sendEnvelope(envelope.SerializeAsString());
+    return m_controlWrites.enqueue(envelope);
 }
 
 bool MiniImSessionManager::sendReceipt(const QString& conversation_id, quint64 last_read_seq)
@@ -823,23 +771,12 @@ bool MiniImSessionManager::sendReceipt(const QString& conversation_id, quint64 l
     }
 
     im::envelope::Envelope envelope;
-    const auto now_ms = QDateTime::currentMSecsSinceEpoch();
-    const QString request_id = makeRequestId(QStringLiteral("receipt"));
-
-    envelope.set_version(1);
-    envelope.set_request_id(request_id.toStdString());
-    envelope.set_channel(im::common::CHANNEL_CONTROL);
-    envelope.set_session_id(m_session_id.toStdString());
-    envelope.set_device_id(m_device_id.toStdString());
-    envelope.set_seq(++m_seq);
-    envelope.set_client_time_ms(now_ms);
-    envelope.set_trace_id(request_id.toStdString());
 
     auto* receipt = envelope.mutable_receipt();
     receipt->set_conversation_id(conversation_id.toStdString());
     receipt->set_last_read_seq(last_read_seq);
 
-    return sendEnvelope(envelope.SerializeAsString());
+    return m_controlWrites.enqueue(envelope);
 }
 
 bool MiniImSessionManager::recallMessage(const QString& conversation_id, const QString& message_id)
@@ -850,23 +787,12 @@ bool MiniImSessionManager::recallMessage(const QString& conversation_id, const Q
     }
 
     im::envelope::Envelope envelope;
-    const auto now_ms = QDateTime::currentMSecsSinceEpoch();
-    const QString request_id = makeRequestId(QStringLiteral("recall"));
-
-    envelope.set_version(1);
-    envelope.set_request_id(request_id.toStdString());
-    envelope.set_channel(im::common::CHANNEL_CONTROL);
-    envelope.set_session_id(m_session_id.toStdString());
-    envelope.set_device_id(m_device_id.toStdString());
-    envelope.set_seq(++m_seq);
-    envelope.set_client_time_ms(now_ms);
-    envelope.set_trace_id(request_id.toStdString());
 
     auto* recall = envelope.mutable_recall();
     recall->set_conversation_id(conversation_id.toStdString());
     recall->set_message_id(message_id.toStdString());
 
-    return sendEnvelope(envelope.SerializeAsString());
+    return m_controlWrites.enqueue(envelope);
 }
 
 bool MiniImSessionManager::sendFile(const QString& conversation_id, const QString& file_path, quint32 priority)
@@ -971,6 +897,7 @@ void MiniImSessionManager::handleIncomingEnvelope(const QByteArray& payload)
             disconnectFromServer();
             return;
         }
+        m_controlWrites.start();
         m_files.start(initial.value(QStringLiteral("files")).toList());
         emit initialStateLoaded(initial);
         m_heartbeat_timer.start(m_heartbeat_interval_sec * 1000);
@@ -998,6 +925,8 @@ void MiniImSessionManager::handleIncomingEnvelope(const QByteArray& payload)
                 emit errorRaised(m_stateStore.errorString());
             }
         }
+        m_controlWrites.handleResult(request_id, ack.success(), ack.code(),
+            QString::fromStdString(ack.message()), QString::fromStdString(ack.entity_id()));
         m_files.handleAck(ack);
         if (!ack.success())
         {
@@ -1022,6 +951,8 @@ void MiniImSessionManager::handleIncomingEnvelope(const QByteArray& payload)
         {
             restartConnection(QStringLiteral("session rejected; reconnecting"), true);
         }
+        m_controlWrites.handleResult(QString::fromStdString(envelope.request_id()), false, error.code(),
+            QString::fromStdString(error.message()), QString());
         m_files.handleFileResult(QString::fromStdString(envelope.request_id()), false, error.code(),
             QString::fromStdString(error.message()), QString());
         handleMessageResult(QString::fromStdString(envelope.request_id()), false, error.code(),

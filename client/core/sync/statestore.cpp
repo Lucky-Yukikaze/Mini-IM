@@ -41,6 +41,7 @@ MiniImStateStore::~MiniImStateStore()
 
 void MiniImStateStore::close()
 {
+    m_controlWrites.close();
     m_fileTasks.close();
     m_outbox.close();
     if (!m_name.isEmpty())
@@ -104,6 +105,7 @@ bool MiniImStateStore::open(const QString& root, const QString& endpoint, const 
         run(QStringLiteral("CREATE INDEX IF NOT EXISTS objects_conversation ON objects(kind,conversation)"));
         m_outbox.open(m_db);
         m_fileTasks.open(m_db);
+        m_controlWrites.open(m_db);
         m_cursor = metadata(QStringLiteral("cursor")).toULongLong();
         return true;
     }
@@ -358,7 +360,8 @@ QVariantMap MiniImStateStore::snapshot() const
         }
         return {{"currentUser", QVariantMap{{"userId", m_user}}}, {"globalCursor", QVariant::fromValue(m_cursor)},
             {"conversations", conversations}, {"recentMessages", messages}, {"unreadTotal", unreadTotal},
-            {"readProgressByConversation", reads}, {"files", files}, {"messageSends", m_outbox.pending()}, {"fileTasks", m_fileTasks.pending()}};
+            {"readProgressByConversation", reads}, {"files", files}, {"messageSends", m_outbox.pending()}, {"fileTasks", m_fileTasks.pending()},
+            {"controlWrites", m_controlWrites.pending()}};
     }
     catch (const std::exception& error)
     {
@@ -384,3 +387,5 @@ MiniImFileTaskStore& MiniImStateStore::fileTasks()
 {
     return m_fileTasks;
 }
+
+MiniImControlWriteStore& MiniImStateStore::controlWrites() { return m_controlWrites; }

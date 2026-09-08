@@ -131,7 +131,7 @@ QWebChannel 方法调用是异步的，接口封装必须正确处理完成回�
 页面须在保存成功后再清空草稿，失败重试复用原发送意图；上传下载同样在任务保存成功后清空对应输入。
 
 Qt 事件采用 connectionChanged、initialStateLoaded、messagePushed、messageUpdated、
-conversationUpdated、syncProgress、messageSendsChanged、fileTasksChanged、fileProgress、errorRaised 等高层对象。
+conversationUpdated、syncProgress、messageSendsChanged、controlWritesChanged、fileTasksChanged、fileProgress、errorRaised 等高层对象。
 initialStateLoaded 的目标契约包含当前用户、会话、最近消息和未读数；
 实际是否满足契约以执行记录和测试为准，不把目标接口当成已经实现。
 

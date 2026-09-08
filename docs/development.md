@@ -58,7 +58,7 @@ npm --prefix ./web run build
 $env:QT_DIR = 'D:/Qt/6.11.0/msvc2022_64'
 $qtToolchain = Join-Path (Get-Location) 'thirdparty_install/vcpkg/scripts/buildsystems/vcpkg.cmake'
 cmake -S ./client -B ./build/client_qt611 -G "Visual Studio 17 2022" -A x64 "-DCMAKE_TOOLCHAIN_FILE=$qtToolchain" "-DVCPKG_TARGET_TRIPLET=x64-windows" "-DCMAKE_PREFIX_PATH=$env:QT_DIR" -DBUILD_TESTING=ON
-cmake --build ./build/client_qt611 --config Release --target mini_im_client mini_im_download_tests mini_im_upload_tests mini_im_state_tests mini_im_sync_tests mini_im_native_driver
+cmake --build ./build/client_qt611 --config Release --target mini_im_client mini_im_download_tests mini_im_upload_tests mini_im_state_tests mini_im_sync_tests mini_im_control_tests mini_im_native_driver
 & "$env:QT_DIR/bin/windeployqt.exe" --release --compiler-runtime --dir ./build/client_qt611/Release ./build/client_qt611/Release/mini_im_client.exe
 ~~~
 
@@ -125,7 +125,7 @@ npm --prefix ./web run dev -- --host 127.0.0.1 --port 5173 --strictPort
 
 退出或进程崩溃后，用同一服务端地址、用户和设备重新连接，Qt 会在同步追平后继续待确认消息。
 网络断开后由 Qt 自动重新连接；点击“断开”会取消正在等待或尝试的重连。
-文件恢复方式见下节；建会话、成员变更、已读和撤回仍需补齐跨重启恢复。
+其他业务操作见 [控制写入与重试边界](#控制写入与重试边界)，文件恢复方式见文件任务一节。
 未连接时暂不接收新的发送意图。
 
 | 情况 | 当前处理 |
@@ -156,8 +156,20 @@ npm --prefix ./web run dev -- --host 127.0.0.1 --port 5173 --strictPort
 业务变化、同步事件和请求结果共同提交后发送确认；写入或最终提交失败返回 503，回滚后允许原请求重试。
 确定的业务失败也保存原确认；之后权限变化不会使旧失败请求自动变成新操作。
 结果记录当前随数据库保留，未实现自动清理；升级前未记录的历史请求无法补建原确认。
-客户端这些操作的本地保存、自动重试和页面完成回调尚未接入，验收状态见
-[控制写入批次](refactoring-progress.md#控制写入持久去重与事务失败回滚--2026-09-08)。
+客户端已通过 [控制写入协调](../client/core/session/writecoordinator.cpp) 和
+[控制写入存储](../client/core/session/writestore.cpp) 保存这些操作；原生方法返回成功表示本地保存完成。
+同步追平后按控制队列顺序发送，同时等待 1 个请求；独立计时器每 500 毫秒检查，
+距上次尝试至少 5000 毫秒才重试。队列与消息、文件任务共用按地址、用户、设备隔离的数据库，
+本机断连或进程重启后沿用请求标识、原业务内容和首次时间，重新登录时更新认证会话。
+重复建会话在本地也核对原 `client_conv_id` 和内容，避免重复生成请求。
+
+保存失败返回拒绝；已保存但发送尝试或本地确认写入失败会保留原意图、停止队列并断开连接，
+恢复数据库后可重新连接。401、408、429 和不小于 500 的错误保留为待重试，确定失败保存原结果，
+后续新的用户操作使用新请求；重复确认不能改写已确认或确定失败的状态。
+`initialStateLoaded.controlWrites` 与 `controlWritesChanged` 提供待处理和失败操作、次数及原因，
+不向页面提供协议字节。原生保存/恢复已接入，页面完成回调和操作状态展示仍需完成。
+验证分别见 [服务端控制写入批次](refactoring-progress.md#控制写入持久去重与事务失败回滚--2026-09-08)
+和 [原生控制写入批次](refactoring-progress.md#原生控制写入队列与重启恢复--2026-09-08)。
 
 ## 同步补拉与等待
 
@@ -166,7 +178,7 @@ npm --prefix ./web run dev -- --host 127.0.0.1 --port 5173 --strictPort
 距上次发送至少 5000 毫秒才以原请求标识和相同内容重试。
 分页请求采用新的标识，从已提交的连续位置继续。
 
-在线事件和补拉事件共用状态存储；当前请求追平且没有缺失事件时，才继续消息与文件任务。
+在线事件和补拉事件共用状态存储；当前请求追平且没有缺失事件时，才继续消息、控制写入与文件任务。
 空页或无法推进连续位置的响应若仍有缺口，会报告 `unresolved gap` 并保留原请求重试；
 同一请求只报告一次该缺口。这个状态下发送意图仍保存在本地，不能直接清除缓存或推进位置。
 断开连接停止补拉；重新登录后读取已保存的位置并建立新请求。
@@ -233,13 +245,13 @@ Push-Location ./web
 & ./node_modules/.bin/vue-tsc.cmd --noEmit
 npm run build
 Pop-Location
-cmake --build ./build/client_qt611 --config Release --target mini_im_client mini_im_download_tests mini_im_upload_tests mini_im_state_tests mini_im_sync_tests mini_im_native_driver
+cmake --build ./build/client_qt611 --config Release --target mini_im_client mini_im_download_tests mini_im_upload_tests mini_im_state_tests mini_im_sync_tests mini_im_control_tests mini_im_native_driver
 ctest --test-dir ./build/client_qt611 -C Release --output-on-failure
 ~~~
 
 服务端测试包含业务与存储入口、使用真实 aioquic 发送器与受控确认的下载调度检查，
 以及 [控制写入网络测试](../server/tests/test_control_write_network.py) 的真实 QUIC 重连、确认丢失和提交失败回滚；
-页面测试检查状态合并；CTest 运行 Qt 下载、上传缓冲、同步协调和状态持久化测试，覆盖消息发送意图及文件任务。真实双客户端网络路径使用下述独立入口。
+页面测试检查状态合并；CTest 运行 Qt 下载、上传缓冲、同步协调、控制写入恢复和状态持久化测试，覆盖消息发送意图及文件任务。真实双客户端网络路径使用下述独立入口。
 类型检查失败、未完成的网络场景及性能测量统一记入执行记录。
 
 ## 真实原生客户端联调
@@ -260,7 +272,7 @@ ctest --test-dir ./build/client_qt611 -C Release --output-on-failure
 还覆盖文件原意图续传、完成确认丢失、源文件变化、任务排队、账号隔离和本机取消，
 以及下载或登录等待期间的正常进程退出与重新连接、跨页补拉和空同步页恢复；
 文件场景还注入仅消息发送尝试记录的写入错误，核对下载完成确认仍能重试；
-Vue 完整桌面页面、其他写入的跨重启恢复及并发性能需另外验收。
+Vue 完整桌面页面、真实服务端进程重启、多设备并发及传输性能需另外验收。
 可在上述联调命令后追加 `--test test_process_restart_fills_persisted_sync_gap` 单独复核一个场景，
 重复 `--test` 可选择多个场景；省略时执行全部。当前覆盖及运行结果统一见执行记录。
 

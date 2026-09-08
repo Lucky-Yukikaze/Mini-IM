@@ -36,7 +36,7 @@ from services.message.service import MessageService, SendMessageResult
 from services.sync.service import SyncService
 from storage.repo import ConversationRepo, DeliveryRepo, FileRepo, MessageRepo, SyncRepo
 from storage.sqlite.db import MiniImSqliteDb
-from storage.repo.control_write_repo import ControlWriteRepo
+from storage.repo.control_write_repo import ControlWriteRepo, ControlWriteResult
 from storage.sqlite.init_db import init_db
 
 
@@ -169,6 +169,12 @@ class TestProtocol(MiniImQuicProtocol):
         super().send_sync_event(event)
 
     def _send(self, stream_id, envelope):
+        if envelope.HasField("ack") and envelope.request_id in self.scenario.control_requests:
+            if self.scenario.drop_control_acks:
+                self.scenario.drop_control_acks -= 1
+                return
+            if self.scenario.duplicate_control_acks:
+                super()._send(stream_id, envelope)
         if envelope.HasField("ack") and envelope.ack.success:
             key = "filefinish" if "-filefinish-" in envelope.request_id else "fileinit"
             if ("-filefinish-" in envelope.request_id or "-fileinit-" in envelope.request_id
@@ -240,6 +246,25 @@ class RecordingMessageService(MessageService):
         return super().handle_send_message(user_id, request_id, send_message)
 
 
+class RecordingControlService(ControlWriteService):
+    def __init__(self, *args, scenario, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.scenario = scenario
+
+    def handle(self, user_id, envelope):
+        operation = envelope.WhichOneof("body")
+        self.scenario.control_requests.add(envelope.request_id)
+        self.scenario.control_attempts.append({
+            "user": user_id, "requestId": envelope.request_id, "operation": operation,
+            "body": getattr(envelope, operation).SerializeToString().hex(),
+        })
+        if self.scenario.reject_control_code:
+            return ControlWriteResult(message_pb2.Ack(
+                request_id=envelope.request_id, code=self.scenario.reject_control_code,
+                success=False, message="injected control write failure"), [])
+        return super().handle(user_id, envelope)
+
+
 class RecordingFileService(FileService):
     def __init__(self, *args, scenario, **kwargs):
         super().__init__(*args, **kwargs)
@@ -284,6 +309,11 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         self.pause_download_at = 0
         self.drop_file_acks = {}
         self.file_attempts = []
+        self.control_requests = set()
+        self.control_attempts = []
+        self.drop_control_acks = 0
+        self.duplicate_control_acks = False
+        self.reject_control_code = 0
         self.fault = FaultConfig()
         self.db_path = self.root / "test.db"
         init_db(self.db_path)
@@ -305,8 +335,8 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
             create_protocol=lambda *args, **kwargs: TestProtocol(
                 *args, scenario=self, auth_service=auth,
                 conversation_service=ConversationService(conversations),
-                control_write_service=ControlWriteService(
-                    ControlWriteRepo(self.db), ConversationService(conversations), DeliveryService(deliveries)),
+                control_write_service=RecordingControlService(
+                    ControlWriteRepo(self.db), ConversationService(conversations), DeliveryService(deliveries), scenario=self),
                 file_service=self.files, message_service=RecordingMessageService(messages, conversations, scenario=self),
                 sync_service=SyncService(SyncRepo(self.db)), online_hub=self.hub, fault_config=self.fault, **kwargs,
             ),
@@ -331,6 +361,8 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
 
     async def cleanup(self):
         errors = []
+        (self.output_dir / f"{self._testMethodName}-control-attempts.json").write_text(
+            json.dumps(self.control_attempts, indent=2), encoding="utf-8")
         (self.output_dir / f"{self._testMethodName}-sync-replies.json").write_text(
             json.dumps(self.sync_replies, indent=2), encoding="utf-8")
         (self.output_dir / f"{self._testMethodName}-file-attempts.json").write_text(
@@ -424,6 +456,135 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
     async def disconnect(self, client):
         mark = await client.command("disconnect")
         await client.wait("connection", lambda item: item["state"] == "disconnected", since=mark)
+
+    async def test_control_receipt_survives_restart_before_server_commit(self):
+        await self.alice.command("message", conversation=self.conversation, intent="unread-control", text="read me")
+        message = await self.bob.wait("message", lambda item: item["clientMsgId"] == "unread-control")
+        self.reject_control_code = 503
+        mark = await self.bob.command("receipt", conversation=self.conversation, seq=message["seq"])
+        await self.bob.wait("error", lambda item: "injected control write failure" in item["message"], since=mark)
+        original = [item for item in self.control_attempts if item["operation"] == "receipt"][-1]
+        await self.bob.crash()
+        self.reject_control_code = 0
+        mark = len(self.alice.events)
+        await self.restart_bob()
+        await self.alice.wait("update", lambda item: item["type"] == "receipt", since=mark, timeout=8)
+        attempts = [item for item in self.control_attempts if item["operation"] == "receipt"]
+        self.assertEqual(2, len(attempts))
+        self.assertEqual(original, attempts[-1])
+        self.assertEqual(message["seq"], self.db.execute_fetchone(
+            "SELECT last_read_seq FROM conversation_members WHERE conversation_id=? AND user_id='bob'",
+            (self.conversation,))[0])
+
+    async def test_control_timeout_retry_does_not_repeat_later_membership_changes(self):
+        mark = await self.alice.command("group", intent="control-group", title="members", members=["bob"])
+        group = (await self.alice.wait("conversation", lambda item: item["type"] == "group", since=mark))["conversationId"]
+        self.drop_control_acks = 1
+        self.duplicate_control_acks = True
+        mark = await self.bob.command("leave", conversation=group)
+        left = await self.bob.wait("conversation", lambda item: item["conversationId"] == group and "bob" not in item["memberIds"], since=mark)
+        await self.bob.command("join", conversation=group)
+        await self.bob.wait("control-writes", lambda item: item["items"] == [], since=mark, timeout=8)
+        joined = await self.bob.wait("conversation", lambda item: item["conversationId"] == group and "bob" in item["memberIds"], since=mark)
+        attempts = [item for item in self.control_attempts if item["user"] == "bob"]
+        self.assertEqual(["leave_conversation", "leave_conversation", "join_conversation"], [item["operation"] for item in attempts])
+        self.assertEqual(attempts[0], attempts[1])
+        self.assertNotEqual(attempts[1]["requestId"], attempts[2]["requestId"])
+        self.assertEqual(1, sum(item["event"] == "conversation" and item["data"] == left for item in self.bob.events))
+        self.assertIn("bob", joined["memberIds"])
+
+    async def test_control_create_lost_ack_restarts_without_duplicate_conversation_events(self):
+        self.drop_control_acks = 1
+        mark = await self.bob.command("group", intent="recover-group", title="persisted", members=["alice"])
+        group = await self.bob.wait("conversation", lambda item: item["title"] == "persisted", since=mark)
+        original = [item for item in self.control_attempts if item["user"] == "bob"][-1]
+        count = self.db.execute_fetchone("SELECT COUNT(*) FROM sync_events")[0]
+        await self.bob.crash()
+        initial = await self.restart_bob()
+        self.assertEqual(original["requestId"], initial["controlWrites"][0]["requestId"])
+        await self.bob.wait("control-writes", lambda item: item["items"] == [])
+        self.assertEqual(count, self.db.execute_fetchone("SELECT COUNT(*) FROM sync_events")[0])
+        attempts = [item for item in self.control_attempts if item["user"] == "bob"]
+        self.assertEqual([original, original], attempts)
+        self.assertEqual(group["conversationId"], self.db.execute_fetchone(
+            "SELECT conversation_id FROM conversation_create_requests WHERE user_id='bob' AND client_conv_id='recover-group'")[0])
+
+    async def test_control_recall_waits_for_sync_and_survives_account_switch(self):
+        mark = await self.bob.command("message", conversation=self.conversation, intent="recall-control", text="recall me")
+        message = await self.bob.wait("message", lambda item: item["clientMsgId"] == "recall-control", since=mark)
+        self.hold_bob_history = True
+        await self.disconnect(self.bob)
+        await self.bob.connect(self.endpoint, "bob")
+        mark = await self.bob.command("recall", conversation=self.conversation, message=message["id"])
+        pending = await self.bob.wait("control-writes", lambda item: bool(item["items"]), since=mark)
+        request = pending["items"][0]["requestId"]
+        self.assertFalse(any(item["requestId"] == request for item in self.control_attempts))
+        await self.disconnect(self.bob)
+        other = await self.bob.connect(self.endpoint, "alice")
+        self.assertEqual([], other["controlWrites"])
+        await self.synced(self.bob, "alice")
+        self.assertFalse(any(item["requestId"] == request for item in self.control_attempts))
+        await self.disconnect(self.bob)
+        self.hold_bob_history = False
+        mark = len(self.alice.events)
+        restored = await self.bob.connect(self.endpoint, "bob")
+        self.assertEqual(request, restored["controlWrites"][0]["requestId"])
+        await self.alice.wait("update", lambda item: item["type"] == "recall" and item["messageId"] == message["id"], since=mark)
+        self.assertEqual(["bob"], [item["user"] for item in self.control_attempts if item["requestId"] == request])
+
+    async def test_control_members_and_rename_restore_saved_queue_order(self):
+        mark = await self.alice.command("group", intent="member-queue", title="before", members=["bob"])
+        group = (await self.alice.wait("conversation", lambda item: item["title"] == "before", since=mark))["conversationId"]
+        self.reject_control_code = 503
+        mark = await self.alice.command("remove-members", conversation=group, members=["bob"])
+        await self.alice.wait("error", lambda item: "injected control" in item["message"], since=mark)
+        await self.alice.command("add-members", conversation=group, members=["bob"])
+        await self.alice.command("rename", conversation=group, title="after")
+        pending = await self.alice.wait("control-writes", lambda item: len(item["items"]) == 3, since=mark)
+        requests = [item["requestId"] for item in pending["items"]]
+        await self.alice.crash()
+        self.reject_control_code = 0
+        self.alice = await NativeClient.start(self.driver_path,
+            self.output_dir / f"{self._testMethodName}-alice-restarted.log", self.root / "state-alice")
+        self.clients.append(self.alice)
+        initial = await self.alice.connect(self.endpoint, "alice")
+        self.assertEqual(requests, [item["requestId"] for item in initial["controlWrites"]])
+        await self.alice.wait("control-writes", lambda item: item["items"] == [])
+        await self.bob.wait("conversation", lambda item: item["conversationId"] == group and item["title"] == "after")
+        attempts = [item["requestId"] for item in self.control_attempts if item["requestId"] in requests]
+        self.assertEqual([requests[0], *requests], attempts)
+        self.assertEqual(["alice", "bob"], [row[0] for row in self.db.execute_fetchall(
+            "SELECT user_id FROM conversation_members WHERE conversation_id=? ORDER BY user_id", (group,))])
+
+    async def test_control_local_insert_failure_rejects_without_sending(self):
+        await self.synced(self.bob)
+        with closing(sqlite3.connect(next((self.root / "state-bob").glob("*.sqlite")))) as cache, cache:
+            cache.execute("CREATE TRIGGER reject_control_insert BEFORE INSERT ON control_outbox "
+                          "BEGIN SELECT RAISE(ABORT, 'injected local control failure'); END")
+        before = len(self.control_attempts)
+        with self.assertRaisesRegex(AssertionError, "native command rejected"):
+            await self.bob.command("receipt", conversation=self.conversation, seq=0)
+        self.assertEqual(before, len(self.control_attempts))
+        with closing(sqlite3.connect(next((self.root / "state-bob").glob("*.sqlite")))) as cache, cache:
+            self.assertEqual(0, cache.execute("SELECT COUNT(*) FROM control_outbox").fetchone()[0])
+            cache.execute("DROP TRIGGER reject_control_insert")
+        await self.bob.command("receipt", conversation=self.conversation, seq=0)
+        await self.bob.wait("control-writes", lambda item: item["items"] == [])
+
+    async def test_control_terminal_rejection_survives_restart_and_new_action_uses_new_id(self):
+        # Bob cannot rename Alice's group; the direct conversation also rejects group rename.
+        mark = await self.bob.command("rename", conversation=self.conversation, title="not allowed")
+        rejected = await self.bob.wait("control-writes", lambda item: item["items"] and item["items"][0]["status"] == "failed", since=mark)
+        request = rejected["items"][0]["requestId"]
+        await self.bob.crash()
+        initial = await self.restart_bob()
+        self.assertEqual("failed", initial["controlWrites"][0]["status"])
+        await self.synced(self.bob)
+        mark = await self.bob.command("rename", conversation=self.conversation, title="new action")
+        results = await self.bob.wait("control-writes", lambda item: len(item["items"]) == 2 and all(
+            entry["status"] == "failed" for entry in item["items"]), since=mark)
+        self.assertEqual(2, len(set(item["requestId"] for item in results["items"])))
+        self.assertEqual(1, sum(item["requestId"] == request for item in self.control_attempts))
 
     async def test_process_restart_restores_cache_receipts_and_recall(self):
         await self.alice.command("message", conversation=self.conversation, intent="retained", text="cached body")

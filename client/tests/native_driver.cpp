@@ -38,6 +38,26 @@ bool Dispatch(ImBridge& bridge, const QJsonObject& command)
         return bridge.createConversation(
             value("intent"), value("title"), command.value("members").toVariant().toList());
     }
+    if (operation == QStringLiteral("rename"))
+    {
+        return bridge.renameConversation(value("conversation"), value("title"));
+    }
+    if (operation == QStringLiteral("add-members"))
+    {
+        return bridge.addMembers(value("conversation"), command.value("members").toVariant().toList());
+    }
+    if (operation == QStringLiteral("remove-members"))
+    {
+        return bridge.removeMembers(value("conversation"), command.value("members").toVariant().toList());
+    }
+    if (operation == QStringLiteral("leave"))
+    {
+        return bridge.leaveConversation(value("conversation"));
+    }
+    if (operation == QStringLiteral("join"))
+    {
+        return bridge.joinConversation(value("conversation"));
+    }
     if (operation == QStringLiteral("message"))
     {
         return bridge.sendMessage(value("conversation"), value("intent"), value("text"), 0, 0);
@@ -97,6 +117,7 @@ int main(int argc, char** argv)
     forward(&ImBridge::messagePushed, QStringLiteral("message"));
     forward(&ImBridge::messageUpdated, QStringLiteral("update"));
     forward(&ImBridge::conversationUpdated, QStringLiteral("conversation"));
+    forward(&ImBridge::controlWritesChanged, QStringLiteral("control-writes"));
     forward(&ImBridge::fileTasksChanged, QStringLiteral("file-tasks"));
     forward(&ImBridge::fileProgress, QStringLiteral("file"));
     forward(&ImBridge::syncProgress, QStringLiteral("sync"));

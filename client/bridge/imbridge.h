@@ -61,6 +61,7 @@ signals:
     void syncProgress(const QVariantMap& payload);
     void messageSendsChanged(const QVariantMap& payload);
     void fileTasksChanged(const QVariantMap& payload);
+    void controlWritesChanged(const QVariantMap& payload);
     void errorRaised(const QString& message);
 
 private:

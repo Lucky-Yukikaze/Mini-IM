@@ -9,6 +9,7 @@
 #include <QVector>
 #include "core/message/outbox.h"
 #include "core/file/taskstore.h"
+#include "core/session/writestore.h"
 
 struct MiniImStateEvent
 {
@@ -39,6 +40,7 @@ public:
     QString databasePath() const;
     MiniImMessageOutbox& outbox();
     MiniImFileTaskStore& fileTasks();
+    MiniImControlWriteStore& controlWrites();
 
 private:
     QSqlQuery run(const QString& sql, const QVariantList& values = {}) const;
@@ -51,6 +53,7 @@ private:
     QSqlDatabase m_db;
     MiniImMessageOutbox m_outbox;
     MiniImFileTaskStore m_fileTasks;
+    MiniImControlWriteStore m_controlWrites;
     QString m_name;
     QString m_path;
     QString m_user;

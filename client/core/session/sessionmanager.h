@@ -16,6 +16,7 @@
 #include "core/quic/recovery.h"
 #include "core/quic/connection.h"
 #include "core/file/coordinator.h"
+#include "core/session/writecoordinator.h"
 
 
 class QByteArray;
@@ -68,6 +69,7 @@ signals:
     void syncProgress(const QVariantMap& payload);
     void messageSendsChanged(const QVariantMap& payload);
     void fileTasksChanged(const QVariantMap& payload);
+    void controlWritesChanged(const QVariantMap& payload);
     void errorRaised(const QString& message);
 
 private slots:
@@ -94,6 +96,7 @@ private:
     void emitConnectionError(const QString& message);
     void pumpMessageOutbox();
     bool sendQueuedMessage(const QVariantMap& item);
+    bool sendQueuedControl(im::envelope::Envelope envelope);
     void publishMessageSends();
     void handleMessageResult(const QString& requestId, bool success, int code,
         const QString& error, const QString& entityId);
@@ -102,6 +105,7 @@ private:
     MiniImSyncCoordinator m_sync;
     MiniImQuicConnection m_transport;
     MiniImFileCoordinator m_files;
+    MiniImControlWriteCoordinator m_controlWrites;
     MiniImConnectionRecovery m_recovery;
     QElapsedTimer m_lastResponseTime;
     bool m_transportStopping = false;

@@ -39,6 +39,7 @@ void AppendBridgeLog(const QString& message)
 ImBridge::ImBridge(QObject* parent)
     : QObject(parent)
 {
+    QObject::connect(&m_session_manager, &MiniImSessionManager::controlWritesChanged, this, &ImBridge::controlWritesChanged);
     QObject::connect(&m_session_manager, &MiniImSessionManager::fileTasksChanged, this, &ImBridge::fileTasksChanged);
     QObject::connect(&m_session_manager, &MiniImSessionManager::messageSendsChanged, this, &ImBridge::messageSendsChanged);
     QObject::connect(&m_session_manager, &MiniImSessionManager::syncProgress, this, &ImBridge::syncProgress);
