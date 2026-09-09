@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from protocol.pb import common_pb2, conversation_pb2
 from storage.sqlite.db import MiniImSqliteDb
+from storage.repo.read_state import PreserveReadPosition
 from storage.repo.sync_event import AppendSyncEvents, StoredSyncEvent
 
 
@@ -305,9 +306,10 @@ class ConversationRepo:
                 connection.execute(
                     """
                     INSERT INTO conversation_members(conversation_id, user_id, role, joined_at_ms, last_read_seq)
-                    VALUES(?, ?, 'member', ?, 0)
+                    VALUES(?, ?, 'member', ?, COALESCE((SELECT last_read_seq FROM conversation_read_history
+                    WHERE conversation_id=? AND user_id=?),0))
                     """,
-                    (conversation_id, user_id, now_ms),
+                    (conversation_id, user_id, now_ms, conversation_id, user_id),
                 )
 
             updated_record = self.get_conversation(conversation_id)
@@ -341,9 +343,10 @@ class ConversationRepo:
             connection.execute(
                 """
                 INSERT INTO conversation_members(conversation_id, user_id, role, joined_at_ms, last_read_seq)
-                VALUES(?, ?, 'member', ?, 0)
+                VALUES(?, ?, 'member', ?, COALESCE((SELECT last_read_seq FROM conversation_read_history
+                    WHERE conversation_id=? AND user_id=?),0))
                 """,
-                (conversation_id, user_id, now_ms),
+                (conversation_id, user_id, now_ms, conversation_id, user_id),
             )
 
             updated_record = self.get_conversation(conversation_id)
@@ -382,6 +385,7 @@ class ConversationRepo:
                 return UpdateConversationResult(conversation=updated, sync_events=[], changed=False)
 
             for user_id in targets:
+                self._preserve_read_position(connection, conversation_id, user_id, now_ms)
                 connection.execute(
                     "DELETE FROM conversation_members WHERE conversation_id = ? AND user_id = ?",
                     (conversation_id, user_id),
@@ -417,6 +421,7 @@ class ConversationRepo:
             if not remaining:
                 return None
 
+            self._preserve_read_position(connection, conversation_id, user_id, now_ms)
             connection.execute(
                 "DELETE FROM conversation_members WHERE conversation_id = ? AND user_id = ?",
                 (conversation_id, user_id),
@@ -471,6 +476,14 @@ class ConversationRepo:
             owner_id=str(row["owner_id"] or ""),
             member_ids=[str(item["user_id"]) for item in member_rows],
         )
+
+    @staticmethod
+    def _preserve_read_position(connection, conversation_id, user_id, now_ms):
+        row = connection.execute(
+            "SELECT last_read_seq FROM conversation_members WHERE conversation_id=? AND user_id=?",
+            (conversation_id, user_id)).fetchone()
+        if row is not None:
+            PreserveReadPosition(connection, conversation_id, user_id, int(row[0]), now_ms)
 
     def is_member(self, conversation_id: str, user_id: str) -> bool:
         row = self.m_db.execute_fetchone(

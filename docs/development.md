@@ -190,6 +190,31 @@ npm --prefix ./web run dev -- --host 127.0.0.1 --port 5173 --strictPort
 数据库写入失败会停止同步及断开连接，未提交的事件不会通知页面。
 验证范围见 [同步协调批次](refactoring-progress.md#同步协调与无进展页恢复--2026-09-07)。
 
+## 群成员变更与历史已读
+
+服务端根据发送时保存的 `message_deliveries` 计算每条消息的收件人数与已读人数，排除发送者。
+新成员读取历史不会消耗原收件人的未读人数；成员离开期间没有该用户投递的消息也保持原计数。
+退群和移除成员时，`conversation_read_history` 保存该用户在该会话的已读位置；主动加入或重新添加时恢复。
+成员权限仍由 `conversation_members` 判断，退出后的历史位置不会授予发消息或提交已读的权限。
+历史位置、成员变化与对应事件共同提交，重复已读不重新计数或改变首次已读、焚毁时间。
+
+[初始化升级](../server/storage/repo/read_state.py) 在 `schema_migrations` 中用 `membership_read_history_v1` 标记一次性修复：
+保留现有成员位置，从读者自己收到的历史已读事件恢复旧版本退群丢失的位置，按投递记录重算展示计数。
+此处标记是 `schema_migrations` 表内 `name` 字段的值；重复启动跳过本次数据修复。
+修复数据与标记共同提交，失败后可重新启动重试；新建的空表可能保留，原业务数据不清空。
+旧库缺少对应历史事件时只能保留已有证据中的位置，不推测丢失的读取范围。
+本次修复不产生新的同步事件，Qt 与页面已有缓存中的历史计数纠正仍待下一模块完成。
+
+[成员已读回归](../server/tests/test_membership_reads.py) 随服务端全量测试执行；只运行该专项可使用：
+
+~~~powershell
+& ./.venv/Scripts/python.exe -m unittest discover server/tests -p test_membership_reads.py -v
+~~~
+
+真实网络成员变更、原收件人计数及数据库重开检查位于
+[控制写入网络测试](../server/tests/test_control_write_network.py)，运行服务端全量测试即可覆盖。
+服务端与原生/页面的验收边界见 [执行记录](refactoring-progress.md#服务端成员变更与历史已读--2026-09-10)。
+
 ## 收件确认与旧库升级
 
 服务端 [SyncApplied 处理](../server/services/sync/service.py) 接受接收设备已保存的连续同步位置，

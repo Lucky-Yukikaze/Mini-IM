@@ -321,6 +321,67 @@ class ControlWriteNetworkTest(unittest.IsolatedAsyncioTestCase):
                 observer.close()
 
 
+    async def test_membership_reads_preserve_original_recipients_across_reopen(self):
+        for user in ("carol", "dave"):
+            self.conversations.ensure_user(user)
+
+        async def accepted(reader, send, request_id, **body):
+            send(request_id, **body)
+            ack = (await self.read(reader, request_id, "ack")).ack
+            self.assertTrue(ack.success, ack.message)
+            return ack.entity_id
+
+        def receipt(seq):
+            return message_pb2.Receipt(conversation_id=self.conversation, last_read_seq=seq)
+
+        def message(intent):
+            return message_pb2.SendMessage(conversation_id=self.conversation, client_msg_id=intent,
+                type=common_pb2.MSG_TEXT, content=intent.encode())
+
+        def counts(message_id):
+            return tuple(self.db.execute_fetchone("SELECT member_count,read_count,unread_count "
+                "FROM message_read_counters WHERE server_msg_id=?", (message_id,)))
+
+        async with self.peer() as (alice, send_alice), self.peer("bob") as (bob, send_bob), self.peer(
+                "dave") as (dave, send_dave):
+            await accepted(alice, send_alice, "add-carol", add_members=conversation_pb2.AddMembers(
+                conversation_id=self.conversation, member_ids=["carol"]))
+            first = await accepted(alice, send_alice, "before-join", send_message=message("before-join"))
+            await accepted(dave, send_dave, "join-dave", join_conversation=conversation_pb2.JoinConversation(
+                conversation_id=self.conversation))
+            await accepted(dave, send_dave, "dave-read", receipt=receipt(1))
+            self.assertEqual((2, 0, 2), counts(first))
+            await accepted(bob, send_bob, "bob-read", receipt=receipt(1))
+            await accepted(bob, send_bob, "bob-leave", leave_conversation=conversation_pb2.LeaveConversation(
+                conversation_id=self.conversation))
+            absent = await accepted(alice, send_alice, "while-absent", send_message=message("while-absent"))
+            self.assertEqual((2, 1, 1), counts(first))
+        self.server.close()
+        self.db.close()
+        await self.start_server()
+        async with self.peer() as (alice, send_alice), self.peer("bob", device="second-device") as (bob, send_bob):
+            send_bob("absent-read", receipt=receipt(2))
+            rejected = (await self.read(bob, "absent-read", "ack")).ack
+            self.assertFalse(rejected.success)
+            self.assertEqual(403, rejected.code)
+            await accepted(bob, send_bob, "bob-rejoin", join_conversation=conversation_pb2.JoinConversation(
+                conversation_id=self.conversation))
+            self.assertEqual(1, self.db.execute_fetchone("SELECT last_read_seq FROM conversation_members "
+                "WHERE conversation_id=? AND user_id='bob'", (self.conversation,))[0])
+            count = self.event_count()
+            await accepted(bob, send_bob, "bob-repeat-read", receipt=receipt(1))
+            self.assertEqual(count, self.event_count())
+            latest = await accepted(alice, send_alice, "after-return", send_message=message("after-return"))
+            await accepted(bob, send_bob, "bob-read-through", receipt=receipt(3))
+            self.assertEqual((2, 1, 1), counts(first))
+            self.assertEqual((2, 0, 2), counts(absent))
+            self.assertEqual((3, 1, 2), counts(latest))
+            count = self.event_count()
+            await accepted(bob, send_bob, "bob-read-through", receipt=receipt(3))
+            self.assertEqual(count, self.event_count())
+            self.assertEqual([], self.db.execute_fetchall("PRAGMA foreign_key_check"))
+            self.assertEqual("ok", self.db.execute_fetchone("PRAGMA integrity_check")[0])
+
     def upload_request(self):
         payload = b"file storage recovery"
         return payload, file_pb2.FileInit(conversation_id=self.conversation, client_file_id="upload",

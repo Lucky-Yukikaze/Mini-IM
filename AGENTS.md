@@ -98,13 +98,16 @@ Web 按 web/src/api、store、components、views、events、types 分职责。
   不把“服务端写入成功”当成“客户端已收到”。
 
 核心表按实现演进：users、devices、sessions、conversations、conversation_create_requests、
-control_write_results、conversation_members、messages、message_deliveries、message_read_counters、attachments、
+control_write_results、conversation_members、conversation_read_history、messages、message_deliveries、
+message_read_counters、attachments、schema_migrations、
 file_transfers、file_cancellations、sync_events、sync_cursors、sync_applied_cursors。
 
 ## 已读、撤回与焚毁
 
-- conversation_members.last_read_seq 是已读真值，只能推进。
-- message_read_counters 是可重算的展示缓存；按消息发送时的成员数计算，排除发送者本人。
+- conversation_members.last_read_seq 是在群成员的已读真值，只能推进；退出或移除时保存历史位置，
+  重新加入时恢复，历史记录不授予成员权限。历史位置与成员变更及事件共同提交。
+- message_read_counters 是可重算的展示缓存；按消息发送时的收件投递记录计算，排除发送者本人。
+  新成员读旧消息、成员离开期间的消息和退群重入均不得增加不属于原收件人的已读人数。
 - 同步统一使用 SyncEvent，承载消息、投递、撤回、已读、会话更新和文件状态，禁止拆成互不关联的恢复接口。
 - 旧消息重放不得覆盖已生效的撤回或焚毁状态；先收到状态变化时，消息后到也必须正确合并。
 - 用户切换必须隔离会话、消息、已读、文件任务、待处理事件和恢复位置。

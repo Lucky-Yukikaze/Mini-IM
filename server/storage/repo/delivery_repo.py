@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from protocol.pb import common_pb2, message_pb2
 from storage.repo.sync_event import AppendSyncEvents, PurgedMessageContent, RedactMessageEvents, StoredSyncEvent
+from storage.repo.read_state import RebuildReadCounters
 from storage.sqlite.db import MiniImSqliteDb
 
 
@@ -133,30 +134,7 @@ class DeliveryRepo:
                         self.BURN_MODE_AFTER_READ,
                     ),
                 )
-            connection.execute(
-                """
-                UPDATE message_read_counters
-                SET
-                  read_count = CASE
-                    WHEN read_count < member_count THEN read_count + 1
-                    ELSE member_count
-                  END,
-                  unread_count = CASE
-                    WHEN unread_count > 0 THEN unread_count - 1
-                    ELSE 0
-                  END,
-                  updated_at_ms = ?
-                WHERE server_msg_id IN (
-                  SELECT server_msg_id
-                  FROM messages
-                  WHERE conversation_id = ?
-                    AND conversation_seq > ?
-                    AND conversation_seq <= ?
-                    AND sender_id <> ?
-                )
-                """,
-                (now_ms, conversation_id, old_last_read_seq, new_last_read_seq, user_id),
-            )
+            RebuildReadCounters(connection, now_ms, conversation_id, old_last_read_seq, new_last_read_seq)
 
             member_rows = connection.execute(
                 """

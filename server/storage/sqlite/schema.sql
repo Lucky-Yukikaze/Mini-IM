@@ -212,3 +212,18 @@ CREATE TABLE IF NOT EXISTS sync_applied_cursors (
   PRIMARY KEY (user_id, device_id),
   FOREIGN KEY (user_id) REFERENCES users(user_id)
 );
+
+CREATE TABLE IF NOT EXISTS conversation_read_history (
+  conversation_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  last_read_seq INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (conversation_id,user_id),
+  FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id),
+  FOREIGN KEY (user_id) REFERENCES users(user_id)
+);
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  name TEXT PRIMARY KEY,
+  applied_at_ms INTEGER NOT NULL
+);
