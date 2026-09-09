@@ -9,6 +9,7 @@ from pathlib import Path
 
 from protocol.pb import common_pb2, file_pb2, message_pb2
 from storage.repo import ConversationRepo, FileRepo, MessageRepo, StoredFileTransfer, StoredSyncEvent
+from storage.repo.control_write_repo import ControlWriteRepo, ControlWriteResult
 
 
 @dataclass
@@ -19,6 +20,7 @@ class FileServiceResult:
     start_download: bool = False
     download_file_id: str = ""
     download_offset: int = 0
+    cancelled_file_id: str = ""
 
 
 class FileService:
@@ -31,6 +33,7 @@ class FileService:
         stale_timeout_ms: int,
     ) -> None:
         self.m_file_repo = file_repo
+        self.m_cancel_requests = ControlWriteRepo(file_repo.m_db)
         self.m_conversation_repo = conversation_repo
         self.m_message_repo = message_repo
         self.m_file_root = file_root
@@ -69,6 +72,11 @@ class FileService:
             server_time_ms=now_ms,
         )
         if not file_init.client_file_id.strip():
+            return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
+
+        if self.m_file_repo.is_cancelled(user_id, file_init.client_file_id):
+            ack.code = 409
+            ack.message = "file intent was cancelled"
             return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
 
         if file_init.direction not in (common_pb2.FILE_DIRECTION_UPLOAD, common_pb2.FILE_DIRECTION_DOWNLOAD):
@@ -230,6 +238,11 @@ class FileService:
             ack.message = "file_finish rejected"
             return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
 
+        if transfer.status == "cancelled":
+            ack.code = 409
+            ack.message = "file intent was cancelled"
+            return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
+
         is_download = transfer.direction == common_pb2.FILE_DIRECTION_DOWNLOAD
         if bool(file_finish.success) and transfer.status != "completed":
             if is_download:
@@ -278,6 +291,19 @@ class FileService:
         ack.server_time_ms = self._now_ms()
         updated = self._file_updated(result.transfer, result.sync_events, user_id)
         return FileServiceResult(ack=ack, file_updated=updated, sync_events=all_sync_events)
+
+    def handle_file_cancel(self, user_id: str, request_id: str, request: file_pb2.FileCancel) -> FileServiceResult:
+        def apply():
+            if not request.client_file_id.strip():
+                return self.m_cancel_requests.reject(request_id, 400, "file cancellation requires intent id")
+            result = self.m_file_repo.cancel_transfer(user_id, request.client_file_id, request.file_id)
+            ack = message_pb2.Ack(request_id=request_id, success=result.code == 0, code=result.code,
+                message=result.error or "cancelled", entity_id=request.client_file_id, server_time_ms=self._now_ms())
+            return ControlWriteResult(ack, result.sync_events)
+        result = self.m_cancel_requests.execute(user_id, request_id, "file_cancel",
+            request.SerializeToString(deterministic=True), apply)
+        file_id = self.m_file_repo.cancelled_file_id(user_id, request.client_file_id) if result.ack.success else ""
+        return FileServiceResult(result.ack, None, result.sync_events, cancelled_file_id=file_id)
 
     def _reconcile_upload(self, transfer: StoredFileTransfer, member_ids: list[str]):
         target = self.m_file_root / transfer.storage_path

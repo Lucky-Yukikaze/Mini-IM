@@ -177,9 +177,9 @@ class TestProtocol(MiniImQuicProtocol):
             if self.scenario.duplicate_control_acks:
                 super()._send(stream_id, envelope)
         if envelope.HasField("ack") and envelope.ack.success:
-            key = "filefinish" if "-filefinish-" in envelope.request_id else "fileinit"
+            key = "filecancel" if "-filecancel-" in envelope.request_id else "filefinish" if "-filefinish-" in envelope.request_id else "fileinit"
             if ("-filefinish-" in envelope.request_id or "-fileinit-" in envelope.request_id
-                    or "-filedl-" in envelope.request_id) and self.scenario.drop_file_acks.get(key, 0):
+                    or "-filedl-" in envelope.request_id or "-filecancel-" in envelope.request_id) and self.scenario.drop_file_acks.get(key, 0):
                 self.scenario.drop_file_acks[key] -= 1
                 return
         if self.scenario.silent_user and self.m_user_id == self.scenario.silent_user:
@@ -272,6 +272,9 @@ class RecordingFileService(FileService):
         self.scenario = scenario
 
     def handle_file_init(self, user_id, request_id, file_init):
+        if self.scenario.block_file_init:
+            return FileServiceResult(message_pb2.Ack(request_id=request_id, success=False, code=503,
+                message="injected initialization hold"), None, [])
         result = super().handle_file_init(user_id, request_id, file_init)
         self.scenario.file_attempts.append({
             "user": user_id, "requestId": request_id, "intent": file_init.client_file_id,
@@ -280,6 +283,15 @@ class RecordingFileService(FileService):
         })
         return result
 
+
+    def handle_file_cancel(self, user_id, request_id, file_cancel):
+        self.scenario.cancel_attempts.append({"user": user_id, "requestId": request_id,
+            "intent": file_cancel.client_file_id, "fileId": file_cancel.file_id,
+            "body": file_cancel.SerializeToString().hex()})
+        if self.scenario.reject_file_cancel:
+            return FileServiceResult(message_pb2.Ack(request_id=request_id, success=False,
+                code=self.scenario.reject_file_cancel, message="injected cancellation rejection"), None, [])
+        return super().handle_file_cancel(user_id, request_id, file_cancel)
 
     def handle_file_finish(self, user_id, request_id, file_finish):
         if self.scenario.hold_upload_finish:
@@ -335,6 +347,9 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         self.file_attempts = []
         self.upload_storage_fault = ""
         self.hold_upload_finish = False
+        self.block_file_init = False
+        self.reject_file_cancel = 0
+        self.cancel_attempts = []
         self.control_requests = set()
         self.control_attempts = []
         self.drop_control_acks = 0
@@ -391,6 +406,8 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
             json.dumps(self.control_attempts, indent=2), encoding="utf-8")
         (self.output_dir / f"{self._testMethodName}-sync-replies.json").write_text(
             json.dumps(self.sync_replies, indent=2), encoding="utf-8")
+        (self.output_dir / f"{self._testMethodName}-cancel-attempts.json").write_text(
+            json.dumps(self.cancel_attempts, indent=2), encoding="utf-8")
         (self.output_dir / f"{self._testMethodName}-file-attempts.json").write_text(
             json.dumps(self.file_attempts, indent=2), encoding="utf-8")
 
@@ -1318,6 +1335,10 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         target.write_bytes(b"keep")
         mark = await self.bob.command("download", conversation=self.conversation, source=file_id, path=str(target))
         task = await self.bob.wait("file-tasks", lambda item: bool(item["items"]), since=mark)
+        async with asyncio.timeout(5):
+            while not any(protocol.m_user_id == "bob" and any(job.offset >= 65536
+                    for job in protocol.m_download_sender.jobs.values()) for protocol in self.protocols):
+                await asyncio.sleep(0.01)
         mark = await self.bob.command("cancel-file", intent=task["items"][0]["clientFileId"])
         await self.bob.wait("file-tasks", lambda item: not item["items"], since=mark)
         await self.bob.crash()
@@ -1328,6 +1349,96 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         await self.synced(self.bob)
         self.assertEqual(attempts, len(self.file_attempts))
         self.assertEqual(b"keep", target.read_bytes())
+        rows = self.db.execute_fetchall("SELECT * FROM file_transfers WHERE owner_id='bob'")
+        cancelled = self.db.execute_fetchone("SELECT * FROM file_cancellations WHERE owner_id='bob'")
+        self.assertIsNotNone(cancelled)
+        self.assertTrue(all(row["status"] == "cancelled" for row in rows))
+
+    async def _pending_uninitialized_upload(self):
+        self.block_file_init = True
+        source = self.root / "cancel-source.bin"
+        source.write_bytes(b"cancel before initialization" * 4096)
+        mark = await self.alice.command("upload", conversation=self.conversation, path=str(source))
+        tasks = await self.alice.wait("file-tasks", lambda item: bool(item["items"]), since=mark)
+        return tasks["items"][0]["clientFileId"]
+
+    async def _wait_cancel_attempts(self, count):
+        async with asyncio.timeout(10):
+            while len(self.cancel_attempts) < count:
+                await asyncio.sleep(0.01)
+
+    async def test_cancel_before_initialization_survives_restart_and_ack_loss(self):
+        intent = await self._pending_uninitialized_upload()
+        self.reject_file_cancel = 503
+        mark = await self.alice.command("cancel-file", intent=intent)
+        await self.alice.wait("file-tasks", lambda item: any(task["status"] == "cancelling"
+            and task["error"] for task in item["items"]), since=mark)
+        await self.alice.crash()
+        original = self.cancel_attempts[0]
+        self.reject_file_cancel = 0
+        self.drop_file_acks["filecancel"] = 1
+        self.block_file_init = False
+        initial = await self.restart_alice()
+        self.assertEqual("cancelling", initial["fileTasks"][0]["status"])
+        await self.alice.wait("file-tasks", lambda item: not item["items"])
+        self.assertGreaterEqual(len(self.cancel_attempts), 3)
+        self.assertTrue(all(item == original for item in self.cancel_attempts))
+        self.assertEqual(0, self.db.execute_fetchone("SELECT COUNT(*) FROM file_transfers")[0])
+        self.assertIsNotNone(self.db.execute_fetchone("SELECT 1 FROM file_cancellations WHERE owner_id='alice' AND client_file_id=?", (intent,)))
+        await self.alice.crash()
+        self.assertEqual([], (await self.restart_alice())["fileTasks"])
+        self.assertEqual(0, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+
+    async def test_cancel_save_failure_does_not_stop_or_change_original_task(self):
+        intent = await self._pending_uninitialized_upload()
+        cache = next((self.root / "state-alice").glob("*.sqlite"))
+        with closing(sqlite3.connect(cache)) as connection, connection:
+            connection.execute("CREATE TRIGGER reject_cancel BEFORE UPDATE ON file_tasks "
+                "WHEN NEW.status='cancelling' BEGIN SELECT RAISE(ABORT,'cancel save failure'); END")
+        with self.assertRaisesRegex(AssertionError, "native command rejected"):
+            await self.alice.command("cancel-file", intent=intent)
+        self.assertEqual([], self.cancel_attempts)
+        with closing(sqlite3.connect(cache)) as connection, connection:
+            self.assertEqual("pending", connection.execute("SELECT status FROM file_tasks").fetchone()[0])
+            connection.execute("DROP TRIGGER reject_cancel")
+        mark = await self.alice.command("cancel-file", intent=intent)
+        await self.alice.wait("file-tasks", lambda item: not item["items"], since=mark)
+
+    async def test_failed_cancellation_stays_stopped_and_new_cancel_uses_new_request(self):
+        intent = await self._pending_uninitialized_upload()
+        self.reject_file_cancel = 403
+        mark = await self.alice.command("cancel-file", intent=intent)
+        await self.alice.wait("file-tasks", lambda item: any(task["status"] == "cancel_failed"
+            for task in item["items"]), since=mark)
+        old = self.cancel_attempts[0]["requestId"]
+        await self.alice.crash()
+        initial = await self.restart_alice()
+        self.assertEqual("cancel_failed", initial["fileTasks"][0]["status"])
+        self.assertEqual(1, len(self.cancel_attempts))
+        self.assertEqual(0, self.db.execute_fetchone("SELECT COUNT(*) FROM file_transfers")[0])
+        self.reject_file_cancel = 0
+        mark = await self.alice.command("cancel-file", intent=intent)
+        await self.alice.wait("file-tasks", lambda item: not item["items"], since=mark)
+        self.assertNotEqual(old, self.cancel_attempts[-1]["requestId"])
+        self.assertEqual(intent, self.cancel_attempts[-1]["intent"])
+
+    async def test_pending_file_cancel_isolated_across_account_switch(self):
+        intent = await self._pending_uninitialized_upload()
+        self.reject_file_cancel = 503
+        mark = await self.alice.command("cancel-file", intent=intent)
+        await self.alice.wait("file-tasks", lambda item: any(task["status"] == "cancelling"
+            and task["error"] for task in item["items"]), since=mark)
+        old = self.cancel_attempts[0]
+        mark = await self.alice.command("disconnect")
+        await self.alice.wait("connection", lambda item: item["state"] == "disconnected", since=mark)
+        other = await self.alice.connect(self.endpoint, "bob")
+        self.assertEqual([], other["fileTasks"])
+        self.reject_file_cancel = 0
+        mark = await self.alice.command("disconnect")
+        await self.alice.wait("connection", lambda item: item["state"] == "disconnected", since=mark)
+        await self.alice.connect(self.endpoint, "alice")
+        await self.alice.wait("file-tasks", lambda item: not item["items"], since=mark)
+        self.assertTrue(all(item == old for item in self.cancel_attempts))
 
     async def test_corrupt_download_can_retry_original_intent_from_zero(self):
         payload = b"verified retry" * 4096
@@ -1368,6 +1479,38 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         for target in targets:
             self.assertEqual(payload, target.read_bytes())
         self.assertEqual(9, self.db.execute_fetchone(
+            "SELECT COUNT(*) FROM file_transfers WHERE direction=2 AND status='completed'")[0])
+
+    async def test_queued_file_cancel_bypasses_eight_stalled_downloads(self):
+        payload = b"queued cancellation" * 8192
+        file_id = await self.upload(payload)
+        self.pause_download_at = 65536
+        targets = [self.root / f"cancel-queue-{index}.bin" for index in range(9)]
+        targets[-1].write_bytes(b"keep queued target")
+        mark = len(self.bob.events)
+        for target in targets:
+            await self.bob.command("download", conversation=self.conversation, source=file_id, path=str(target))
+        tasks = await self.bob.wait("file-tasks", lambda item: len(item["items"]) == 9, since=mark)
+        intent = tasks["items"][-1]["clientFileId"]
+        async with asyncio.timeout(5):
+            while not any(protocol.m_user_id == "bob" and sum(job.offset >= 65536
+                    for job in protocol.m_download_sender.jobs.values()) == 8 for protocol in self.protocols):
+                await asyncio.sleep(0.01)
+        mark = await self.bob.command("cancel-file", intent=intent)
+        await self.bob.wait("file-tasks", lambda item: len(item["items"]) == 8
+                           and all(task["clientFileId"] != intent for task in item["items"]), since=mark, timeout=8)
+        self.assertEqual(1, self.db.execute_fetchone(
+            "SELECT COUNT(*) FROM file_cancellations WHERE owner_id='bob' AND client_file_id=?", (intent,))[0])
+        self.assertEqual(0, self.db.execute_fetchone(
+            "SELECT COUNT(*) FROM file_transfers WHERE owner_id='bob' AND client_file_id=?", (intent,))[0])
+        self.assertEqual(b"keep queued target", targets[-1].read_bytes())
+        self.pause_download_at = 0
+        for protocol in self.protocols:
+            protocol.m_download_sender.notify()
+        await self.bob.wait("file-tasks", lambda item: not item["items"], since=mark)
+        for target in targets[:-1]:
+            self.assertEqual(payload, target.read_bytes())
+        self.assertEqual(8, self.db.execute_fetchone(
             "SELECT COUNT(*) FROM file_transfers WHERE direction=2 AND status='completed'")[0])
 
     async def test_pending_upload_isolated_while_switching_accounts(self):

@@ -3,7 +3,8 @@
 Read context.json for endpoint, seeded group and local WebEngine debugging URL.
 Write {"id": "unique-command", "op": ...} to command.json and wait for the same
 id in response.json. Operations: snapshot, message(text), reject(code),
-drop-ack(count), cache-fault(enabled,user,device), restart-client, stop.
+drop-ack(count), cache-fault(enabled,user,device), file-init-reject(code),
+file-cancel-reject(code), restart-client, stop.
 Only the private fixture databases are changed. No default development data is used.
 """
 from __future__ import annotations
@@ -33,7 +34,7 @@ from services.auth.service import AuthService
 from services.control.service import ControlWriteService
 from services.conversation.service import ConversationService
 from services.delivery.service import DeliveryService
-from services.file.service import FileService
+from services.file.service import FileService, FileServiceResult
 from services.message.service import MessageService
 from services.sync.service import SyncService
 from storage.repo import ConversationRepo, DeliveryRepo, FileRepo, MessageRepo, SyncRepo
@@ -57,6 +58,8 @@ class DesktopFixture:
         self.attempts = []
         self.rejected = 0
         self.drop_acks = 0
+        self.file_init_reject = self.file_cancel_reject = 0
+        self.file_cancel_attempts = []
         self.context = {}
         self.hub = OnlineSessionHub()
         self.repo = ConversationRepo(self.db)
@@ -84,7 +87,22 @@ class DesktopFixture:
                 return super().handle(user_id, envelope)
 
         controls = Controls(ControlWriteRepo(self.db), self.conversations, delivery)
-        files = FileService(FileRepo(self.db), self.repo, MessageRepo(self.db), self.root / "files", 900000)
+        class Files(FileService):
+            def handle_file_init(self, user_id, request_id, request):
+                if scenario.file_init_reject:
+                    return FileServiceResult(message_pb2.Ack(request_id=request_id, success=False,
+                        code=scenario.file_init_reject, message="injected file init rejection"), None, [])
+                return super().handle_file_init(user_id, request_id, request)
+
+            def handle_file_cancel(self, user_id, request_id, request):
+                scenario.file_cancel_attempts.append(dict(user=user_id, requestId=request_id,
+                    intent=request.client_file_id, body=request.SerializeToString().hex()))
+                if scenario.file_cancel_reject:
+                    return FileServiceResult(message_pb2.Ack(request_id=request_id, success=False,
+                        code=scenario.file_cancel_reject, message="injected file cancel rejection"), None, [])
+                return super().handle_file_cancel(user_id, request_id, request)
+
+        files = Files(FileRepo(self.db), self.repo, MessageRepo(self.db), self.root / "files", 900000)
         auth = AuthService()
 
         class Protocol(MiniImQuicProtocol):
@@ -115,7 +133,9 @@ class DesktopFixture:
         with closing(socket.socket()) as probe:
             probe.bind(("127.0.0.1", 0))
             debug_port = probe.getsockname()[1]
-        self.context = dict(endpoint=f"quic://127.0.0.1:{self.port}", group=self.group,
+        upload = self.root / "desktop-upload.bin"
+        upload.write_bytes(b"desktop file cancellation" * 4096)
+        self.context = dict(upload=str(upload), endpoint=f"quic://127.0.0.1:{self.port}", group=self.group,
             debug=f"http://127.0.0.1:{debug_port}", root=str(self.root), output=str(self.output),
             state=str(self.root / "state"), users=["alice", "bob", "cindy"], device="desktop-device")
         await self.start_client()
@@ -141,7 +161,8 @@ class DesktopFixture:
             self.client_log.close()
 
     def snapshot(self):
-        state = dict(attempts=self.attempts,
+        state = dict(attempts=self.attempts, fileCancelAttempts=self.file_cancel_attempts,
+            cancellations=[dict(row) for row in self.db.execute_fetchall("SELECT * FROM file_cancellations")],
             conversations=[dict(row) for row in self.db.execute_fetchall("SELECT * FROM conversations")],
             members=[dict(row) for row in self.db.execute_fetchall("SELECT * FROM conversation_members")],
             events=self.db.execute_fetchone("SELECT COUNT(*) FROM sync_events")[0],
@@ -158,6 +179,10 @@ class DesktopFixture:
         op = data["op"]
         if op == "reject":
             self.rejected = int(data["code"])
+        elif op == "file-init-reject":
+            self.file_init_reject = int(data["code"])
+        elif op == "file-cancel-reject":
+            self.file_cancel_reject = int(data["code"])
         elif op == "drop-ack":
             self.drop_acks = int(data.get("count", 1))
         elif op == "message":

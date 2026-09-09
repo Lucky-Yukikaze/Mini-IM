@@ -50,6 +50,14 @@ class FileTransferFinishResult:
     changed: bool
 
 
+@dataclass
+class FileTransferCancelResult:
+    transfer: StoredFileTransfer | None
+    sync_events: list[StoredSyncEvent]
+    code: int = 0
+    error: str = ""
+
+
 class FileRepo:
     def __init__(self, db: MiniImSqliteDb) -> None:
         self.m_db = db
@@ -100,6 +108,8 @@ class FileRepo:
                         expected, actual = expected.lower(), actual.lower()
                     if expected != actual:
                         return FileTransferInitResult(transfer, [], False, f"intent_id {field} mismatch")
+                if transfer.status == "cancelled":
+                    return FileTransferInitResult(transfer, [], False, "file intent was cancelled")
                 stale = (stale_timeout_ms > 0 and self._is_uploading_status(transfer.status)
                          and now_ms - transfer.updated_at_ms > stale_timeout_ms)
                 if transfer.status != "completed":
@@ -118,6 +128,40 @@ class FileRepo:
                         )
             events = self._append_file_updated_sync_events(connection, member_ids, transfer) if changed else []
             return FileTransferInitResult(transfer, events, created)
+
+    def is_cancelled(self, user_id: str, client_file_id: str) -> bool:
+        return self.m_db.execute_fetchone(
+            "SELECT 1 FROM file_cancellations WHERE owner_id=? AND client_file_id=?",
+            (user_id, client_file_id)) is not None
+
+    def cancelled_file_id(self, user_id: str, client_file_id: str) -> str:
+        row = self.m_db.execute_fetchone(
+            "SELECT file_id FROM file_cancellations WHERE owner_id=? AND client_file_id=?", (user_id, client_file_id))
+        return str(row[0]) if row else ""
+
+    def cancel_transfer(self, user_id: str, client_file_id: str, file_id: str) -> FileTransferCancelResult:
+        with self.m_db.transaction() as connection:
+            rows = connection.execute("SELECT * FROM file_transfers WHERE owner_id=? AND client_file_id=?",
+                (user_id, client_file_id)).fetchall()
+            if len(rows) > 1:
+                return FileTransferCancelResult(None, [], 409, "ambiguous legacy file intent")
+            transfer = self._row_to_transfer(rows[0]) if rows else None
+            if file_id and (transfer is None or transfer.file_id != file_id):
+                return FileTransferCancelResult(None, [], 403, "file cancellation identity mismatch")
+            if transfer and transfer.status == "completed":
+                return FileTransferCancelResult(transfer, [], 409, "file already completed")
+            connection.execute("INSERT OR IGNORE INTO file_cancellations(owner_id,client_file_id,file_id,created_at_ms) "
+                "VALUES(?,?,?,?)", (user_id, client_file_id, transfer.file_id if transfer else "", self._now_ms()))
+            events = []
+            if transfer and transfer.status != "cancelled":
+                transfer.status = "cancelled"
+                self._save_progress(connection, transfer)
+                # Include the owner even after leaving the conversation.
+                users = connection.execute("SELECT user_id FROM conversation_members WHERE conversation_id=?",
+                    (transfer.conversation_id,)).fetchall()
+                members = sorted({user_id, *(row[0] for row in users)})
+                events = self._append_file_updated_sync_events(connection, members, transfer)
+            return FileTransferCancelResult(transfer, events)
 
     def get_transfer_by_file_id(self, file_id: str) -> StoredFileTransfer | None:
         row = self.m_db.execute_fetchone("SELECT * FROM file_transfers WHERE file_id = ?", (file_id,))
@@ -138,7 +182,7 @@ class FileRepo:
                 return None
             if received_bytes < 0 or received_bytes > transfer.file_size:
                 raise ValueError("invalid transfer progress")
-            changed = transfer.status != "completed" and received_bytes > transfer.received_bytes
+            changed = transfer.status not in {"completed", "cancelled"} and received_bytes > transfer.received_bytes
             if changed:
                 transfer.received_bytes = int(received_bytes)
                 transfer.status = "uploaded" if received_bytes == transfer.file_size else "uploading"
@@ -156,7 +200,7 @@ class FileRepo:
                 return None
             if not 0 <= received_bytes <= transfer.received_bytes:
                 raise ValueError("invalid upload recovery offset")
-            changed = transfer.status != "completed" and (received_bytes < transfer.received_bytes
+            changed = transfer.status not in {"completed", "cancelled"} and (received_bytes < transfer.received_bytes
                 or (integrity_failed and transfer.status != "failed_integrity"))
             if changed:
                 transfer.received_bytes = received_bytes
@@ -170,6 +214,8 @@ class FileRepo:
             transfer = self.get_transfer_by_file_id(file_id)
             if transfer is None:
                 return None
+            if transfer.status == "cancelled":
+                return FileTransferFinishResult(transfer, [], False)
             target_status = "completed" if success or transfer.status == "completed" else "failed"
             changed = target_status != transfer.status
             if changed:

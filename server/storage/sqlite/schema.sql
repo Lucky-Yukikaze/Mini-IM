@@ -143,6 +143,15 @@ CREATE TABLE IF NOT EXISTS file_transfers (
   FOREIGN KEY (owner_id) REFERENCES users(user_id)
 );
 
+CREATE TABLE IF NOT EXISTS file_cancellations (
+  owner_id TEXT NOT NULL,
+  client_file_id TEXT NOT NULL,
+  file_id TEXT NOT NULL DEFAULT '',
+  created_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (owner_id, client_file_id),
+  FOREIGN KEY (owner_id) REFERENCES users(user_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_file_transfers_owner_intent
 ON file_transfers(owner_id, client_file_id);
 

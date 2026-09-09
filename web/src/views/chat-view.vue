@@ -113,11 +113,12 @@
         <div class="file-progress-scroll">
           <div v-for="task in session.currentFileTasks" :key="task.clientFileId" class="file-task-card">
             <div>{{ task.direction === 1 ? '上传' : '下载' }} · {{ task.fileName }}</div>
-            <div class="file-meta">{{ task.status === 'failed' ? '传输失败' : task.status === 'finishing' ? '等待完成确认' : '等待或传输中' }}</div>
+            <div class="file-meta">{{ task.status === 'cancelling' ? '取消待确认' : task.status === 'cancel_failed' ? '取消未成功' : task.status === 'failed' ? '传输失败' : task.status === 'finishing' ? '等待完成确认' : '等待或传输中' }}</div>
             <div v-if="task.error" class="file-meta">{{ task.error }}</div>
             <button v-if="task.status === 'failed'" class="secondary-button"
               :disabled="session.connection.state !== 'connected'" @click="onFileAction(task.clientFileId, false)">重试</button>
-            <button class="secondary-button" @click="onFileAction(task.clientFileId, true)">取消</button>
+            <button class="secondary-button" :disabled="task.status === 'cancelling'"
+              @click="onFileAction(task.clientFileId, true)">{{ task.status === 'cancel_failed' ? '重试取消' : '取消' }}</button>
           </div>
           <div v-if="currentFileProgress.length === 0 && session.currentFileTasks.length === 0" class="muted-text">暂无传输</div>
           <div v-for="item in currentFileProgress" :key="item.fileId" class="file-progress-card">

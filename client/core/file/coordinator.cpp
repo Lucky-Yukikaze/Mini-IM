@@ -101,6 +101,16 @@ void MiniImFileCoordinator::handleAck(const im::message::Ack& ack)
         return;
     }
     const QString request_id = QString::fromStdString(ack.request_id());
+    const auto task = m_tasks.byRequest(request_id);
+    if ((task.value("status") == "cancelling" || task.value("status") == "cancel_failed")
+        && request_id != task.value("cancelRequestId").toString())
+    {
+        return;
+    }
+    if (task.value("status") == "cancelled")
+    {
+        return;
+    }
     handleFileResult(request_id, ack.success(), ack.code(), QString::fromStdString(ack.message()),
         QString::fromStdString(ack.entity_id()));
     const QString finishedFileId = m_pending_file_finish_requests.take(request_id);
@@ -342,6 +352,11 @@ void MiniImFileCoordinator::publishFileTasks()
 void MiniImFileCoordinator::failFileTask(const QString& fileId, const QString& error)
 {
     const auto task = m_tasks.byFile(fileId);
+    if (task.value("status") == "cancelling" || task.value("status") == "cancel_failed"
+        || task.value("status") == "cancelled")
+    {
+        return;
+    }
     if (!task.isEmpty())
     {
         m_tasks.update(task.value("clientFileId").toString(), {{"status", "failed"}, {"error", error},
@@ -369,6 +384,42 @@ void MiniImFileCoordinator::handleFileResult(
         return;
     }
     const QString id = task.value("clientFileId").toString();
+    if (requestId == task.value("cancelRequestId").toString())
+    {
+        if (task.value("status") != "cancelling")
+        {
+            return;
+        }
+        if (success)
+        {
+            if (fileId != id)
+            {
+                throw std::runtime_error("file cancellation confirmation intent mismatch");
+            }
+            m_tasks.update(id, {{"status", "cancelled"}, {"error", ""}});
+        }
+        else
+        {
+            const bool retryable = code == 401 || code == 408 || code == 429 || code >= 500;
+            m_tasks.update(id, {{"status", retryable ? "cancelling" : "cancel_failed"}, {"error", error}});
+            if (!retryable)
+            {
+                emit errorRaised(error);
+            }
+        }
+        if (success || m_tasks.task(id).value("status") == "cancel_failed")
+        {
+            m_activeFileTasks.remove(id);
+            m_fileControlAttempts.remove(requestId);
+        }
+        publishFileTasks();
+        return;
+    }
+    if (task.value("status") == "cancelling" || task.value("status") == "cancel_failed"
+        || task.value("status") == "cancelled")
+    {
+        return;
+    }
     if (success)
     {
         if (fileId.isEmpty())
@@ -424,7 +475,12 @@ bool MiniImFileCoordinator::cancelFile(const QString& clientFileId)
         {
             return false;
         }
-        m_tasks.update(clientFileId, {{"status", "cancelled"}, {"error", ""}});
+        if (task.value("status") == "cancelling")
+        {
+            return true;
+        }
+        m_tasks.update(clientFileId, {{"status", "cancelling"}, {"error", ""},
+            {"cancelRequestId", m_requestIdFactory(QStringLiteral("filecancel"))}});
         publishFileTasks();
         if (m_running)
         {
@@ -451,8 +507,17 @@ void MiniImFileCoordinator::pumpFileTasks()
         {
             const auto task = value.toMap();
             const QString id = task.value("clientFileId").toString();
-            if (task.value("status") == "failed")
+            if (task.value("status") == "failed" || task.value("status") == "cancel_failed")
             {
+                continue;
+            }
+            if (task.value("status") == "cancelling")
+            {
+                const auto attempt = m_fileControlAttempts.constFind(task.value("cancelRequestId").toString());
+                if (attempt == m_fileControlAttempts.constEnd() || attempt->elapsed() >= kRequestRetryMs)
+                {
+                    startFileTask(task);
+                }
                 continue;
             }
             const bool finishing = task.value("status") == "finishing";
@@ -497,6 +562,18 @@ void MiniImFileCoordinator::startFileTask(const QVariantMap& task)
     const bool download = task.value("direction").toInt() == 2;
     const quint64 size = task.value("fileSize").toULongLong();
     const QString hash = task.value("sha256").toString();
+    if (task.value("status") == "cancelling")
+    {
+        const QString cancelRequestId = task.value("cancelRequestId").toString();
+        auto envelope = m_envelopeFactory(cancelRequestId);
+        envelope.set_channel(im::common::CHANNEL_FILE);
+        auto* cancel = envelope.mutable_file_cancel();
+        cancel->set_client_file_id(id.toStdString());
+        cancel->set_file_id(fileId.toStdString());
+        m_fileControlAttempts[cancelRequestId].start();
+        m_sender(envelope.SerializeAsString());
+        return;
+    }
     if (task.value("status") == "finishing")
     {
         if (download && FileDigest(path, size) != hash)
@@ -599,6 +676,11 @@ bool MiniImFileCoordinator::sendFileFinish(
         {
             return false;
         }
+        if (task.value("status") == "cancelling" || task.value("status") == "cancel_failed"
+            || task.value("status") == "cancelled")
+        {
+            return false;
+        }
         const QString requestId = task.value("finishRequestId").toString();
         m_tasks.update(task.value("clientFileId").toString(),
             {{"status", "finishing"}, {"finishSuccess", success},
@@ -645,6 +727,18 @@ void MiniImFileCoordinator::handleFileUpdated(const im::file::FileUpdated& updat
         updated.completed(), updated.version(), updated.updated_at_ms()));
 
     auto task = m_tasks.byFile(fileId);
+    if (task.value("status") == "cancelling" || task.value("status") == "cancel_failed"
+        || task.value("status") == "cancelled")
+    {
+        return;
+    }
+    if (!task.isEmpty() && updated.status() == "cancelled")
+    {
+        m_tasks.update(task.value("clientFileId").toString(), {{"status", "cancelled"}, {"error", ""}});
+        publishFileTasks();
+        emit restartRequested(QStringLiteral("file task cancelled remotely"));
+        return;
+    }
     if (!task.isEmpty() && updated.file_size() > 0)
     {
         m_tasks.update(task.value("clientFileId").toString(),

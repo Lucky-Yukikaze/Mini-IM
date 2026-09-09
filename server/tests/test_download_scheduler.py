@@ -4,6 +4,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -139,6 +140,29 @@ class DownloadSchedulerTest(unittest.IsolatedAsyncioTestCase):
         await self.drain()
         self.assertFalse(self.sender.jobs)
         self.assertNotIn(3, self.quic.fin)
+
+    async def test_cancel_during_disk_read_never_sends_late_chunk_or_fin(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def blocked_read(function, *args):
+            entered.set()
+            await release.wait()
+            return self.payload[:65536]
+        with patch("quic.download.asyncio.to_thread", blocked_read):
+            self.sender.start("cancel-me", self.path, len(self.payload), 0)
+            await entered.wait()
+            before = bytes(self.quic.sends[3])
+            self.sender.cancel("cancel-me")
+            self.sender.cancel("cancel-me")
+            self.assertIn(3, self.sender.jobs, "reset buffers must stay counted until acknowledgement")
+            self.assertIn(3, self.quic.resets)
+            release.set()
+            await self.drain()
+        self.assertEqual(before, bytes(self.quic.sends[3]))
+        self.assertNotIn(3, self.quic.fin)
+        self.assertFalse(self.sender.jobs)
+        self.sender.start("unrelated", self.path, len(self.payload), 0)
+        await self.drain()
+        self.assertTrue(self.quic.sends[7].endswith(self.payload))
 
     async def test_valid_offset_completes_with_only_remaining_content(self):
         self.sender.start("resume", self.path, len(self.payload), 197)

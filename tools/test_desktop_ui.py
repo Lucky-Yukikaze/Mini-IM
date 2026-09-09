@@ -148,7 +148,26 @@ class DesktopCheck:
         self.phase("leave")
         self.phase("join", title="Desktop renamed")
         self.phase("login", user="alice", title="Desktop renamed", switch=True, failure=True)
-        return self.command("snapshot")
+        self.command("file-init-reject", code=503)
+        self.command("file-cancel-reject", code=503)
+        self.phase("upload")
+        self.phase("cancel-file", image=str(self.artifacts / "cancel-pending.png"))
+        self.command("file-cancel-reject", code=0)
+        self.phase("file-cancelled")
+        self.command("file-cancel-reject", code=403)
+        self.phase("upload")
+        self.phase("cancel-file", failed=True, image=str(self.artifacts / "cancel-failed.png"))
+        self.command("file-cancel-reject", code=0)
+        self.phase("cancel-file-retry")
+        self.phase("file-cancelled")
+        state = self.command("snapshot")
+        assert len(state["cancellations"]) == 2
+        attempts = state["fileCancelAttempts"]
+        rejected_intent = attempts[-1]["intent"]
+        assert len({item["requestId"] for item in attempts if item["intent"] == rejected_intent}) == 2
+        for cancellation in state["cancellations"]:
+            assert cancellation["owner_id"] == "alice"
+        return state
 
 
 if __name__ == "__main__":

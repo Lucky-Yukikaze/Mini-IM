@@ -94,7 +94,7 @@ Web 按 web/src/api、store、components、views、events、types 分职责。
 
 核心表按实现演进：users、devices、sessions、conversations、conversation_create_requests、
 control_write_results、conversation_members、messages、message_deliveries、message_read_counters、attachments、
-file_transfers、sync_events、sync_cursors。
+file_transfers、file_cancellations、sync_events、sync_cursors。
 
 ## 已读、撤回与焚毁
 
@@ -112,7 +112,7 @@ file_transfers、sync_events、sync_cursors。
 
 ## 文件传输
 
-- FileInit、FileFinish 负责控制；FileUpdated 带单调版本和更新时间，旧版本不能覆盖新状态。
+- FileInit、FileFinish、FileCancel 负责控制；FileUpdated 带单调版本和更新时间，旧版本不能覆盖新状态。
 - client_file_id 是发送意图 ID；断线或进程重启后继续原任务，不自动改成新上传。
   复用意图时校验大小、摘要、方向及引用一致性。
 - 文件流与控制流独立仍需应用层调度；按发送进度分批读取，限制未完成发送数据。
@@ -120,6 +120,9 @@ file_transfers、sync_events、sync_cursors。
 - 完成条件是实际接收/落盘字节数等于 file_size 且 SHA-256 校验通过。
   下载由下载端落盘校验后确认；发送队列接受数据或流关闭都不能直接代表业务完成。
 - 处理部分写入、磁盘错误、截断、取消、重复完成与恢复偏移；中断不得报告成功。
+- 取消先保存本地意图并停止传输，收到服务端成功确认后才标记取消完成；确认丢失或重启复用原请求。
+  服务端取消记录、任务状态、同步事件与请求结果共同提交；初始化前取消也须阻止迟到初始化恢复任务。
+  已完成文件拒绝取消，取消不删除已发布消息；取消控制请求不占用文件传输名额。
 - 续传和过期任务接管须保证已有数据与记录一致；失败任务保留可恢复意图。
   服务端未完成上传从磁盘实际长度与已提交进度共同确定续传位置，未提交尾部不能直接计入进度。
   进度回退增加版本并与同步事件共同提交；已完成文件不得因旧任务续传而被截断。

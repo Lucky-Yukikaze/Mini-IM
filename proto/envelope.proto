@@ -41,6 +41,7 @@ message Envelope {
     im.file.FileInit file_init = 40;
     im.file.FileFinish file_finish = 41;
     im.file.FileUpdated file_updated = 42;
+    im.file.FileCancel file_cancel = 43;
 
     im.sync.SyncRequest sync_request = 50;
     im.sync.SyncResponse sync_response = 51;

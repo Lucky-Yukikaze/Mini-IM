@@ -102,7 +102,7 @@ export interface FileTaskItem {
   fileName: string;
   path: string;
   direction: number;
-  status: 'pending' | 'transferring' | 'finishing' | 'failed';
+  status: 'pending' | 'transferring' | 'finishing' | 'failed' | 'cancelling' | 'cancel_failed';
   error: string;
 }
 

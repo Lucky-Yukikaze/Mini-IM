@@ -47,7 +47,36 @@ void MiniImFileTaskStore::open(const QSqlDatabase& database)
     m_db = database;
     run(QStringLiteral("CREATE TABLE IF NOT EXISTS file_tasks("
         "id TEXT PRIMARY KEY,init_request TEXT UNIQUE NOT NULL,finish_request TEXT UNIQUE NOT NULL,"
-        "file_id TEXT NOT NULL DEFAULT '',status TEXT NOT NULL,data BLOB NOT NULL)"));
+        "file_id TEXT NOT NULL DEFAULT '',cancel_request TEXT NOT NULL DEFAULT '',status TEXT NOT NULL,data BLOB NOT NULL)"));
+    auto columns = run(QStringLiteral("PRAGMA table_info(file_tasks)"));
+    bool hasCancellation = false;
+    while (columns.next())
+    {
+        hasCancellation = hasCancellation || columns.value(1).toString() == QStringLiteral("cancel_request");
+    }
+    columns.finish();
+    if (!hasCancellation)
+    {
+        run(QStringLiteral("ALTER TABLE file_tasks ADD COLUMN cancel_request TEXT NOT NULL DEFAULT ''"));
+    }
+    run(QStringLiteral("CREATE UNIQUE INDEX IF NOT EXISTS idx_file_tasks_cancel_request "
+        "ON file_tasks(cancel_request) WHERE cancel_request<>''"));
+    auto legacy = run(QStringLiteral("SELECT data FROM file_tasks WHERE status='cancelled' AND cancel_request=''"));
+    QVariantList cancellations;
+    while (legacy.next())
+    {
+        cancellations.append(Decode(legacy.value(0)));
+    }
+    legacy.finish();
+    for (const auto& item : cancellations)
+    {
+        auto task = item.toMap();
+        const auto request = QStringLiteral("legacy-filecancel-") + task.value("requestId").toString();
+        task.insert("cancelRequestId", request);
+        task.insert("status", "cancelling");
+        run(QStringLiteral("UPDATE file_tasks SET status='cancelling',cancel_request=?,data=? WHERE id=?"),
+            {request, Encode(task), task.value("clientFileId")});
+    }
 }
 
 void MiniImFileTaskStore::close()
@@ -91,7 +120,11 @@ QVariantMap MiniImFileTaskStore::byFile(const QString& fileId) const
 QVariantMap MiniImFileTaskStore::byRequest(const QString& requestId) const
 {
     auto result = find(QStringLiteral("init_request"), requestId);
-    return result.isEmpty() ? find(QStringLiteral("finish_request"), requestId) : result;
+    if (result.isEmpty())
+    {
+        result = find(QStringLiteral("finish_request"), requestId);
+    }
+    return result.isEmpty() ? find(QStringLiteral("cancel_request"), requestId) : result;
 }
 
 QVariantList MiniImFileTaskStore::pending() const
@@ -117,11 +150,22 @@ void MiniImFileTaskStore::update(const QString& id, const QVariantMap& changes)
     {
         return;
     }
+    const auto nextStatus = changes.value("status", previousStatus).toString();
+    if ((previousStatus == "cancelling" || previousStatus == "cancel_failed")
+        && nextStatus != "cancelling" && nextStatus != "cancel_failed" && nextStatus != "cancelled")
+    {
+        return;
+    }
     const bool metadataWasReady = value.value("metadataReady").toBool();
     const QStringList immutable{"clientFileId", "requestId", "finishRequestId", "conversationId",
         "path", "direction", "sourceFileId", "priority"};
     for (auto it = changes.begin(); it != changes.end(); ++it)
     {
+        if (it.key() == "cancelRequestId" && !value.value(it.key()).toString().isEmpty()
+            && previousStatus != "cancel_failed" && value.value(it.key()) != it.value())
+        {
+            throw std::runtime_error("pending file cancellation identity cannot change");
+        }
         if ((immutable.contains(it.key()) || (it.key() == "fileId" && !value.value("fileId").toString().isEmpty()))
             && value.value(it.key()) != it.value())
         {
@@ -134,6 +178,7 @@ void MiniImFileTaskStore::update(const QString& id, const QVariantMap& changes)
         }
         value.insert(it.key(), it.value());
     }
-    run(QStringLiteral("UPDATE file_tasks SET file_id=?,status=?,data=? WHERE id=?"),
-        {value.value("fileId", QStringLiteral("")), value.value("status"), Encode(value), id});
+    run(QStringLiteral("UPDATE file_tasks SET file_id=?,status=?,data=?,cancel_request=? WHERE id=?"),
+        {value.value("fileId", QStringLiteral("")), value.value("status"), Encode(value),
+         value.value("cancelRequestId", QStringLiteral("")), id});
 }

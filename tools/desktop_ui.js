@@ -109,6 +109,21 @@ async page => {
     await button('标为已读').click();
   } else if (data.phase === 'settled') {
     await status.getByText('标记已读 · 等待确认', { exact: true }).waitFor({ state: 'hidden' });
+  } else if (data.phase === 'upload') {
+    if (!(await page.getByLabel('发送文件路径', { exact: true }).count())) await button('文件').click();
+    await page.getByLabel('发送文件路径', { exact: true }).fill(data.upload);
+    await button('发送文件').click();
+    await page.locator('.file-task-card').getByText('上传 · desktop-upload.bin', { exact: true }).waitFor();
+  } else if (data.phase === 'cancel-file') {
+    const task = page.locator('.file-task-card');
+    await task.getByRole('button', { name: '取消', exact: true }).click();
+    await task.getByText(data.failed ? '取消未成功' : '取消待确认', { exact: true }).waitFor();
+    if (!data.failed) check(await task.getByRole('button', { name: '取消', exact: true }).isDisabled(), 'duplicate cancellation enabled');
+    if (data.image) await page.screenshot({ path: data.image });
+  } else if (data.phase === 'cancel-file-retry') {
+    await page.locator('.file-task-card').getByRole('button', { name: '重试取消', exact: true }).click();
+  } else if (data.phase === 'file-cancelled') {
+    await page.locator('.file-task-card').waitFor({ state: 'hidden' });
   } else if (data.phase === 'join') {
     await button('加群').click();
     await modal.getByLabel('会话 ID', { exact: true }).fill(data.group);

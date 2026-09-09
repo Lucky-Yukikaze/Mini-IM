@@ -164,3 +164,21 @@ test('control operations restore, remain until native replacement, and isolate a
   session.applyControlWrites([]);
   assert.deepEqual(session.controlWrites, []);
 });
+
+
+test('unconfirmed file cancellation remains visible and account-scoped until native confirmation', () => {
+  const session = createSession();
+  const cancelling = { clientFileId: 'cancel-intent', conversationId: 'private', fileId: 'file',
+    fileName: 'source.bin', path: '/private/source.bin', direction: 1, status: 'cancelling' as const, error: '' };
+  session.applyInitialState({ currentUser: { userId: 'alice' }, fileTasks: [cancelling] });
+  session.applyFileProgress({ eventId: 'late-progress', fileId: 'file', conversationId: 'private',
+    transferredBytes: 128, completed: true, version: 2, updatedAtMs: 2 });
+  assert.equal(session.currentFileTasks[0].status, 'cancelling');
+  session.applyFileTasks([{ ...cancelling, status: 'cancel_failed', error: 'already completed' }]);
+  session.applyInitialState({ currentUser: { userId: 'bob' } });
+  assert.deepEqual(session.fileTasks, []);
+  session.applyInitialState({ currentUser: { userId: 'alice' }, fileTasks: [cancelling] });
+  assert.equal(session.fileTasks[0].clientFileId, 'cancel-intent');
+  session.applyFileTasks([]);
+  assert.deepEqual(session.fileTasks, []);
+});

@@ -37,3 +37,8 @@ message FileUpdated {
   string status = 11;
   string file_name = 12;
 }
+
+message FileCancel {
+  string client_file_id = 1;
+  string file_id = 2;
+}

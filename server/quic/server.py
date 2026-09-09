@@ -60,6 +60,10 @@ class OnlineSessionHub:
             self.m_protocols[user_id] = bucket
         bucket.add(protocol)
 
+    def cancel_file(self, user_id: str, file_id: str) -> None:
+        for protocol in list(self.m_protocols.get(user_id, ())):
+            protocol.m_download_sender.cancel(file_id)
+
     def unregister(self, user_id: str, protocol: "MiniImQuicProtocol") -> None:
         bucket = self.m_protocols.get(user_id)
         if bucket is None:
@@ -386,6 +390,22 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
                 ack_envelope = self._new_response_from_request(envelope)
                 ack_envelope.ack.CopyFrom(result.ack)
                 self._send(event.stream_id, ack_envelope)
+                self.m_online_hub.fanout_sync_events(result.sync_events)
+                continue
+
+            if envelope.HasField("file_cancel"):
+                try:
+                    result = self.m_file_service.handle_file_cancel(
+                        session.user_id, envelope.request_id, envelope.file_cancel)
+                except (OSError, sqlite3.Error) as error:
+                    self._debug(f"file cancellation storage failed: {error}")
+                    self._send_error(event.stream_id, envelope, 503, "file cancellation could not be committed")
+                    continue
+                if result.ack.success and result.cancelled_file_id:
+                    self.m_online_hub.cancel_file(session.user_id, result.cancelled_file_id)
+                response = self._new_response_from_request(envelope)
+                response.ack.CopyFrom(result.ack)
+                self._send(event.stream_id, response)
                 self.m_online_hub.fanout_sync_events(result.sync_events)
                 continue
 

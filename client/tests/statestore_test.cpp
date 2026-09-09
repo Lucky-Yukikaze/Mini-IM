@@ -357,11 +357,67 @@ void CheckDurableFileTasks()
     cancelled["requestId"] = "cancel-init";
     cancelled["finishRequestId"] = "cancel-finish";
     store.fileTasks().create(cancelled);
+    store.fileTasks().update("cancelled", {{"status", "cancelling"}, {"cancelRequestId", "cancel-request"}});
     store.fileTasks().update("cancelled", {{"status", "cancelled"}});
     store.fileTasks().update("cancelled", {{"status", "transferring"}});
     store.close();
     Open(store, root);
     Require(store.fileTasks().pending().isEmpty(), "cancelled file resumed after restart");
+}
+
+void CheckFileCancellationRecovery()
+{
+    QTemporaryDir root;
+    MiniImStateStore store;
+    Open(store, root);
+    const QVariantMap task{{"clientFileId", "intent"}, {"requestId", "init"}, {"finishRequestId", "finish"},
+        {"conversationId", "conversation"}, {"path", "/data/file"}, {"direction", 1}, {"status", "pending"}};
+    store.fileTasks().create(task);
+    const auto path = store.databasePath();
+    store.close();
+    Query(path, "DROP INDEX idx_file_tasks_cancel_request");
+    Query(path, "ALTER TABLE file_tasks DROP COLUMN cancel_request");
+    Open(store, root);
+    Require(store.fileTasks().byRequest("init").value("clientFileId") == "intent", "cancel migration lost task");
+    Query(path, "CREATE TRIGGER reject_cancel BEFORE UPDATE ON file_tasks BEGIN SELECT RAISE(ABORT,'injected'); END");
+    bool rejected = false;
+    try { store.fileTasks().update("intent", {{"status", "cancelling"}, {"cancelRequestId", "cancel"}}); }
+    catch (const std::exception&) { rejected = true; }
+    Require(rejected && store.fileTasks().byRequest("cancel").isEmpty(), "cancel save failure persisted partial state");
+    Query(path, "DROP TRIGGER reject_cancel");
+    store.fileTasks().update("intent", {{"status", "cancelling"}, {"cancelRequestId", "cancel"}});
+    store.fileTasks().update("intent", {{"status", "completed"}});
+    store.fileTasks().update("intent", {{"status", "transferring"}});
+    store.close();
+    Open(store, root, "carol");
+    Require(store.fileTasks().pending().isEmpty(), "file cancellation crossed account boundary");
+    Open(store, root);
+    Require(store.fileTasks().byRequest("cancel").value("status") == "cancelling", "pending cancellation not restored");
+    rejected = false;
+    try { store.fileTasks().update("intent", {{"cancelRequestId", "changed"}}); }
+    catch (const std::exception&) { rejected = true; }
+    Require(rejected, "pending cancellation changed its request identity");
+    store.fileTasks().update("intent", {{"status", "cancel_failed"}, {"error", "rejected"}});
+    store.fileTasks().update("intent", {{"status", "cancelling"}, {"cancelRequestId", "new-cancel"}});
+    Require(store.fileTasks().byRequest("cancel").isEmpty(), "new cancellation action retained old response mapping");
+    store.fileTasks().update("intent", {{"status", "cancelled"}});
+    store.close();
+    Open(store, root);
+    Require(store.fileTasks().pending().isEmpty(), "confirmed cancellation replayed after restart");
+    auto legacy = task;
+    legacy["clientFileId"] = "legacy";
+    legacy["requestId"] = "legacy-init";
+    legacy["finishRequestId"] = "legacy-finish";
+    store.fileTasks().create(legacy);
+    store.fileTasks().update("legacy", {{"status", "cancelled"}});
+    store.close();
+    Open(store, root);
+    const auto upgraded = store.fileTasks().task("legacy");
+    Require(upgraded.value("status") == "cancelling", "legacy local cancellation did not queue server confirmation");
+    store.close();
+    Open(store, root);
+    Require(store.fileTasks().task("legacy").value("cancelRequestId") == upgraded.value("cancelRequestId"),
+        "legacy cancellation migration changed request on reopen");
 }
 
 void CheckMonotonicObjectVersions()
@@ -395,6 +451,7 @@ int main(int argc, char* argv[])
         CheckReadSnapshotAndAccountIsolation();
         CheckMonotonicObjectVersions();
         CheckDurableFileTasks();
+        CheckFileCancellationRecovery();
         CheckOutboxIdentityRecoveryAndConfirmation();
         CheckOutboxFailureAndTerminalCleanup();
         std::cout << "State store: gaps, rollback, terminal states, read snapshots, isolation and versions passed\n";

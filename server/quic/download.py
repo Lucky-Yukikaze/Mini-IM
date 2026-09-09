@@ -82,6 +82,14 @@ class DownloadScheduler:
         if self.task is None or self.task.done():
             self.task = asyncio.create_task(self._run())
 
+    def cancel(self, file_id: str) -> None:
+        for stream_id, job in list(self.jobs.items()):
+            if job.file_id == file_id:
+                self.protocol._quic.reset_stream(stream_id, 0x1005)
+                job.eof = True
+        self.protocol.transmit()
+        self.notify()
+
     def notify(self) -> None:
         self.changed.set()
 
@@ -102,6 +110,8 @@ class DownloadScheduler:
                 for job in sorted(list(self.jobs.values()), key=lambda value: -value.priority):
                     if self.closed:
                         break
+                    if self.jobs.get(job.stream_id) is not job:
+                        continue
                     if self.buffer.finished(job.stream_id):
                         self.jobs.pop(job.stream_id, None)
                         progressed = True
@@ -115,6 +125,8 @@ class DownloadScheduler:
                         chunk = await asyncio.to_thread(ReadChunk, job.path, job.offset, min(CHUNK_SIZE, budget))
                         if self.closed:
                             break
+                        if self.jobs.get(job.stream_id) is not job:
+                            continue
                         if self.buffer.reset_requested(job.stream_id) or self.buffer.finished(job.stream_id):
                             continue
                         if job.offset + len(chunk) > job.size:
