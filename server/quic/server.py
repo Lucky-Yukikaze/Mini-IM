@@ -221,6 +221,8 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
             item = file_pb2.FileUpdated()
             item.ParseFromString(event.payload)
             sync_event.file_updated.CopyFrom(item)
+        elif event.event_type == "read_count_updated":
+            sync_event.read_count_updated.ParseFromString(event.payload)
         elif event.event_type == "delivery_updated":
             sync_event.delivery_updated.ParseFromString(event.payload)
         else:

@@ -2,6 +2,7 @@ import type { MessageItem } from '../types';
 
 export function deliveryLabel(item: MessageItem, currentUserId: string, conversationType: string): string {
   if (item.senderId !== currentUserId || item.recalled || item.burned || item.unreadCount === 0) return '';
+  if (item.readCountKnown === false) return '';
   const recipients = (item.deliveries ?? []).filter(delivery => delivery.userId !== item.senderId);
   const received = recipients.filter(delivery => delivery.status === 'delivered' || delivery.status === 'read');
   if (conversationType === 'direct') {

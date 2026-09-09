@@ -31,6 +31,14 @@ message DeliveryUpdated {
   string failure_reason = 10;
 }
 
+// Absolute display count for the recipients recorded when the message was sent.
+message ReadCountUpdated {
+  string event_id = 1;
+  string conversation_id = 2;
+  string message_id = 3;
+  uint32 unread_count = 4;
+}
+
 message SyncEvent {
   string event_id = 1;
   uint64 global_seq = 2;
@@ -41,6 +49,7 @@ message SyncEvent {
     im.conversation.ConversationUpdated conversation_updated = 13;
     im.file.FileUpdated file_updated = 14;
     DeliveryUpdated delivery_updated = 15;
+    ReadCountUpdated read_count_updated = 16;
   }
 }
 

@@ -66,10 +66,12 @@ struct Fixture
         QObject::connect(&sync, &MiniImSyncCoordinator::ready, [&]() { ++readyCount; });
         QObject::connect(&sync, &MiniImSyncCoordinator::failed, [&]() { ++failedCount; });
         QObject::connect(&sync, &MiniImSyncCoordinator::errorRaised, [&]() { ++errors; });
-        QObject::connect(&sync, &MiniImSyncCoordinator::eventApplied, [&](const MiniImStateEvent&)
+        QObject::connect(&sync, &MiniImSyncCoordinator::eventApplied, [&](const MiniImStateEvent& event)
         {
             ++appliedCount;
-            Require(!store.snapshot().value("recentMessages").toList().isEmpty(), "state committed before delivery");
+            const QString objects = event.type == QStringLiteral("readCount")
+                ? QStringLiteral("readCounts") : QStringLiteral("recentMessages");
+            Require(!store.snapshot().value(objects).toList().isEmpty(), "state committed before delivery");
         });
         sync.start();
     }
@@ -184,6 +186,28 @@ void CheckConfirmationSaveFailureAndDeliveryMapping()
     Require(fixture.store.cursor() == 2 && fixture.sync.isReady(), "delivery is a supported sync event");
 }
 
+void CheckReadCountMapping()
+{
+    Fixture fixture;
+    im::sync::SyncEvent event;
+    event.set_global_seq(2);
+    event.set_event_id("count-2");
+    auto* count = event.mutable_read_count_updated();
+    count->set_event_id("count-2");
+    count->set_message_id("message-1");
+    count->set_conversation_id("conversation");
+    count->set_unread_count(0);
+    fixture.reply("", {event});
+    fixture.reply(fixture.sent.first().request_id(), {Message(1)}, false, 2);
+    const auto snapshot = fixture.store.snapshot();
+    Require(fixture.store.cursor() == 2 && fixture.sync.isReady(), "read count is a supported sync event");
+    const auto saved = snapshot.value("readCounts").toList().first().toMap();
+    Require(saved.value("globalSeq").toInt() == 2 && saved.value("unreadCount").toInt() == 0,
+        "read count lost its identity, position or zero count");
+    Require(snapshot.value("recentMessages").toList().first().toMap().value("unreadCount").toInt() == 0,
+        "message arriving after count changed its value");
+}
+
 void CheckPaginationAndLateReply()
 {
     Fixture fixture;
@@ -276,6 +300,7 @@ int main(int argc, char** argv)
     QCoreApplication application(argc, argv);
     try
     {
+        CheckReadCountMapping();
         CheckDurableConfirmationRetries();
         CheckConfirmationSaveFailureAndDeliveryMapping();
         CheckPaginationAndLateReply();

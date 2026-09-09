@@ -112,6 +112,16 @@ async page => {
       await row.getByText('1 人未读', { exact: true }).waitFor();
     }
     if (data.image) await page.screenshot({ path: data.image });
+  } else if (data.phase === 'late-member') {
+    if (!(await page.getByPlaceholder('成员 ID，逗号分隔', { exact: true }).count())) await button('成员').click();
+    await page.getByPlaceholder('成员 ID，逗号分隔', { exact: true }).fill('cindy');
+    await button('邀请').click();
+    await page.locator('.member-chip').filter({ hasText: 'cindy' }).waitFor();
+  } else if (data.phase === 'late-member-count') {
+    const row = page.locator('.message-row').filter({ hasText: 'Desktop delivery' });
+    await row.getByText('1 人未读', { exact: true }).waitFor();
+    await row.getByText('等待送达', { exact: true }).waitFor();
+    if (data.image) await page.screenshot({ path: data.image });
   } else if (data.phase === 'recall') {
     await page.getByPlaceholder('输入消息', { exact: true }).fill('Desktop recall');
     await button('发送').click();

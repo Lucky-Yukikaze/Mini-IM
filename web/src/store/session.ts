@@ -4,6 +4,7 @@ import type {
   ControlWriteItem,
   ConversationItem,
   DeliveryUpdate,
+  ReadCountUpdate,
   InitialStatePayload,
   FileProgressItem,
   FileTaskItem,
@@ -26,6 +27,7 @@ interface SessionStoreState {
   messagesByConversation: Record<string, MessageItem[]>;
   fileProgressByConversation: Record<string, FileProgressItem[]>;
   readProgressByConversation: Record<string, Record<string, number>>;
+  readCountsByConversation: Record<string, Record<string, ReadCountUpdate>>;
   deliveriesByConversation: Record<string, Record<string, Record<string, DeliveryUpdate>>>;
   pendingMessageStateByConversation: Record<string, Record<string, { recalled: boolean; burned: boolean }>>;
 }
@@ -63,6 +65,7 @@ function ensureMessageDefaults(item: Partial<MessageItem>): MessageItem {
     recalled: item.recalled ?? false,
     burned: item.burned ?? false,
     unreadCount: item.unreadCount ?? 0,
+    readCountKnown: item.readCountKnown ?? true,
     burnMode: item.burnMode ?? 0,
     burnTtlSec: item.burnTtlSec ?? 0
   };
@@ -102,22 +105,6 @@ function upsertSortedMessage(list: MessageItem[], item: MessageItem): MessageIte
   return nextItem;
 }
 
-function applyReadProgressToMessage(
-  item: MessageItem,
-  conversationProgress: Record<string, number> | undefined
-): MessageItem {
-  if (!conversationProgress) {
-    return item;
-  }
-  let unreadCount = item.unreadCount;
-  for (const [readerId, lastReadSeq] of Object.entries(conversationProgress)) {
-    if (readerId !== item.senderId && item.seq > 0 && item.seq <= lastReadSeq) {
-      unreadCount = Math.max(0, unreadCount - 1);
-    }
-  }
-  return { ...item, unreadCount };
-}
-
 function countsAsUnread(
   item: MessageItem | undefined,
   userId: string,
@@ -145,6 +132,7 @@ export const useSessionStore = defineStore('session', {
     messagesByConversation: {},
     fileProgressByConversation: {},
     readProgressByConversation: {},
+    readCountsByConversation: {},
     deliveriesByConversation: {},
     pendingMessageStateByConversation: {}
   }),
@@ -217,6 +205,10 @@ export const useSessionStore = defineStore('session', {
       if (payload.messageSends !== undefined) {
         this.applyMessageSends(payload.messageSends);
       }
+      if (payload.readCounts !== undefined) {
+        this.readCountsByConversation = {};
+        for (const count of payload.readCounts) this.applyMessageUpdated(count);
+      }
       if (payload.deliveries !== undefined) {
         this.deliveriesByConversation = {};
         for (const delivery of payload.deliveries) this.applyMessageUpdated(delivery);
@@ -231,6 +223,8 @@ export const useSessionStore = defineStore('session', {
         const grouped: Record<string, MessageItem[]> = {};
         for (const rawItem of payload.recentMessages) {
           const item = ensureMessageDefaults(rawItem);
+          const count = this.readCountsByConversation[item.conversationId]?.[item.id];
+          if (count) { item.unreadCount = count.unreadCount; item.readCountKnown = true; }
           const list = grouped[item.conversationId] ?? [];
           list.push(item);
           grouped[item.conversationId] = list;
@@ -281,10 +275,8 @@ export const useSessionStore = defineStore('session', {
           item.burned = item.burned || pending.burned;
           delete this.pendingMessageStateByConversation[item.conversationId][item.id];
         }
-        const normalizedItem = applyReadProgressToMessage(
-          item,
-          this.readProgressByConversation[item.conversationId]
-        );
+        const count = this.readCountsByConversation[item.conversationId]?.[item.id];
+        const normalizedItem = count ? { ...item, unreadCount: count.unreadCount, readCountKnown: true } : item;
         const list = this.messagesByConversation[item.conversationId] ?? [];
         const progress = this.readProgressByConversation[item.conversationId];
         const existing = list.find((entry) => entry.id === normalizedItem.id);
@@ -307,6 +299,17 @@ export const useSessionStore = defineStore('session', {
       }
     },
     applyMessageUpdated(update: MessageUpdate): void {
+      if (update.type === 'readCount') {
+        const counts = this.readCountsByConversation[update.conversationId] ?? {};
+        const previous = counts[update.messageId];
+        if (!previous || update.globalSeq > previous.globalSeq) {
+          counts[update.messageId] = update;
+          this.readCountsByConversation[update.conversationId] = counts;
+          const item = this.messagesByConversation[update.conversationId]?.find(message => message.id === update.messageId);
+          if (item) { item.unreadCount = update.unreadCount; item.readCountKnown = true; }
+        }
+        return;
+      }
       if (update.type === 'delivery') {
         const conversation = this.deliveriesByConversation[update.conversationId] ?? {};
         const deliveries = conversation[update.messageId] ?? {};
@@ -353,9 +356,6 @@ export const useSessionStore = defineStore('session', {
       const list = this.messagesByConversation[update.conversationId] ?? [];
       let readByCurrentUser = 0;
       for (const item of list) {
-        if (item.seq > oldLastReadSeq && item.seq <= update.lastReadSeq && item.senderId !== update.readerId) {
-          item.unreadCount = Math.max(0, item.unreadCount - 1);
-        }
         if (
           update.readerId === this.currentUserId &&
           countsAsUnread(item, this.currentUserId, conversationProgress) &&

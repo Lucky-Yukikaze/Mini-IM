@@ -107,7 +107,7 @@ class ReliabilityTest(unittest.TestCase):
         events = (self.m_created_events + sent.sync_events + receipt.sync_events
                   + recalled.sync_events + uploaded.sync_events + burn.sync_events + burned)
         self.assertEqual(
-            {"conversation_updated", "message", "receipt", "recall", "file_updated"},
+            {"conversation_updated", "message", "receipt", "recall", "file_updated", "read_count_updated"},
             {event.event_type for event in events},
         )
         for event in events:

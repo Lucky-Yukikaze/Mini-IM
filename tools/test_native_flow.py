@@ -636,6 +636,89 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         return dict(self.db.execute_fetchone(
             "SELECT * FROM message_deliveries WHERE server_msg_id=? AND user_id='bob'", (message,)))
 
+    async def test_membership_read_counts_use_original_recipients_and_survive_restart(self):
+        repo = ConversationRepo(self.db)
+        for user in ("carol", "dave"):
+            repo.ensure_user(user)
+        mark = await self.alice.command("group", intent="count-group", title="original recipients", members=["carol", "dave"])
+        group = (await self.alice.wait("conversation", lambda item: item["type"] == "group", since=mark))["conversationId"]
+
+        async def send_message(intent):
+            mark = await self.alice.command("message", conversation=group, intent=intent, text=intent)
+            return await self.alice.wait("message", lambda item: item["clientMsgId"] == intent, since=mark)
+
+        async def bob_control(operation, **args):
+            mark = await self.bob.command(operation, conversation=group, **args)
+            await self.bob.wait("control-writes", lambda item: item["items"] == [], since=mark)
+
+        async def count_changed(message, unread):
+            return await self.alice.wait("update", lambda item: item["type"] == "readCount" and
+                item["messageId"] == message["id"] and item["unreadCount"] == unread)
+
+        first = await send_message("before-bob-joined")
+        await bob_control("join")
+        await bob_control("receipt", seq=first["seq"])
+        self.assertEqual(2, self.db.execute_fetchone("SELECT unread_count FROM message_read_counters "
+            "WHERE server_msg_id=?", (first["id"],))[0])
+        second = await send_message("bob-receives")
+        await bob_control("receipt", seq=second["seq"])
+        await count_changed(second, 2)
+        await bob_control("leave")
+        absent = await send_message("bob-was-absent")
+        await bob_control("join")
+        await bob_control("receipt", seq=absent["seq"])
+        latest = await send_message("bob-returned")
+        await bob_control("receipt", seq=latest["seq"])
+        await count_changed(latest, 2)
+        pending = await send_message("sender-will-leave")
+        mark = await self.alice.command("leave", conversation=group)
+        await self.alice.wait("control-writes", lambda item: item["items"] == [], since=mark)
+        await bob_control("receipt", seq=pending["seq"])
+        await count_changed(pending, 2)
+        await self.confirmations_settled()
+        await self.alice.crash()
+        self.alice = await NativeClient.start(self.driver_path,
+            self.output_dir / f"{self._testMethodName}-alice-restarted.log", self.root / "state-alice")
+        self.clients.append(self.alice)
+        snapshot = await self.alice.connect(self.endpoint, "alice")
+        actual = {item["clientMsgId"]: item for item in snapshot["recentMessages"] if item["conversationId"] == group}
+        for message in (first, second, absent, latest, pending):
+            self.assertEqual(2, actual[message["clientMsgId"]]["unreadCount"])
+            self.assertTrue(actual[message["clientMsgId"]]["readCountKnown"])
+        self.assertEqual(2, len(self.db.execute_fetchall("SELECT user_id FROM message_deliveries "
+            "WHERE server_msg_id=? AND user_id<>'alice'", (absent["id"],))))
+
+    async def test_read_count_migration_corrects_legacy_native_cache_without_resetting_cursor(self):
+        await self.alice.command("message", conversation=self.conversation, intent="legacy-count", text="kept history")
+        message = await self.bob.wait("message", lambda item: item["clientMsgId"] == "legacy-count")
+        await self.bob.command("receipt", conversation=self.conversation, seq=message["seq"])
+        await self.alice.wait("update", lambda item: item["type"] == "readCount" and item["unreadCount"] == 0)
+        await self.confirmations_settled()
+        await self.alice.crash()
+        cache_path = next((self.root / "state-alice").glob("*.sqlite"))
+        with closing(sqlite3.connect(cache_path)) as cache, cache:
+            before_cursor = int(cache.execute("SELECT value FROM metadata WHERE key='cursor'").fetchone()[0])
+            cache.execute("DELETE FROM objects WHERE kind='readCount'")
+            cache.execute("UPDATE objects SET data=json_set(data,'$.unreadCount',1) WHERE kind='message'")
+        self.db.execute_write("DELETE FROM schema_migrations WHERE name='read_count_events_v1'")
+        init_db(self.db_path)
+        self.alice = await NativeClient.start(self.driver_path,
+            self.output_dir / f"{self._testMethodName}-alice-upgraded.log", self.root / "state-alice")
+        self.clients.append(self.alice)
+        initial = await self.alice.connect(self.endpoint, "alice")
+        self.assertEqual(before_cursor, initial["globalCursor"])
+        self.assertFalse(initial["recentMessages"][0]["readCountKnown"])
+        corrected = await self.alice.wait("update", lambda item: item["type"] == "readCount" and
+            item["messageId"] == message["id"] and item["globalSeq"] > before_cursor)
+        self.assertEqual(0, corrected["unreadCount"])
+        await self.synced(self.alice, "alice")
+        await self.disconnect(self.alice)
+        restored = await self.alice.connect(self.endpoint, "alice")
+        self.assertEqual(0, restored["recentMessages"][0]["unreadCount"])
+        self.assertEqual("kept history", restored["recentMessages"][0]["text"])
+        self.assertTrue(restored["recentMessages"][0]["readCountKnown"])
+        self.assertGreater(restored["globalCursor"], before_cursor)
+
     async def test_native_delivery_waits_for_offline_receiver_and_restores_sender_display(self):
         await self.disconnect(self.bob)
         await self.alice.command("message", conversation=self.conversation, intent="delivery-offline", text="offline")

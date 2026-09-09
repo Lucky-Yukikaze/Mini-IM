@@ -1,7 +1,8 @@
 """Rebuild display counts from original deliveries and preserve departed readers."""
 import time
 
-from protocol.pb import message_pb2
+from protocol.pb import message_pb2, sync_pb2
+from storage.repo.sync_event import AppendSyncEvents
 
 
 def RebuildReadCounters(connection, now_ms, conversation_id="", after_seq=0, through_seq=9223372036854775807):
@@ -46,4 +47,28 @@ def MigrateMembershipReads(connection):
         ),0))
     """)
     RebuildReadCounters(connection, now_ms)
+    connection.execute("INSERT INTO schema_migrations(name,applied_at_ms) VALUES(?,?)", (name, now_ms))
+
+
+def AppendReadCounts(connection, rows, now_ms):
+    events = []
+    for row in rows:
+        recipients = connection.execute(
+            "SELECT user_id FROM message_deliveries WHERE server_msg_id=? ORDER BY user_id",
+            (row["server_msg_id"],)).fetchall()
+        body = sync_pb2.ReadCountUpdated(conversation_id=row["conversation_id"],
+            message_id=row["server_msg_id"], unread_count=row["unread_count"])
+        events.extend(AppendSyncEvents(connection, [recipient[0] for recipient in recipients],
+            row["conversation_id"], "read_count_updated", body, now_ms))
+    return events
+
+
+def MigrateReadCountEvents(connection):
+    name = "read_count_events_v1"
+    if connection.execute("SELECT 1 FROM schema_migrations WHERE name=?", (name,)).fetchone():
+        return
+    now_ms = int(time.time() * 1000)
+    rows = connection.execute("SELECT server_msg_id,conversation_id,unread_count "
+                              "FROM message_read_counters ORDER BY conversation_id,conversation_seq").fetchall()
+    AppendReadCounts(connection, rows, now_ms)
     connection.execute("INSERT INTO schema_migrations(name,applied_at_ms) VALUES(?,?)", (name, now_ms))

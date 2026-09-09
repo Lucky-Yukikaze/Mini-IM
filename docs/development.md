@@ -203,7 +203,20 @@ npm --prefix ./web run dev -- --host 127.0.0.1 --port 5173 --strictPort
 此处标记是 `schema_migrations` 表内 `name` 字段的值；重复启动跳过本次数据修复。
 修复数据与标记共同提交，失败后可重新启动重试；新建的空表可能保留，原业务数据不清空。
 旧库缺少对应历史事件时只能保留已有证据中的位置，不推测丢失的读取范围。
-本次修复不产生新的同步事件，Qt 与页面已有缓存中的历史计数纠正仍待下一模块完成。
+另一次升级 `read_count_events_v1` 为已有消息的每个原投递用户追加 ReadCountUpdated，
+即按原收件记录计算的单条消息实际未读人数；发送者离群后仍收到自己历史消息的计数。
+计数纠正事件与升级标记共同提交，失败回滚后重试，不改变已有事件标识、已读时间或客户端同步位置。
+收到真实已读请求时，仅为首次读取的原收件投递产生计数事件，与业务变化及请求结果共同提交；
+新成员读旧消息、重复读取和离群期间无投递的消息不会产生计数变化。
+
+Qt 将计数独立保存为 `objects.kind=readCount`，初始状态的 `readCounts` 和 `messageUpdated.type=readCount`
+向页面提供人数与事件位置；消息先到时采用消息初始人数，计数先到时保留计数，旧事件不能回退新结果。
+`readCountKnown=false` 表示旧缓存缺少可信计数，页面暂时显示“已读状态同步中”，补拉纠正事件后恢复人数。
+Receipt 继续保存用户的已读位置及计算当前用户未读总数；页面不再用其他读者的位置扣减每条消息的人数。
+计数事件不携带正文，不改变已撤回或已焚毁状态。
+
+本次新增 SyncEvent 字段号 16，服务端、Qt 和内嵌页面须配套升级；旧客户端不支持该事件，
+不能把旧版本与本版服务端混用作为支持组合。大规模旧库升级耗时和新增事件容量尚未测量。
 
 [成员已读回归](../server/tests/test_membership_reads.py) 随服务端全量测试执行；只运行该专项可使用：
 
@@ -213,7 +226,7 @@ npm --prefix ./web run dev -- --host 127.0.0.1 --port 5173 --strictPort
 
 真实网络成员变更、原收件人计数及数据库重开检查位于
 [控制写入网络测试](../server/tests/test_control_write_network.py)，运行服务端全量测试即可覆盖。
-服务端与原生/页面的验收边界见 [执行记录](refactoring-progress.md#服务端成员变更与历史已读--2026-09-10)。
+服务端与原生/页面的验收边界见 [执行记录](refactoring-progress.md#跨端成员已读计数与旧缓存纠正--2026-09-10)。
 
 ## 收件确认与旧库升级
 
@@ -378,7 +391,10 @@ ctest --test-dir ./build/client_qt611 -C Release --output-on-failure
 多设备消息场景分别使用单聊和固定成员群聊，验证两名用户各两台设备的发送、并发已读、撤回、
 接收方设备离线和进程重启，以及恢复快照、未读总数和持久事件去重。
 可追加 `--test test_multidevice_direct_reads_recall_and_restart --test test_multidevice_group_reads_recall_and_restart`
-仅运行这两个场景。这两个场景等待各设备收件确认完成后核对缓存；群成员变更仍需单独验收。
+仅运行这两个场景。这两个场景等待各设备收件确认完成后核对缓存。
+成员变化另有 `test_membership_read_counts_use_original_recipients_and_survive_restart`，覆盖新加入、退出重入、
+离群期间消息、发送者离群后的计数和重启；`test_read_count_migration_corrects_legacy_native_cache_without_resetting_cursor`
+覆盖旧服务数据补发纠正事件和已有 Qt 缓存恢复，均可通过 `--test` 单独运行。
 收件确认另有五项专项：离线收件及发送端恢复、确认丢失、确认意图跨进程恢复、同步缺口、本地保存失败。
 服务进程重启由下述独立入口验证；Vue 完整桌面页面、其他多设备业务流程及传输性能需另外验收。
 可在上述联调命令后追加 `--test test_process_restart_fills_persisted_sync_gap` 单独复核一个场景，

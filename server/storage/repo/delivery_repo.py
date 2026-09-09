@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 from protocol.pb import common_pb2, message_pb2
 from storage.repo.sync_event import AppendSyncEvents, PurgedMessageContent, RedactMessageEvents, StoredSyncEvent
-from storage.repo.read_state import RebuildReadCounters
+from storage.repo.read_state import RebuildReadCounters, AppendReadCounts
 from storage.sqlite.db import MiniImSqliteDb
 
 
@@ -72,6 +72,11 @@ class DeliveryRepo:
             if new_last_read_seq <= old_last_read_seq:
                 return ReceiptApplyResult(receipt=receipt, sync_events=[], updated=False)
 
+            changed_messages = connection.execute(
+                "SELECT d.server_msg_id FROM message_deliveries AS d JOIN messages AS m "
+                "ON m.server_msg_id=d.server_msg_id WHERE d.user_id=? AND d.conversation_id=? "
+                "AND d.seq>? AND d.seq<=? AND d.read_at_ms IS NULL AND m.sender_id<>?",
+                (user_id, conversation_id, old_last_read_seq, new_last_read_seq, user_id)).fetchall()
             connection.execute(
                 """
                 UPDATE conversation_members
@@ -150,6 +155,11 @@ class DeliveryRepo:
                 connection, [str(row["user_id"]) for row in member_rows],
                 conversation_id, "receipt", receipt, now_ms,
             )
+
+            for changed in changed_messages:
+                row = connection.execute("SELECT server_msg_id,conversation_id,unread_count "
+                    "FROM message_read_counters WHERE server_msg_id=?", (changed[0],)).fetchone()
+                sync_events.extend(AppendReadCounts(connection, [row], now_ms))
 
         return ReceiptApplyResult(receipt=receipt, sync_events=sync_events, updated=True)
 

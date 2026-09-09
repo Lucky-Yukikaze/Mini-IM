@@ -72,7 +72,7 @@ def _ensure_sync_event_columns(db: MiniImSqliteDb) -> None:
 
 def init_db(db_path: Path) -> None:
     from storage.repo.sync_event import MigrateMessageEvents
-    from storage.repo.read_state import MigrateMembershipReads
+    from storage.repo.read_state import MigrateMembershipReads, MigrateReadCountEvents
 
     db = MiniImSqliteDb(db_path)
     try:
@@ -85,5 +85,6 @@ def init_db(db_path: Path) -> None:
         with db.transaction() as connection:
             MigrateMessageEvents(connection)
             MigrateMembershipReads(connection)
+            MigrateReadCountEvents(connection)
     finally:
         db.close()

@@ -36,6 +36,8 @@ test('late delivery cannot regress read and old positions cannot replace newer d
   state.pushMessage(message);
   state.applyMessageUpdated({ type: 'receipt', eventId: 'read', conversationId: 'c1',
     lastReadSeq: 1, readAtMs: 3, readerId: 'bob' });
+  state.applyMessageUpdated({ type: 'readCount', eventId: 'count', globalSeq: 4,
+    conversationId: 'c1', messageId: message.id, unreadCount: 0 });
   state.applyMessageUpdated(delivered);
   state.applyMessageUpdated({ ...delivered, globalSeq: 1, status: 'sent', deliveredAtMs: 0 });
   assert.equal(state.currentMessages[0].deliveries?.[0].status, 'read');

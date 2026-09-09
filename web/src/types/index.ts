@@ -9,6 +9,7 @@ export interface MessageItem {
   recalled: boolean;
   burned: boolean;
   unreadCount: number;
+  readCountKnown?: boolean;
   burnMode: number;
   burnTtlSec: number;
   deliveries?: DeliveryUpdate[];
@@ -38,6 +39,7 @@ export interface InitialStatePayload {
   globalCursor?: number;
   readProgressByConversation?: Record<string, Record<string, number>>;
   deliveries?: DeliveryUpdate[];
+  readCounts?: ReadCountUpdate[];
   files?: FileProgressItem[];
   messageSends?: MessageSendItem[];
   fileTasks?: FileTaskItem[];
@@ -86,7 +88,16 @@ export interface DeliveryUpdate {
   failureReason: string;
 }
 
-export type MessageUpdate = ReceiptUpdate | RecallUpdate | BurnUpdate | DeliveryUpdate;
+export interface ReadCountUpdate {
+  type: 'readCount';
+  eventId: string;
+  globalSeq: number;
+  conversationId: string;
+  messageId: string;
+  unreadCount: number;
+}
+
+export type MessageUpdate = ReceiptUpdate | RecallUpdate | BurnUpdate | DeliveryUpdate | ReadCountUpdate;
 
 export interface FileProgressItem {
   eventId: string;

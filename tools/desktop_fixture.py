@@ -45,7 +45,15 @@ from storage.sqlite.db import MiniImSqliteDb
 def write_json(path, value):
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(path)
+    deadline = time.monotonic() + 2
+    while True:
+        try:
+            temporary.replace(path)
+            break
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
 
 
 class DesktopFixture:
@@ -199,9 +207,9 @@ class DesktopFixture:
             if not result.ack.success:
                 raise ValueError(result.ack.message)
             self.hub.fanout_sync_events(result.sync_events)
-        elif op == "read-bob":
+        elif op in ("read-bob", "read-cindy"):
             seq = self.db.execute_fetchone("SELECT MAX(conversation_seq) FROM messages WHERE conversation_id=?", (self.group,))[0]
-            result = DeliveryRepo(self.db).apply_receipt("bob", self.group, seq)
+            result = DeliveryRepo(self.db).apply_receipt("bob" if op == "read-bob" else "cindy", self.group, seq)
             self.hub.fanout_sync_events(result.sync_events)
         elif op == "cache-fault":
             identity = json.dumps([f"127.0.0.1:{self.port}", data.get("user", "alice"),
@@ -247,7 +255,7 @@ async def run(args):
             while time.monotonic() < deadline:
                 try:
                     data = json.loads((output / "command.json").read_text(encoding="utf-8-sig"))
-                except (FileNotFoundError, json.JSONDecodeError):
+                except (FileNotFoundError, PermissionError, json.JSONDecodeError):
                     await asyncio.sleep(0.1)
                     continue
                 if data["id"] != seen:

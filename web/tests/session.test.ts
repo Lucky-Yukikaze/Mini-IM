@@ -75,6 +75,8 @@ test('native snapshot restores read counts without subtracting them again on rep
     currentUser: { userId: 'alice' }, globalCursor: 12, unreadTotal: 0,
     conversations: [...session.conversations],
     recentMessages: [{ ...raw, unreadCount: 0 }],
+    readCounts: [{ type: 'readCount', eventId: 'absolute', globalSeq: 11,
+      conversationId: 'private', messageId: raw.id, unreadCount: 0 }],
     readProgressByConversation: { private: { alice: 1, bob: 1 } }, files: []
   });
   assert.equal(session.currentMessages[0].unreadCount, 0);
@@ -246,4 +248,48 @@ test('terminal events for sent and already read messages preserve other unread m
       messageId, operatorId: 'carol', tsMs: 3 });
   }
   assert.equal(session.unreadTotal, 1);
+});
+
+test('a later group member receipt cannot subtract an original recipient', () => {
+  const session = createSession();
+  session.pushMessage({ id: 'group-old', conversationId: 'group', senderId: 'alice', seq: 1, unreadCount: 2 });
+  session.applyMessageUpdated({ type: 'receipt', eventId: 'new-reader', conversationId: 'group',
+    readerId: 'dave', lastReadSeq: 1, readAtMs: 10 });
+  assert.equal(session.messagesByConversation.group[0].unreadCount, 2);
+});
+
+test('absolute read counts survive early arrival, old messages and backwards updates', () => {
+  const session = createSession();
+  const latest = { type: 'readCount' as const, eventId: 'count-new', globalSeq: 20,
+    conversationId: 'group', messageId: 'old', unreadCount: 1 };
+  session.applyMessageUpdated(latest);
+  session.pushMessage({ id: 'old', conversationId: 'group', senderId: 'alice', seq: 1, unreadCount: 3 });
+  session.applyMessageUpdated({ ...latest, eventId: 'count-old', globalSeq: 10, unreadCount: 2 });
+  session.pushMessage({ id: 'old', conversationId: 'group', senderId: 'alice', seq: 1, unreadCount: 3 });
+  assert.equal(session.messagesByConversation.group[0].unreadCount, 1);
+  session.applyMessageUpdated({ type: 'receipt', eventId: 'read-returning', conversationId: 'group',
+    readerId: 'bob', lastReadSeq: 1, readAtMs: 30 });
+  assert.equal(session.messagesByConversation.group[0].unreadCount, 1);
+});
+
+
+test('native count snapshots correct legacy displays and clear across accounts', () => {
+  const session = createSession();
+  const original = { ...session.currentMessages[0], unreadCount: 0, readCountKnown: false };
+  session.applyInitialState({ currentUser: { userId: 'alice' }, recentMessages: [original], readCounts: [] });
+  assert.equal(session.currentMessages[0].readCountKnown, false);
+  const corrected = { type: 'readCount' as const, eventId: 'repair', globalSeq: 30,
+    conversationId: 'private', messageId: original.id, unreadCount: 1 };
+  session.applyMessageUpdated(corrected);
+  assert.equal(session.currentMessages[0].readCountKnown, true);
+  assert.equal(session.currentMessages[0].unreadCount, 1);
+  session.applyInitialState({ currentUser: { userId: 'alice' }, recentMessages: [original], readCounts: [corrected] });
+  assert.equal(session.currentMessages[0].unreadCount, 1);
+  session.applyMessageUpdated({ type: 'burn', eventId: 'burn-old', conversationId: 'private',
+    messageId: original.id, operatorId: 'system-burn', tsMs: 31 });
+  session.applyMessageUpdated({ ...corrected, globalSeq: 32, eventId: 'repair-later', unreadCount: 0 });
+  assert.equal(session.currentMessages[0].text, '');
+  assert.equal(session.currentMessages[0].burned, true);
+  session.applyInitialState({ currentUser: { userId: 'bob' } });
+  assert.deepEqual(session.readCountsByConversation, {});
 });

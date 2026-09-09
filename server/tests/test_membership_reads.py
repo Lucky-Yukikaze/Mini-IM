@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from protocol.pb import common_pb2, conversation_pb2, message_pb2
+from protocol.pb import common_pb2, conversation_pb2, message_pb2, sync_pb2
 from services.conversation.service import ConversationService
 from services.message.service import MessageService
 from storage.repo import ConversationRepo, DeliveryRepo, MessageRepo
@@ -159,6 +159,71 @@ class MembershipReadTest(unittest.TestCase):
         self.db.execute_write("DROP TRIGGER reject_counts")
         self.read("bob", 1)
         self.assertEqual((2, 1, 1), self.counts(message))
+
+    def test_count_events_reach_original_recipients_including_departed_sender(self):
+        message = self.send("original-recipients")
+        self.repo.add_members("alice", self.group, ["dave"])
+        newcomer = self.read("dave", 1)
+        self.assertFalse(any(event.event_type == "read_count_updated" for event in newcomer.sync_events))
+        self.repo.leave_conversation("alice", self.group)
+        changed = self.read("bob", 1)
+        counts = [event for event in changed.sync_events if event.event_type == "read_count_updated"]
+        self.assertEqual({"alice", "bob", "carol"}, {event.user_id for event in counts})
+        for event in counts:
+            body = sync_pb2.ReadCountUpdated.FromString(event.payload)
+            self.assertEqual(event.event_id, body.event_id)
+            self.assertEqual(message, body.message_id)
+            self.assertEqual(1, body.unread_count)
+        self.assertEqual([], self.read("bob", 1).sync_events)
+
+    def test_count_event_failure_rolls_back_entire_receipt(self):
+        message = self.send("event-failure")
+        count = self.db.execute_fetchone("SELECT COUNT(*) FROM sync_events")[0]
+        self.db.execute_write("CREATE TRIGGER reject_count_event BEFORE INSERT ON sync_events "
+            "WHEN NEW.event_type='read_count_updated' BEGIN SELECT RAISE(ABORT,'injected count event failure'); END")
+        with self.assertRaises(sqlite3.Error):
+            self.read("bob", 1)
+        self.assertEqual(0, self.cursor("bob"))
+        self.assertEqual((2, 0, 2), self.counts(message))
+        self.assertEqual(count, self.db.execute_fetchone("SELECT COUNT(*) FROM sync_events")[0])
+        self.assertIsNone(self.db.execute_fetchone("SELECT read_at_ms FROM message_deliveries "
+            "WHERE server_msg_id=? AND user_id='bob'", (message,))[0])
+        self.db.execute_write("DROP TRIGGER reject_count_event")
+        self.assertEqual(3, sum(event.event_type == "read_count_updated" for event in self.read("bob", 1).sync_events))
+
+    def test_count_event_migration_repairs_existing_stream_once_and_rolls_back_on_failure(self):
+        message = self.send("migration-count")
+        self.read("bob", 1)
+        self.repo.leave_conversation("alice", self.group)
+        self.repo.add_members("bob", self.group, ["dave"])
+        self.db.execute_write("DELETE FROM schema_migrations WHERE name='read_count_events_v1'")
+        before = self.db.execute_fetchone("SELECT COUNT(*) FROM sync_events")[0]
+        self.db.execute_write("CREATE TRIGGER fail_count_migration BEFORE INSERT ON sync_events "
+            "WHEN NEW.event_type='read_count_updated' AND NEW.user_id='bob' "
+            "BEGIN SELECT RAISE(ABORT,'injected count migration failure'); END")
+        self.db.close()
+        with self.assertRaises(sqlite3.Error):
+            init_db(self.path)
+        self.open()
+        self.assertEqual(before, self.db.execute_fetchone("SELECT COUNT(*) FROM sync_events")[0])
+        self.assertIsNone(self.db.execute_fetchone("SELECT 1 FROM schema_migrations WHERE name='read_count_events_v1'"))
+        self.db.execute_write("DROP TRIGGER fail_count_migration")
+        self.db.close()
+        init_db(self.path)
+        self.open()
+        self.assertEqual(before + 3, self.db.execute_fetchone("SELECT COUNT(*) FROM sync_events")[0])
+        for user in ("alice", "bob", "carol"):
+            row = self.db.execute_fetchone("SELECT payload FROM sync_events WHERE user_id=? "
+                "AND event_type='read_count_updated' ORDER BY seq DESC LIMIT 1", (user,))
+            body = sync_pb2.ReadCountUpdated.FromString(row[0])
+            self.assertEqual((message, 1), (body.message_id, body.unread_count))
+        self.assertIsNone(self.db.execute_fetchone("SELECT 1 FROM sync_events "
+            "WHERE user_id='dave' AND event_type='read_count_updated'"))
+        self.assertIsNone(self.cursor("alice"))
+        self.db.close()
+        init_db(self.path)
+        self.open()
+        self.assertEqual(before + 3, self.db.execute_fetchone("SELECT COUNT(*) FROM sync_events")[0])
 
     def prepare_legacy(self, active):
         message = self.send("legacy")

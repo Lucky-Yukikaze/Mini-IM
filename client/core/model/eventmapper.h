@@ -7,7 +7,7 @@
 namespace im
 {
 namespace message { class Message; class Receipt; class Recall; }
-namespace sync { class DeliveryUpdated; }
+namespace sync { class DeliveryUpdated; class ReadCountUpdated; }
 namespace conversation { class ConversationUpdated; }
 }
 
@@ -15,6 +15,7 @@ namespace miniim
 {
 QVariantMap BuildMessagePayload(const im::message::Message& message);
 QVariantMap BuildConversationPayload(const im::conversation::ConversationUpdated& updated);
+QVariantMap BuildReadCountPayload(const im::sync::ReadCountUpdated& updated);
 QVariantMap BuildDeliveryPayload(const im::sync::DeliveryUpdated& updated);
 QVariantMap BuildReceiptPayload(const im::message::Receipt& receipt);
 QVariantMap BuildRecallPayload(const im::message::Recall& recall);

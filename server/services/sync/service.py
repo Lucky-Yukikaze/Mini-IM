@@ -63,6 +63,8 @@ class SyncService:
                 updated = file_pb2.FileUpdated()
                 updated.ParseFromString(row.payload)
                 event.file_updated.CopyFrom(updated)
+            elif row.event_type == "read_count_updated":
+                event.read_count_updated.ParseFromString(row.payload)
             elif row.event_type == "delivery_updated":
                 event.delivery_updated.ParseFromString(row.payload)
             else:

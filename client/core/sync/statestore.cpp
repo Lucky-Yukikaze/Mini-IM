@@ -174,6 +174,16 @@ QVariantMap MiniImStateStore::project(const MiniImStateEvent& event)
             || previous.value(QStringLiteral("recalled")).toBool());
         data.insert(QStringLiteral("burned"), data.value(QStringLiteral("burned")).toBool()
             || previous.value(QStringLiteral("burned")).toBool());
+        if (object(QStringLiteral("readCount"), id).isEmpty())
+        {
+            saveObject(QStringLiteral("readCount"), id, event.position,
+                {{"type", "readCount"}, {"eventId", event.eventId}, {"conversationId", conversation},
+                 {"messageId", id}, {"globalSeq", QVariant::fromValue(event.position)},
+                 {"unreadCount", data.value(QStringLiteral("unreadCount"))}});
+        }
+        const auto count = object(QStringLiteral("readCount"), id);
+        data.insert(QStringLiteral("unreadCount"), count.value(QStringLiteral("unreadCount")));
+        data.insert(QStringLiteral("readCountKnown"), true);
         data = protectMessage(data);
         saveObject(QStringLiteral("message"), id, event.position, data);
     }
@@ -189,6 +199,16 @@ QVariantMap MiniImStateStore::project(const MiniImStateEvent& event)
         {
             saveObject(QStringLiteral("message"), id, event.position, protectMessage(message));
         }
+    }
+    else if (event.type == QStringLiteral("readCount"))
+    {
+        const QString id = data.value(QStringLiteral("messageId")).toString();
+        auto previous = run(QStringLiteral("SELECT position,data FROM objects WHERE kind='readCount' AND id=?"), {id});
+        if (previous.next() && previous.value(0).toULongLong() >= event.position)
+        {
+            return Decode(previous.value(1));
+        }
+        saveObject(QStringLiteral("readCount"), id, event.position, data);
     }
     else if (event.type == QStringLiteral("delivery"))
     {
@@ -322,6 +342,8 @@ QVariantMap MiniImStateStore::snapshot() const
         QVariantList messages;
         QVariantList files;
         QVariantList deliveries;
+        QVariantList readCounts;
+        QVariantMap countsByMessage;
         QVariantMap reads;
         auto query = run(QStringLiteral("SELECT kind,data FROM objects ORDER BY position"));
         while (query.next())
@@ -344,6 +366,11 @@ QVariantMap MiniImStateStore::snapshot() const
             {
                 deliveries.append(data);
             }
+            else if (kind == QStringLiteral("readCount"))
+            {
+                readCounts.append(data);
+                countsByMessage.insert(data.value(QStringLiteral("messageId")).toString(), data);
+            }
             else if (kind == QStringLiteral("receipt"))
             {
                 const QString conversation = data.value(QStringLiteral("conversationId")).toString();
@@ -358,15 +385,12 @@ QVariantMap MiniImStateStore::snapshot() const
             auto message = value.toMap();
             const auto progress = reads.value(message.value(QStringLiteral("conversationId")).toString()).toMap();
             const quint64 seq = message.value(QStringLiteral("seq")).toULongLong();
-            int unread = message.value(QStringLiteral("unreadCount")).toInt();
-            for (auto it = progress.begin(); it != progress.end(); ++it)
+            const auto count = countsByMessage.value(message.value(QStringLiteral("id")).toString()).toMap();
+            message.insert(QStringLiteral("readCountKnown"), !count.isEmpty());
+            if (!count.isEmpty())
             {
-                if (it.key() != message.value(QStringLiteral("senderId")).toString() && it.value().toULongLong() >= seq)
-                {
-                    unread = qMax(0, unread - 1);
-                }
+                message.insert(QStringLiteral("unreadCount"), count.value(QStringLiteral("unreadCount")));
             }
-            message.insert(QStringLiteral("unreadCount"), unread);
             if (message.value(QStringLiteral("senderId")).toString() != m_user
                 && seq > progress.value(m_user).toULongLong() && !message.value(QStringLiteral("recalled")).toBool())
             {
@@ -376,7 +400,7 @@ QVariantMap MiniImStateStore::snapshot() const
         }
         return {{"currentUser", QVariantMap{{"userId", m_user}}}, {"globalCursor", QVariant::fromValue(m_cursor)},
             {"conversations", conversations}, {"recentMessages", messages}, {"unreadTotal", unreadTotal},
-            {"readProgressByConversation", reads}, {"deliveries", deliveries}, {"files", files}, {"messageSends", m_outbox.pending()}, {"fileTasks", m_fileTasks.pending()},
+            {"readProgressByConversation", reads}, {"readCounts", readCounts}, {"deliveries", deliveries}, {"files", files}, {"messageSends", m_outbox.pending()}, {"fileTasks", m_fileTasks.pending()},
             {"controlWrites", m_controlWrites.pending()}};
     }
     catch (const std::exception& error)

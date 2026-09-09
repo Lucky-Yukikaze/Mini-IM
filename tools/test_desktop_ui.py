@@ -44,7 +44,15 @@ class DesktopCheck:
         data = dict(id=uuid.uuid4().hex, op=operation, **fields)
         temporary = self.output / "command.tmp"
         temporary.write_text(json.dumps(data), encoding="utf-8")
-        temporary.replace(self.output / "command.json")
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                temporary.replace(self.output / "command.json")
+                break
+            except PermissionError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.02)
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             try:
@@ -53,7 +61,7 @@ class DesktopCheck:
                     if not response["ok"]:
                         raise RuntimeError(response["error"])
                     return response["state"]
-            except FileNotFoundError:
+            except (FileNotFoundError, PermissionError):
                 pass
             time.sleep(0.1)
         raise TimeoutError("fixture command timeout: " + operation)
@@ -168,6 +176,9 @@ class DesktopCheck:
         for cancellation in state["cancellations"]:
             assert cancellation["owner_id"] == "alice"
         self.phase("delivery-send")
+        self.phase("late-member")
+        self.command("read-cindy")
+        self.phase("late-member-count", image=str(self.artifacts / "late-member-count.png"))
         self.command("confirm-bob")
         self.phase("delivery-status", image=str(self.artifacts / "delivery-confirmed.png"))
         self.command("restart-client")

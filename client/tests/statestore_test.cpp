@@ -44,6 +44,13 @@ MiniImStateEvent Message(quint64 position, const QString& id)
          {"unreadCount", 2}, {"recalled", false}, {"burned", false}}};
 }
 
+MiniImStateEvent ReadCount(quint64 position, const QString& id, int unread)
+{
+    return {position, QStringLiteral("event-%1").arg(position), QStringLiteral("readCount"),
+        {{"type", "readCount"}, {"messageId", id}, {"conversationId", "conversation"},
+         {"globalSeq", QVariant::fromValue(position)}, {"unreadCount", unread}}};
+}
+
 MiniImStateEvent Receipt(quint64 position, const QString& user, quint64 read)
 {
     return {position, QStringLiteral("event-%1").arg(position), QStringLiteral("receipt"),
@@ -182,12 +189,55 @@ void CheckTerminalStatesSurviveReplay()
     }
 }
 
+void CheckAbsoluteReadCountsAndLegacyCache()
+{
+    QTemporaryDir root;
+    MiniImStateStore store;
+    Open(store, root);
+    Apply(store, {Message(1, "first"), Receipt(2, "new-member", 1)});
+    Require(FindMessage(store.snapshot(), "first").value("unreadCount").toInt() == 2,
+        "new member consumed an original recipient");
+    Apply(store, {ReadCount(5, "late", 1), ReadCount(3, "late", 2), Message(4, "late")});
+    Apply(store, {ReadCount(5, "late", 1)}, 0);
+    Require(store.cursor() == 5, "out-of-order count did not fill continuous history");
+    Require(FindMessage(store.snapshot(), "late").value("unreadCount").toInt() == 1,
+        "old count or late message replaced absolute count");
+    Apply(store, {{6, "event-6", "burn", {{"messageId", "late"}, {"conversationId", "conversation"}}},
+        ReadCount(7, "late", 0)});
+    store.close();
+    Open(store, root);
+    auto terminal = FindMessage(store.snapshot(), "late");
+    Require(terminal.value("burned").toBool() && terminal.value("text").toString().isEmpty(),
+        "read count restored a burned message");
+    Query(store.databasePath(), "CREATE TRIGGER fail_count BEFORE UPDATE ON objects WHEN NEW.kind='readCount' "
+        "BEGIN SELECT RAISE(ABORT,'injected count failure'); END");
+    QVector<MiniImStateEvent> applied;
+    Require(!store.apply({ReadCount(8, "first", 1)}, &applied), "failed count save was accepted");
+    Require(applied.isEmpty() && store.cursor() == 7, "failed count advanced position or emitted state");
+    Query(store.databasePath(), "DROP TRIGGER fail_count");
+    const QString path = store.databasePath();
+    store.close();
+    Query(path, "DELETE FROM objects WHERE kind='readCount' AND id='first'");
+    Open(store, root);
+    Require(!FindMessage(store.snapshot(), "first").value("readCountKnown").toBool(),
+        "legacy cache without authoritative count was declared current");
+    Apply(store, {ReadCount(8, "first", 1)});
+    store.close();
+    Open(store, root);
+    const auto restored = FindMessage(store.snapshot(), "first");
+    Require(restored.value("readCountKnown").toBool() && restored.value("unreadCount").toInt() == 1,
+        "correction event did not repair legacy cache after restart");
+    Open(store, root, "another-user");
+    Require(store.snapshot().value("readCounts").toList().isEmpty(), "count leaked across users");
+}
+
 void CheckReadSnapshotAndAccountIsolation()
 {
     QTemporaryDir root;
     MiniImStateStore store;
     Open(store, root);
-    Apply(store, {Message(1, "first"), Message(2, "second"), Receipt(3, "bob", 1), Receipt(4, "carol", 2)});
+    Apply(store, {Message(1, "first"), Message(2, "second"), Receipt(3, "bob", 1), Receipt(4, "carol", 2),
+        ReadCount(5, "first", 0), ReadCount(6, "second", 1)});
     Require(store.saveSession("session-bob", QString()), "initial session without ACK cannot persist");
     Require(store.saveSession("session-bob", "request-bob"), "session could not persist");
     store.close();
@@ -196,7 +246,7 @@ void CheckReadSnapshotAndAccountIsolation()
     Require(snapshot.value("unreadTotal").toInt() == 1, "own unread count wrong after reopen");
     Require(FindMessage(snapshot, "first").value("unreadCount").toInt() == 0, "reader count not restored");
     Require(FindMessage(snapshot, "second").value("unreadCount").toInt() == 1, "reader count decremented twice");
-    Apply(store, {Receipt(5, "carol", 1)});
+    Apply(store, {Receipt(7, "carol", 1)});
     Require(FindMessage(store.snapshot(), "second").value("unreadCount").toInt() == 1, "lower receipt regressed state");
     Require(store.sessionId() == QStringLiteral("session-bob") && store.lastAck() == QStringLiteral("request-bob"),
         "resume metadata lost");
@@ -211,7 +261,7 @@ void CheckReadSnapshotAndAccountIsolation()
         Require(store.sessionId().isEmpty() && store.lastAck().isEmpty(), "account identity leaked session");
     }
     Open(store, root);
-    Require(store.cursor() == 5 && store.snapshot().value("unreadTotal").toInt() == 1, "account return lost state");
+    Require(store.cursor() == 7 && store.snapshot().value("unreadTotal").toInt() == 1, "account return lost state");
 }
 
 QVariantMap Intent(const QString& id, const QString& text = QStringLiteral("pending secret"))
@@ -506,6 +556,7 @@ int main(int argc, char* argv[])
     QCoreApplication app(argc, argv);
     try
     {
+        CheckAbsoluteReadCountsAndLegacyCache();
         CheckDeliveryAndConfirmationPersistence();
         CheckGapsAndDuplicateReplay();
         CheckAtomicFailureAndRetry();

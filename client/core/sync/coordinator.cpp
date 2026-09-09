@@ -39,6 +39,12 @@ MiniImStateEvent MapEvent(const im::sync::SyncEvent& event)
         item.data = miniim::BuildRecallPayload(event.recall());
         item.type = item.data.value(QStringLiteral("type")).toString();
     }
+    else if (event.has_read_count_updated())
+    {
+        item.type = QStringLiteral("readCount");
+        item.data = miniim::BuildReadCountPayload(event.read_count_updated());
+        item.data.insert(QStringLiteral("globalSeq"), QVariant::fromValue(event.global_seq()));
+    }
     else if (event.has_delivery_updated())
     {
         item.type = QStringLiteral("delivery");

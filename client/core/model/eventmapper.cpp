@@ -44,6 +44,14 @@ QVariantMap BuildConversationPayload(const im::conversation::ConversationUpdated
     return payload;
 }
 
+QVariantMap BuildReadCountPayload(const im::sync::ReadCountUpdated& updated)
+{
+    return {{"type", "readCount"}, {"eventId", QString::fromStdString(updated.event_id())},
+        {"conversationId", QString::fromStdString(updated.conversation_id())},
+        {"messageId", QString::fromStdString(updated.message_id())},
+        {"unreadCount", static_cast<uint>(updated.unread_count())}};
+}
+
 QVariantMap BuildDeliveryPayload(const im::sync::DeliveryUpdated& updated)
 {
     return {{"type", "delivery"}, {"eventId", QString::fromStdString(updated.event_id())},

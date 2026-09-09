@@ -445,12 +445,20 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         await self.bob.command("receipt", conversation=self.conversation, seq=message["seq"])
         checkpoint = await self.kill_at_checkpoint()
         self.assertEqual(1, self.scalar("SELECT last_read_seq FROM conversation_members WHERE user_id='bob'"))
+        self.assertEqual(0, self.scalar("SELECT unread_count FROM message_read_counters"))
+        committed_counts = self.rows("SELECT event_id,user_id,seq,payload FROM sync_events "
+            "WHERE event_type='read_count_updated' ORDER BY user_id")
+        self.assertEqual(2, len(committed_counts))
         await self.start_server()
         await self.bob.wait("control-writes", lambda item: not item["items"], since=self.marks[1], timeout=18)
         await self.alice.wait("update", lambda item: item["type"] == "receipt" and item["readerId"] == "bob",
                               since=self.marks[0], timeout=18)
         self.assert_replayed("receipt", checkpoint["requestId"])
         self.assertEqual(2, self.scalar("SELECT COUNT(*) FROM sync_events WHERE event_type='receipt'"))
+        await self.alice.wait("update", lambda item: item["type"] == "readCount" and
+            item["messageId"] == message["id"] and item["unreadCount"] == 0, since=self.marks[0])
+        self.assertEqual(committed_counts, self.rows("SELECT event_id,user_id,seq,payload FROM sync_events "
+            "WHERE event_type='read_count_updated' ORDER BY user_id"))
         await self.server.arm("before-ack", "recall")
         await self.alice.command("recall", conversation=self.conversation, message=message["id"])
         checkpoint = await self.kill_at_checkpoint()
@@ -467,6 +475,28 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
             stored = json.loads(self.rows("SELECT data FROM objects WHERE kind='message' AND id=?", (message["id"],), cache)[0]["data"])
             self.assertTrue(stored["recalled"])
             self.assertEqual("", stored["text"])
+            count = json.loads(self.rows("SELECT data FROM objects WHERE kind='readCount' AND id=?",
+                (message["id"],), cache)[0]["data"])
+            self.assertEqual(0, count["unreadCount"])
+
+    async def test_read_count_transaction_rolls_back_before_server_commit(self):
+        mark = await self.alice.command("message", conversation=self.conversation, intent="count-rollback", text="unread")
+        message = await self.bob.wait("message", lambda item: item["clientMsgId"] == "count-rollback")
+        await self.alice.wait("message-sends", lambda item: not item["items"], since=mark)
+        await self.check_sync()
+        await self.server.arm("before-commit", "receipt")
+        await self.bob.command("receipt", conversation=self.conversation, seq=message["seq"])
+        checkpoint = await self.kill_at_checkpoint()
+        self.assertEqual(0, self.scalar("SELECT last_read_seq FROM conversation_members WHERE user_id='bob'"))
+        self.assertEqual(1, self.scalar("SELECT unread_count FROM message_read_counters"))
+        self.assertEqual(0, self.scalar("SELECT COUNT(*) FROM sync_events WHERE event_type='read_count_updated'"))
+        self.assertEqual(0, self.scalar("SELECT COUNT(*) FROM control_write_results WHERE request_id=?", (checkpoint["requestId"],)))
+        await self.start_server()
+        await self.alice.wait("update", lambda item: item["type"] == "readCount" and
+            item["messageId"] == message["id"] and item["unreadCount"] == 0, since=self.marks[0], timeout=18)
+        self.assert_replayed("receipt", checkpoint["requestId"])
+        self.assertEqual(2, self.scalar("SELECT COUNT(*) FROM sync_events WHERE event_type='read_count_updated'"))
+        await self.check_sync()
 
     async def test_idle_server_restart_uses_default_failure_detection(self):
         self.marks = [len(client.events) for client in self.clients]

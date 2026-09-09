@@ -185,6 +185,7 @@ function readLabel(item: MessageItem): string {
   if (item.recalled || item.senderId !== props.currentUserId) {
     return '';
   }
+  if (item.readCountKnown === false) return '已读状态同步中';
   if (props.conversationType === 'direct') {
     return item.unreadCount > 0 ? '未读' : '已读';
   }
