@@ -159,7 +159,7 @@ void VerifyBoundAndResume(const QString& path, const QByteArray& payload, quint6
     Require(!completed, "enqueue and send completion do not complete the stream");
     transport.finish(true);
     Require(completed, "acknowledged graceful shutdown completes the stream");
-    Require(transport.delivered == QByteArrayLiteral("MINIIMFILE1 file\n") + payload.mid(offset), "correct resume bytes");
+    Require(transport.delivered == QByteArrayLiteral("MINIIMFILE2 file ") + QByteArray::number(offset) + '\n' + payload.mid(offset), "correct resume bytes");
 }
 
 void VerifyFailure(const QString& path, const QByteArray& payload, bool truncate)

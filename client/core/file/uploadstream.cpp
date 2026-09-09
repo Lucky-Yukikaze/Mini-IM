@@ -49,7 +49,7 @@ bool MiniImUploadStream::start(const QString& fileId, quint64 offset)
     {
         return false;
     }
-    if (!send(QByteArrayLiteral("MINIIMFILE1 ") + fileId.toUtf8() + '\n'))
+    if (!send(QByteArrayLiteral("MINIIMFILE2 ") + fileId.toUtf8() + ' ' + QByteArray::number(offset) + '\n'))
     {
         abort(QStringLiteral("failed to send upload header"));
         return false;

@@ -111,8 +111,8 @@ class NativeClient:
             raise AssertionError(f"native command rejected: {operation}; {self.events[mark:]}")
         return mark
 
-    async def connect(self, endpoint, user):
-        mark = await self.command("connect", endpoint=endpoint, token="dev-token:" + user, device="device-" + user)
+    async def connect(self, endpoint, user, device=None):
+        mark = await self.command("connect", endpoint=endpoint, token="dev-token:" + user, device=device or "device-" + user)
         return await self.wait("initial", lambda data: data["currentUser"]["userId"] == user, since=mark)
 
     async def crash(self):
@@ -158,6 +158,19 @@ class TestProtocol(MiniImQuicProtocol):
                 return 131072
             return original_pending(stream_id)
         self.m_download_sender.buffer.pending_bytes = paused_pending
+
+    def _send_error(self, stream_id, request, code, message):
+        if code == 429 and message.startswith("upload is active"):
+            self.scenario.upload_conflicts.append({"device": self.m_device_id, "requestId": request.request_id})
+        super()._send_error(stream_id, request, code, message)
+
+    def _handle_file_stream_data(self, stream_id, data, end_stream):
+        state = self.m_file_stream_states.get(stream_id)
+        if (self.scenario.hold_alice_upload and self.m_device_id == "device-alice"
+                and state and state.lease and state.lease.offset >= 65536):
+            self.scenario.held_upload_chunks.append((self, stream_id, data, end_stream))
+            return
+        super()._handle_file_stream_data(stream_id, data, end_stream)
 
     def _debug(self, message):
         self.scenario.server_log.write(message + "\n")
@@ -347,6 +360,9 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         self.file_attempts = []
         self.upload_storage_fault = ""
         self.hold_upload_finish = False
+        self.hold_alice_upload = False
+        self.held_upload_chunks = []
+        self.upload_conflicts = []
         self.block_file_init = False
         self.reject_file_cancel = 0
         self.cancel_attempts = []
@@ -402,6 +418,8 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
 
     async def cleanup(self):
         errors = []
+        (self.output_dir / f"{self._testMethodName}-upload-conflicts.json").write_text(
+            json.dumps(self.upload_conflicts, indent=2), encoding="utf-8")
         (self.output_dir / f"{self._testMethodName}-control-attempts.json").write_text(
             json.dumps(self.control_attempts, indent=2), encoding="utf-8")
         (self.output_dir / f"{self._testMethodName}-sync-replies.json").write_text(
@@ -1531,6 +1549,52 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         await self.alice.connect(self.endpoint, "alice")
         await self.alice.wait("file-tasks", lambda item: not item["items"], since=mark)
         self.assert_single_file_intent("alice", 1)
+
+    async def test_second_native_device_recovers_upload_after_owner_crash_and_lease_expiry(self):
+        self.hold_alice_upload = True
+        self.hold_upload_finish = True
+        payload = b"same intent across devices" * 16384
+        source = self.root / "two-device-upload.bin"
+        source.write_bytes(payload)
+        await self.alice.command("upload", conversation=self.conversation, path=str(source))
+        async with asyncio.timeout(5):
+            while not self.held_upload_chunks:
+                await asyncio.sleep(0.01)
+        state_root = self.root / "state-alice-second"
+        second = await NativeClient.start(self.driver_path,
+            self.output_dir / f"{self._testMethodName}-second-device.log", state_root)
+        self.clients.append(second)
+        await second.connect(self.endpoint, "alice", device="device-alice-second")
+        await self.synced(second, "alice")
+        await self.disconnect(second)
+        with closing(sqlite3.connect(next((self.root / "state-alice").glob("*.sqlite")))) as original:
+            row = original.execute(
+                "SELECT id,init_request,finish_request,file_id,cancel_request,status,data FROM file_tasks").fetchone()
+        with closing(sqlite3.connect(next(state_root.glob("*.sqlite")))) as destination:
+            destination.execute("INSERT INTO file_tasks(id,init_request,finish_request,file_id,cancel_request,status,data) "
+                "VALUES(?,?,?,?,?,?,?)", row)
+            destination.commit()
+        mark = len(second.events)
+        initial = await second.connect(self.endpoint, "alice", device="device-alice-second")
+        self.assertEqual(row[0], initial["fileTasks"][0]["clientFileId"])
+        async with asyncio.timeout(5):
+            while not any(item["device"] == "device-alice-second" for item in self.upload_conflicts):
+                await asyncio.sleep(0.01)
+        before = self.files.get_transfer_by_file_id(row[3]).received_bytes
+        protocol, stream_id, data, end_stream = self.held_upload_chunks.pop(0)
+        super(TestProtocol, protocol)._handle_file_stream_data(stream_id, data, end_stream)
+        await second.wait("file", lambda item: item["fileId"] == row[3] and item["transferredBytes"] > before, since=mark)
+        await self.alice.crash()
+        # Keep the production timeout unchanged; shorten only this isolated takeover wait.
+        self.hub.uploads.idle_timeout_ms = 1000
+        self.hold_alice_upload = False
+        self.hold_upload_finish = False
+        await second.wait("file-tasks", lambda item: not item["items"], since=mark, timeout=14)
+        transfer, attempts = self.assert_single_file_intent("alice", 1)
+        self.assertEqual(row[3], transfer["file_id"])
+        self.assertGreater(attempts[-1]["acceptedOffset"], before)
+        self.assertEqual(payload, self.files.get_storage_path(row[3]).read_bytes())
+        self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
 
     async def test_upload_connection_drop_does_not_complete(self):
         self.fault.file_drop_after_bytes = 65536

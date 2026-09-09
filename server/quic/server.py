@@ -9,14 +9,15 @@ from pathlib import Path
 
 from aioquic.asyncio import QuicConnectionProtocol
 from aioquic.quic.configuration import QuicConfiguration
-from aioquic.quic.events import ConnectionTerminated, StreamDataReceived
+from aioquic.quic.events import ConnectionTerminated, StreamDataReceived, StreamReset
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 from quic.endpoint import serve_quic
-from quic.download import DownloadScheduler, FILE_STREAM_HEADER_PREFIX
+from quic.download import DownloadScheduler
+from quic.upload import UploadRegistry, UploadLease, UPLOAD_HEADER_PREFIX
 from protocol.codec import EnvelopeCodec
 from protocol.pb import common_pb2, auth_pb2, conversation_pb2, envelope_pb2, file_pb2, message_pb2, sync_pb2
 from services.auth.service import AuthService
@@ -40,7 +41,7 @@ FILE_STREAM_HEADER_MAX = 512
 class FileStreamState:
     buffer: bytearray = field(default_factory=bytearray)
     file_id: str = ""
-    initialized: bool = False
+    lease: UploadLease | None = None
 
 
 @dataclass
@@ -50,7 +51,8 @@ class FaultConfig:
 
 
 class OnlineSessionHub:
-    def __init__(self) -> None:
+    def __init__(self, upload_idle_ms: int = 900000) -> None:
+        self.uploads = UploadRegistry(upload_idle_ms)
         self.m_protocols: dict[str, set["MiniImQuicProtocol"]] = {}
 
     def register(self, user_id: str, protocol: "MiniImQuicProtocol") -> None:
@@ -61,10 +63,14 @@ class OnlineSessionHub:
         bucket.add(protocol)
 
     def cancel_file(self, user_id: str, file_id: str) -> None:
+        lease = self.uploads.by_file.get(file_id)
+        if lease and lease.user_id == user_id:
+            self.uploads.release(lease)
         for protocol in list(self.m_protocols.get(user_id, ())):
             protocol.m_download_sender.cancel(file_id)
 
     def unregister(self, user_id: str, protocol: "MiniImQuicProtocol") -> None:
+        self.uploads.release_owner(protocol)
         bucket = self.m_protocols.get(user_id)
         if bucket is None:
             return
@@ -106,6 +112,7 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
         self.m_message_service = message_service
         self.m_sync_service = sync_service
         self.m_online_hub = online_hub
+        self.m_upload_generation = online_hub.uploads.next_generation()
         self.m_fault_config = fault_config
         self.m_user_id = ""
         self.m_session_id = ""
@@ -114,6 +121,7 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
         self.m_control_stream_buffers: dict[int, bytearray] = {}
         self.m_file_stream_states: dict[int, FileStreamState] = {}
         self.m_file_storage_failed = False
+        self.m_rejected_file_streams: set[int] = set()
         self.m_download_sender = DownloadScheduler(self)
 
     @staticmethod
@@ -227,82 +235,100 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
             self.m_online_hub.unregister(self.m_user_id, self)
         super().connection_lost(exc)
 
+    def _reject_file_stream(self, stream_id: int) -> None:
+        self.m_rejected_file_streams.add(stream_id)
+        self.m_file_stream_states.pop(stream_id, None)
+        self.m_online_hub.uploads.release_owner(self, stream_id)
+        self._quic.stop_stream(stream_id, 0x1006)
+        self.transmit()
+
+    def _bind_upload_stream(self, stream_id: int, state: FileStreamState, end_stream: bool) -> bool:
+        uploads = self.m_online_hub.uploads
+        split = state.buffer.find(b"\n")
+        if split < 0 and len(state.buffer) <= FILE_STREAM_HEADER_MAX and not end_stream:
+            return False
+        if split < 0 or split > FILE_STREAM_HEADER_MAX:
+            self._reject_file_stream(stream_id)
+            return False
+        header = bytes(state.buffer[:split])
+        state.buffer = state.buffer[split + 1:]
+        try:
+            prefix, file_id, offset = header.decode("utf-8").split(" ")
+            if prefix.encode() + b" " != UPLOAD_HEADER_PREFIX or not offset.isascii() or not offset.isdecimal():
+                raise ValueError("invalid upload header")
+            state.lease = uploads.bind(self, file_id, stream_id, int(offset))
+        except (ValueError, UnicodeDecodeError):
+            state.lease = None
+        if state.lease is None:
+            self._reject_file_stream(stream_id)
+            return False
+        state.file_id = file_id
+        return True
+
     def _handle_file_stream_data(self, stream_id: int, data: bytes, end_stream: bool) -> None:
-        if not self.m_user_id:
+        if not self.m_user_id or stream_id in self.m_rejected_file_streams:
             return
-        state = self.m_file_stream_states.get(stream_id)
-        if state is None:
-            state = FileStreamState()
-            self.m_file_stream_states[stream_id] = state
+        uploads = self.m_online_hub.uploads
+        state = self.m_file_stream_states.setdefault(stream_id, FileStreamState())
         state.buffer.extend(data)
+        if state.lease is None and not self._bind_upload_stream(stream_id, state, end_stream):
+            return
 
-        if not state.initialized:
-            split = state.buffer.find(b"\n")
-            if split < 0:
-                if len(state.buffer) > FILE_STREAM_HEADER_MAX:
-                    self.m_file_stream_states.pop(stream_id, None)
+        lease = state.lease
+        transfer = self.m_file_service.get_transfer_for_upload(self.m_user_id, state.file_id)
+        if (not uploads.current(lease) or transfer is None
+                or transfer.direction != common_pb2.FILE_DIRECTION_UPLOAD
+                or transfer.status not in {"init", "uploading", "uploaded"}
+                or transfer.received_bytes != lease.offset):
+            self._reject_file_stream(stream_id)
+            return
+        if state.buffer:
+            projected = lease.offset + len(state.buffer)
+            if projected > transfer.file_size:
+                self._reject_file_stream(stream_id)
                 return
-            raw_header = bytes(state.buffer[:split])
-            state.buffer = bytearray(state.buffer[split + 1 :])
-            if not raw_header.startswith(FILE_STREAM_HEADER_PREFIX):
+            if self.m_fault_config.file_drop_after_bytes > 0 and projected >= self.m_fault_config.file_drop_after_bytes:
+                self._quic.close(error_code=0x1001, reason_phrase="fault_injection_drop_after_bytes")
+                self.transmit()
                 self.m_file_stream_states.pop(stream_id, None)
                 return
-            file_id = raw_header[len(FILE_STREAM_HEADER_PREFIX) :].decode("utf-8", errors="ignore").strip()
-            if not file_id:
+            if self.m_fault_config.file_drop_probability > 0.0 and random.random() < self.m_fault_config.file_drop_probability:
+                self._quic.close(error_code=0x1002, reason_phrase="fault_injection_random_drop")
+                self.transmit()
                 self.m_file_stream_states.pop(stream_id, None)
                 return
-            transfer = self.m_file_service.get_transfer_for_upload(self.m_user_id, file_id)
-            if transfer is None:
-                self.m_file_stream_states.pop(stream_id, None)
-                return
-            state.file_id = file_id
-            state.initialized = True
-
-        if state.initialized and state.buffer:
-            transfer = self.m_file_service.get_transfer_for_upload(self.m_user_id, state.file_id)
-            if transfer is None:
-                self.m_file_stream_states.pop(stream_id, None)
-                return
-            if self.m_fault_config.file_drop_after_bytes > 0:
-                projected = int(transfer.received_bytes) + len(state.buffer)
-                if projected >= self.m_fault_config.file_drop_after_bytes:
-                    self._quic.close(error_code=0x1001, reason_phrase="fault_injection_drop_after_bytes")
-                    self.transmit()
-                    self.m_file_stream_states.pop(stream_id, None)
-                    return
-            if self.m_fault_config.file_drop_probability > 0.0:
-                if random.random() < self.m_fault_config.file_drop_probability:
-                    self._quic.close(error_code=0x1002, reason_phrase="fault_injection_random_drop")
-                    self.transmit()
-                    self.m_file_stream_states.pop(stream_id, None)
-                    return
-
             try:
                 updated, sync_events = self.m_file_service.append_file_chunk(
-                    user_id=self.m_user_id,
-                    file_id=state.file_id,
-                    chunk=bytes(state.buffer),
-                )
+                    user_id=self.m_user_id, file_id=state.file_id, chunk=bytes(state.buffer))
             except (OSError, sqlite3.Error) as error:
                 self._debug(f"upload storage failed: {error}")
                 self.m_file_storage_failed = True
                 self.m_file_stream_states.clear()
+                uploads.release_owner(self)
                 self._quic.close(error_code=0x1004, reason_phrase="upload_storage_failed")
                 self.transmit()
                 return
-
+            if updated is None or updated.transferred_bytes != projected:
+                self._reject_file_stream(stream_id)
+                return
+            uploads.advance(lease, projected)
             state.buffer.clear()
-            if updated is not None and sync_events:
-                self.m_online_hub.fanout_sync_events(sync_events)
-
+            self.m_online_hub.fanout_sync_events(sync_events)
         if end_stream:
             self.m_file_stream_states.pop(stream_id, None)
+            if lease.offset != transfer.file_size:
+                uploads.release(lease)
 
     def quic_event_received(self, event):
         if isinstance(event, ConnectionTerminated):
             self.m_download_sender.close()
             if self.m_user_id:
                 self.m_online_hub.unregister(self.m_user_id, self)
+            return
+        if isinstance(event, StreamReset):
+            self.m_file_stream_states.pop(event.stream_id, None)
+            self.m_rejected_file_streams.add(event.stream_id)
+            self.m_online_hub.uploads.release_owner(self, event.stream_id)
             return
         if self.m_file_storage_failed or not isinstance(event, StreamDataReceived):
             return
@@ -342,7 +368,7 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
 
             self.m_user_id = session.user_id
             self.m_session_id = envelope.session_id
-            self.m_device_id = envelope.device_id
+            self.m_device_id = session.device_id
             if self.m_control_stream_id is None:
                 self.m_control_stream_id = event.stream_id
             self.m_online_hub.register(session.user_id, self)
@@ -410,6 +436,11 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
                 continue
 
             if envelope.HasField("file_init"):
+                is_upload = envelope.file_init.direction == common_pb2.FILE_DIRECTION_UPLOAD
+                if is_upload and not self.m_online_hub.uploads.available(
+                        session.user_id, envelope.file_init.client_file_id, self, session.device_id, self.m_upload_generation):
+                    self._send_error(event.stream_id, envelope, 429, "upload is active; retry after its owner releases it")
+                    continue
                 if (envelope.file_init.direction == common_pb2.FILE_DIRECTION_DOWNLOAD
                         and not self.m_download_sender.can_accept):
                     self._send_error(event.stream_id, envelope, 429, "download queue is full; retry later")
@@ -424,6 +455,10 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
                     self._debug(f"file init storage failed: {error}")
                     self._send_error(event.stream_id, envelope, 503, "file init could not be committed")
                     continue
+
+                if is_upload and result.ack.success and result.file_updated is not None and not result.file_updated.completed:
+                    self.m_online_hub.uploads.grant(session.user_id, envelope.file_init.client_file_id,
+                        result.ack.entity_id, self, result.file_updated.transferred_bytes, session.device_id, self.m_upload_generation)
 
                 ack_envelope = self._new_response_from_request(envelope)
                 ack_envelope.ack.CopyFrom(result.ack)
@@ -445,6 +480,10 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
                 continue
 
             if envelope.HasField("file_finish"):
+                lease = self.m_online_hub.uploads.by_file.get(envelope.file_finish.file_id)
+                if lease is not None and lease.owner is not self:
+                    self._send_error(event.stream_id, envelope, 429, "upload is active on another connection")
+                    continue
                 try:
                     result = self.m_file_service.handle_file_finish(
                         user_id=session.user_id,
@@ -455,6 +494,10 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
                     self._debug(f"file finish storage failed: {error}")
                     self._send_error(event.stream_id, envelope, 503, "file finish could not be committed")
                     continue
+
+                if lease is not None and (result.ack.success or (result.file_updated is not None
+                        and result.file_updated.status.startswith("failed"))):
+                    self.m_online_hub.uploads.release(lease)
 
                 ack_envelope = self._new_response_from_request(envelope)
                 ack_envelope.ack.CopyFrom(result.ack)
@@ -588,7 +631,7 @@ async def run_server() -> None:
     )
     message_service = MessageService(message_repo, conversation_repo, burn_enabled=burn_enabled)
     sync_service = SyncService(SyncRepo(db))
-    online_hub = OnlineSessionHub()
+    online_hub = OnlineSessionHub(upload_idle_ms=file_stale_ms)
     fault_config = FaultConfig(
         file_drop_after_bytes=max(fault_drop_after_bytes, 0),
         file_drop_probability=min(max(fault_drop_probability, 0.0), 1.0),

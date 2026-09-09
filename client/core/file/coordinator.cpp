@@ -744,9 +744,13 @@ void MiniImFileCoordinator::handleFileUpdated(const im::file::FileUpdated& updat
         m_tasks.update(task.value("clientFileId").toString(),
             {{"fileSize", QVariant::fromValue(updated.file_size())},
              {"sha256", QString::fromStdString(updated.sha256())}, {"metadataReady", true}});
-        m_fileControlAttempts.remove(task.value("requestId").toString());
+        if (m_pending_file_uploads.contains(fileId) || m_pending_file_downloads.contains(fileId))
+        {
+            m_fileControlAttempts.remove(task.value("requestId").toString());
+        }
         if (task.value("direction").toInt() == 1 && updated.completed())
         {
+            m_fileControlAttempts.remove(task.value("requestId").toString());
             m_tasks.update(task.value("clientFileId").toString(), {{"status", "completed"}});
             m_activeFileTasks.remove(task.value("clientFileId").toString());
             publishFileTasks();
