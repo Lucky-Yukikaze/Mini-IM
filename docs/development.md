@@ -302,7 +302,7 @@ ctest --test-dir ./build/client_qt611 -C Release --output-on-failure
 & ./.venv/Scripts/python.exe ./tools/test_native_flow.py --client ./build/client_qt611/Release/mini_im_native_driver.exe
 ~~~
 
-该入口自动启动两个使用桌面 Bridge 和原生库的 Qt 进程及临时 aioquic 服务端；
+该入口通常自动启动两个使用桌面 Bridge 和原生库的 Qt 进程及临时 aioquic 服务端；多设备消息场景启动四个客户端。
 通过随机本机端口传输业务数据，测试数据、证书均隔离。
 驱动需要与桌面程序相同的运行时 DLL，包括 Qt Sql 和 SQLite 插件。
 测试为每个客户端指定独立状态目录；命令接口只监听本机，退出时清理测试进程。
@@ -317,6 +317,10 @@ ctest --test-dir ./build/client_qt611 -C Release --output-on-failure
 同意图双设备上传检查把原任务复制到另一个隔离设备缓存，实际连接使用不同设备标识；
 它验证第二设备等待、第一设备进度推送、第一进程终止和超时接管后沿原位置完成。
 该用例只在隔离服务中把占用超时改为 1000 毫秒，不修改生产默认值。
+多设备消息场景分别使用单聊和固定成员群聊，验证两名用户各两台设备的发送、并发已读、撤回、
+接收方设备离线和进程重启，以及恢复快照、未读总数和持久事件去重。
+可追加 `--test test_multidevice_direct_reads_recall_and_restart --test test_multidevice_group_reads_recall_and_restart`
+仅运行这两个场景。群成员变更和接收端落盘后的投递确认不在这两个场景的验收范围内。
 服务进程重启由下述独立入口验证；Vue 完整桌面页面、其他多设备业务流程及传输性能需另外验收。
 可在上述联调命令后追加 `--test test_process_restart_fills_persisted_sync_gap` 单独复核一个场景，
 重复 `--test` 可选择多个场景；省略时执行全部。当前覆盖及运行结果统一见执行记录。

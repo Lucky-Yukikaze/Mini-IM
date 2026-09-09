@@ -70,7 +70,7 @@ function compareMessages(left: MessageItem, right: MessageItem): number {
   return left.seq - right.seq || left.createdAtMs - right.createdAtMs;
 }
 
-function upsertSortedMessage(list: MessageItem[], item: MessageItem): void {
+function upsertSortedMessage(list: MessageItem[], item: MessageItem): MessageItem {
   const existingIndex = list.findIndex((existing) => existing.id === item.id);
   const existing = list[existingIndex];
   const nextItem = existing ? {
@@ -97,6 +97,7 @@ function upsertSortedMessage(list: MessageItem[], item: MessageItem): void {
     }
   }
   list.splice(low, 0, nextItem);
+  return nextItem;
 }
 
 function applyReadProgressToMessage(
@@ -115,8 +116,13 @@ function applyReadProgressToMessage(
   return { ...item, unreadCount };
 }
 
-function isReadByUser(item: MessageItem, readerId: string, conversationProgress: Record<string, number> | undefined): boolean {
-  return Boolean(readerId) && item.seq > 0 && item.seq <= (conversationProgress?.[readerId] ?? 0);
+function countsAsUnread(
+  item: MessageItem | undefined,
+  userId: string,
+  conversationProgress: Record<string, number> | undefined
+): boolean {
+  return Boolean(item && item.senderId !== userId && !item.recalled && !item.burned &&
+    item.seq > (conversationProgress?.[userId] ?? 0));
 }
 
 export const useSessionStore = defineStore('session', {
@@ -267,15 +273,12 @@ export const useSessionStore = defineStore('session', {
           this.readProgressByConversation[item.conversationId]
         );
         const list = this.messagesByConversation[item.conversationId] ?? [];
-        const exists = list.some((existing) => existing.id === normalizedItem.id);
-        if (
-          !exists &&
-          normalizedItem.senderId !== this.currentUserId &&
-          !isReadByUser(normalizedItem, this.currentUserId, this.readProgressByConversation[item.conversationId])
-        ) {
-          this.unreadTotal += 1;
-        }
-        upsertSortedMessage(list, normalizedItem);
+        const progress = this.readProgressByConversation[item.conversationId];
+        const existing = list.find((entry) => entry.id === normalizedItem.id);
+        const wasUnread = countsAsUnread(existing, this.currentUserId, progress);
+        const merged = upsertSortedMessage(list, normalizedItem);
+        const isUnread = countsAsUnread(merged, this.currentUserId, progress);
+        this.unreadTotal = Math.max(0, this.unreadTotal + Number(isUnread) - Number(wasUnread));
         this.messagesByConversation[item.conversationId] = [...list];
 
         const conversation = this.conversations.find(
@@ -295,6 +298,9 @@ export const useSessionStore = defineStore('session', {
         const list = this.messagesByConversation[update.conversationId] ?? [];
         const item = list.find((message) => message.id === update.messageId);
         if (item) {
+          if (countsAsUnread(item, this.currentUserId, this.readProgressByConversation[update.conversationId])) {
+            this.unreadTotal = Math.max(0, this.unreadTotal - 1);
+          }
           item.recalled = true;
           item.text = '';
           if (update.type === 'burn' || update.operatorId === 'system-burn') {
@@ -328,8 +334,7 @@ export const useSessionStore = defineStore('session', {
         }
         if (
           update.readerId === this.currentUserId &&
-          item.senderId !== this.currentUserId &&
-          item.seq > oldLastReadSeq &&
+          countsAsUnread(item, this.currentUserId, conversationProgress) &&
           item.seq <= update.lastReadSeq
         ) {
           readByCurrentUser += 1;

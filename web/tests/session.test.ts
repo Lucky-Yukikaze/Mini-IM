@@ -182,3 +182,68 @@ test('unconfirmed file cancellation remains visible and account-scoped until nat
   session.applyFileTasks([]);
   assert.deepEqual(session.fileTasks, []);
 });
+
+
+for (const kind of ['recall', 'burn'] as const) {
+  test(kind + ' removes only its own unread contribution once, including later receipts', () => {
+    const session = createSession();
+    const original = { ...session.currentMessages[0] };
+    session.pushMessage({ ...original, id: 'm2', seq: 2 });
+    session.pushMessage({ ...original, id: 'elsewhere', conversationId: 'other' });
+    const terminal = { type: kind, eventId: 'terminal', conversationId: 'private',
+      messageId: original.id, operatorId: kind === 'burn' ? 'system-burn' : 'carol', tsMs: 2 };
+    session.applyMessageUpdated(terminal);
+    assert.equal(session.unreadTotal, 2);
+    session.applyMessageUpdated(terminal);
+    session.pushMessages([original, original]);
+    assert.equal(session.unreadTotal, 2);
+    session.applyMessageUpdated({ type: 'receipt', eventId: 'read-terminal', conversationId: 'private',
+      readerId: 'alice', lastReadSeq: 1, readAtMs: 3 });
+    assert.equal(session.unreadTotal, 2);
+    session.applyMessageUpdated({ type: 'receipt', eventId: 'read-next', conversationId: 'private',
+      readerId: 'alice', lastReadSeq: 2, readAtMs: 4 });
+    assert.equal(session.unreadTotal, 1);
+  });
+
+  test(kind + ' arriving before its message cannot create unread on replay', () => {
+    const session = useSessionStore(createPinia());
+    session.applyInitialState({ currentUser: { userId: 'alice' }, unreadTotal: 0 });
+    session.applyMessageUpdated({ type: kind, eventId: 'terminal-first', conversationId: 'private',
+      messageId: 'late', operatorId: kind === 'burn' ? 'system-burn' : 'carol', tsMs: 2 });
+    const message = { id: 'late', conversationId: 'private', senderId: 'carol', seq: 1, text: 'old body' };
+    session.pushMessages([message, message]);
+    assert.equal(session.unreadTotal, 0);
+    assert.equal(session.messagesByConversation.private[0].text, '');
+  });
+
+  test(kind + ' embedded in a message updates unread consistently with a native snapshot', () => {
+    const session = createSession();
+    const original = { ...session.currentMessages[0] };
+    session.pushMessage({ ...original, recalled: kind === 'recall', burned: kind === 'burn' });
+    assert.equal(session.unreadTotal, 0);
+    session.pushMessage(original);
+    assert.equal(session.unreadTotal, 0);
+    session.pushMessage({ ...original, id: 'already-terminal', seq: 2,
+      recalled: kind === 'recall', burned: kind === 'burn' });
+    assert.equal(session.unreadTotal, 0);
+    session.applyInitialState({ currentUser: { userId: 'alice' }, unreadTotal: 0,
+      recentMessages: session.currentMessages.map(item => ({ ...item })) });
+    session.applyMessageUpdated({ type: 'receipt', eventId: 'read-all', conversationId: 'private',
+      readerId: 'alice', lastReadSeq: 2, readAtMs: 4 });
+    assert.equal(session.unreadTotal, 0);
+  });
+}
+
+test('terminal events for sent and already read messages preserve other unread messages', () => {
+  const session = createSession();
+  const original = { ...session.currentMessages[0] };
+  session.applyMessageUpdated({ type: 'receipt', eventId: 'read', conversationId: 'private',
+    readerId: 'alice', lastReadSeq: 1, readAtMs: 2 });
+  session.pushMessage({ ...original, id: 'sent', senderId: 'alice', seq: 2 });
+  session.pushMessage({ ...original, id: 'unread', seq: 3 });
+  for (const messageId of ['m1', 'sent']) {
+    session.applyMessageUpdated({ type: 'recall', eventId: messageId, conversationId: 'private',
+      messageId, operatorId: 'carol', tsMs: 3 });
+  }
+  assert.equal(session.unreadTotal, 1);
+});

@@ -462,6 +462,126 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
             await client.wait("message", lambda item: item["clientMsgId"] == "file-msg-" + file_id)
         return file_id
 
+
+    async def test_multidevice_direct_reads_recall_and_restart(self):
+        await self.check_multidevice_messages(group=False)
+
+    async def test_multidevice_group_reads_recall_and_restart(self):
+        await self.check_multidevice_messages(group=True)
+
+    async def check_multidevice_messages(self, *, group):
+        devices = [(self.alice, "alice", "device-alice", self.root / "state-alice"),
+                   (self.bob, "bob", "device-bob", self.root / "state-bob")]
+        for user in ("alice", "bob"):
+            device = "device-" + user + "-secondary"
+            state = self.root / ("state-" + user + "-secondary")
+            client = await NativeClient.start(self.driver_path,
+                self.output_dir / f"{self._testMethodName}-{device}.log", state)
+            self.clients.append(client)
+            await client.connect(self.endpoint, user, device=device)
+            await self.synced(client, user)
+            devices.append((client, user, device, state))
+        alice_second, bob_second = devices[2][0], devices[3][0]
+        conversation = self.conversation
+        if group:
+            mark = await self.alice.command("group", intent="multi-group", title="two devices each", members=["bob"])
+            created = await self.alice.wait("conversation", lambda item: item["type"] == "group", since=mark)
+            conversation = created["conversationId"]
+            for client, _, _, _ in devices:
+                await client.wait("conversation", lambda item: item["conversationId"] == conversation)
+
+        await self.alice.command("message", conversation=conversation, intent="multi-read", text="read once")
+        first = await self.bob.wait("message", lambda item: item["clientMsgId"] == "multi-read")
+        for client, user, _, _ in devices:
+            await client.wait("message", lambda item: item["id"] == first["id"])
+            await self.synced(client, user)
+        marks = [len(client.events) for client in (self.bob, bob_second)]
+        await asyncio.gather(*(client.command("receipt", conversation=conversation, seq=first["seq"])
+                              for client in (self.bob, bob_second)))
+        for client, mark in zip((self.bob, bob_second), marks):
+            await client.wait("control-writes", lambda item: not item["items"], since=mark)
+        for client, user, _, _ in devices:
+            await client.wait("update", lambda item: item["type"] == "receipt" and item["lastReadSeq"] == first["seq"])
+            await self.synced(client, user)
+        receipts = [item for item in self.control_attempts if item["operation"] == "receipt"]
+        self.assertEqual(2, len({item["requestId"] for item in receipts}))
+        for user in ("alice", "bob"):
+            self.assertEqual(1, self.db.execute_fetchone(
+                "SELECT COUNT(*) FROM sync_events WHERE user_id=? AND event_type='receipt'", (user,))[0])
+        counter = self.db.execute_fetchone(
+            "SELECT read_count, unread_count FROM message_read_counters WHERE server_msg_id=?", (first["id"],))
+        self.assertEqual((1, 0), tuple(counter))
+
+        saved_cursor = await self.synced(bob_second)
+        await self.disconnect(bob_second)
+        await bob_second.crash()
+        messages = {"multi-read": first}
+        for intent, body in (("multi-recall", "remove this"), ("multi-unread", "still unread")):
+            await alice_second.command("message", conversation=conversation, intent=intent, text=body)
+            messages[intent] = await self.bob.wait("message", lambda item: item["clientMsgId"] == intent)
+        recalled = messages["multi-recall"]
+        mark = await self.alice.command("recall", conversation=conversation, message=recalled["id"])
+        await self.alice.wait("control-writes", lambda item: not item["items"], since=mark)
+        await self.bob.wait("update", lambda item: item["type"] == "recall" and item["messageId"] == recalled["id"])
+        mark = await self.bob.command("receipt", conversation=conversation, seq=recalled["seq"])
+        await self.bob.wait("control-writes", lambda item: not item["items"], since=mark)
+
+        _, user, device, state = devices[3]
+        bob_second = await NativeClient.start(self.driver_path,
+            self.output_dir / f"{self._testMethodName}-bob-secondary-restarted.log", state)
+        self.clients.append(bob_second)
+        devices[3] = (bob_second, user, device, state)
+        initial = await bob_second.connect(self.endpoint, user, device=device)
+        self.assertEqual(saved_cursor, initial["globalCursor"])
+        self.assertEqual([first["id"]], [item["id"] for item in initial["recentMessages"]])
+        self.assertEqual(0, initial["unreadTotal"])
+        self.assertEqual(first["seq"], initial["readProgressByConversation"][conversation]["bob"])
+        await self.synced(bob_second)
+        self.assertEqual({"multi-recall", "multi-unread"}, {
+            item["data"]["clientMsgId"] for item in bob_second.events if item["event"] == "message"})
+        before = self.db.execute_fetchone("SELECT COUNT(*) FROM sync_events")[0]
+        mark = await bob_second.command("receipt", conversation=conversation, seq=first["seq"])
+        await bob_second.wait("control-writes", lambda item: not item["items"], since=mark)
+        self.assertEqual(before, self.db.execute_fetchone("SELECT COUNT(*) FROM sync_events")[0])
+        await bob_second.command("message", conversation=conversation, intent="multi-reply", text="from second device")
+        messages["multi-reply"] = await self.alice.wait("message", lambda item: item["clientMsgId"] == "multi-reply")
+
+        for client, user, device, state in devices:
+            await client.wait("message", lambda item: item["clientMsgId"] == "multi-reply")
+            cursor = await self.synced(client, user)
+            await self.disconnect(client)
+            initial = await client.connect(self.endpoint, user, device=device)
+            self.assertEqual(cursor, initial["globalCursor"])
+            self.assertEqual(1, initial["unreadTotal"])
+            self.assertEqual(recalled["seq"], initial["readProgressByConversation"][conversation]["bob"])
+            restored = {item["clientMsgId"]: item for item in initial["recentMessages"]}
+            self.assertEqual(set(messages), set(restored))
+            self.assertEqual(4, len(initial["recentMessages"]))
+            emitted = [item["data"]["clientMsgId"] for item in client.events if item["event"] == "message"]
+            expected_emitted = set(messages) - ({"multi-read"} if client is bob_second else set())
+            self.assertEqual(expected_emitted, set(emitted))
+            self.assertEqual(len(expected_emitted), len(emitted))
+            self.assertEqual("", restored["multi-recall"]["text"])
+            self.assertTrue(restored["multi-recall"]["recalled"])
+            for intent in messages:
+                self.assertEqual(messages[intent]["id"], restored[intent]["id"])
+                self.assertEqual(0 if intent in ("multi-read", "multi-recall") else 1,
+                                 restored[intent]["unreadCount"])
+            paths = list(state.glob("*.sqlite"))
+            self.assertEqual(1, len(paths))
+            with closing(sqlite3.connect(paths[0])) as cache:
+                seen = cache.execute("SELECT position, event_id FROM seen ORDER BY position").fetchall()
+                expected = [tuple(row) for row in self.db.execute_fetchall(
+                    "SELECT seq, event_id FROM sync_events WHERE user_id=? ORDER BY seq", (user,))]
+                self.assertEqual(expected, seen)
+                self.assertEqual(list(range(1, cursor + 1)), [row[0] for row in seen])
+                self.assertEqual("ok", cache.execute("PRAGMA integrity_check").fetchone()[0])
+        self.assertEqual(4, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+        self.assertEqual(8, self.db.execute_fetchone("SELECT COUNT(*) FROM message_deliveries")[0])
+        self.assertEqual(recalled["seq"], self.db.execute_fetchone(
+            "SELECT last_read_seq FROM conversation_members WHERE conversation_id=? AND user_id='bob'",
+            (conversation,))[0])
+
     async def test_message_receipt_recall_and_offline_sync(self):
         mark = await self.alice.command("message", conversation=self.conversation, intent="message-1", text="hello")
         sent = await self.alice.wait("message", lambda item: item["clientMsgId"] == "message-1", since=mark)
