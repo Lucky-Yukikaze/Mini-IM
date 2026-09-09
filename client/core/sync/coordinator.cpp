@@ -39,6 +39,12 @@ MiniImStateEvent MapEvent(const im::sync::SyncEvent& event)
         item.data = miniim::BuildRecallPayload(event.recall());
         item.type = item.data.value(QStringLiteral("type")).toString();
     }
+    else if (event.has_delivery_updated())
+    {
+        item.type = QStringLiteral("delivery");
+        item.data = miniim::BuildDeliveryPayload(event.delivery_updated());
+        item.data.insert(QStringLiteral("globalSeq"), QVariant::fromValue(event.global_seq()));
+    }
     else if (event.has_file_updated())
     {
         return MapFile(event.global_seq(), event.event_id(), event.file_updated());
@@ -70,6 +76,10 @@ void MiniImSyncCoordinator::stop()
     m_caughtUp = false;
     emit readinessChanged(false);
     clearRequest();
+    m_confirmationId.clear();
+    m_confirmationPayload.clear();
+    m_confirmationAttempt.invalidate();
+    m_confirmationCursor = 0;
 }
 
 bool MiniImSyncCoordinator::isReady() const
@@ -106,6 +116,7 @@ void MiniImSyncCoordinator::requestNext()
 
 void MiniImSyncCoordinator::retryRequest()
 {
+    pumpConfirmation();
     if (m_running && !m_requestId.isEmpty() && m_attemptTime.isValid()
         && m_attemptTime.elapsed() >= kRequestRetryMs)
     {
@@ -115,6 +126,85 @@ void MiniImSyncCoordinator::retryRequest()
             emit errorRaised(QStringLiteral("failed to send sync request; waiting to retry"));
         }
     }
+}
+
+void MiniImSyncCoordinator::pumpConfirmation()
+{
+    if (!m_running)
+    {
+        return;
+    }
+    try
+    {
+        if (m_confirmationId.isEmpty())
+        {
+            auto pending = m_store.pendingConfirmation();
+            if (pending.isEmpty() && m_store.cursor() <= m_store.confirmedCursor())
+            {
+                return;
+            }
+            auto envelope = m_factory(m_store.cursor(), 0);
+            if (pending.isEmpty())
+            {
+                m_store.saveConfirmation(QString::fromStdString(envelope.request_id()), m_store.cursor());
+                pending = m_store.pendingConfirmation();
+            }
+            m_confirmationId = pending.value(QStringLiteral("requestId")).toString();
+            m_confirmationCursor = pending.value(QStringLiteral("cursor")).toULongLong();
+            envelope.set_request_id(m_confirmationId.toStdString());
+            envelope.set_trace_id(m_confirmationId.toStdString());
+            envelope.mutable_sync_applied()->set_global_cursor(m_confirmationCursor);
+            m_confirmationPayload = envelope.SerializeAsString();
+        }
+        if (!m_confirmationAttempt.isValid() || m_confirmationAttempt.elapsed() >= kRequestRetryMs)
+        {
+            m_confirmationAttempt.start();
+            if (!m_sender(m_confirmationPayload))
+            {
+                emit errorRaised(QStringLiteral("failed to send delivery confirmation; waiting to retry"));
+            }
+        }
+    }
+    catch (const std::exception& error)
+    {
+        fail(QString::fromUtf8(error.what()));
+    }
+}
+
+bool MiniImSyncCoordinator::handleConfirmationResult(
+    const QString& requestId, bool success, int code, const QString& entityId)
+{
+    if (!m_running || m_confirmationId.isEmpty() || requestId != m_confirmationId)
+    {
+        return false;
+    }
+    try
+    {
+        if (success)
+        {
+            if (entityId != QString::number(m_confirmationCursor))
+            {
+                throw std::runtime_error("delivery confirmation response has wrong cursor");
+            }
+            m_store.completeConfirmation(requestId);
+            m_confirmationId.clear();
+            m_confirmationPayload.clear();
+            m_confirmationAttempt.invalidate();
+        }
+        else if (code == 401 || code == 408 || code == 429 || code >= 500)
+        {
+            emit errorRaised(QStringLiteral("delivery confirmation rejected temporarily; waiting to retry"));
+        }
+        else
+        {
+            fail(QStringLiteral("delivery confirmation rejected; cached intent retained"));
+        }
+    }
+    catch (const std::exception& error)
+    {
+        fail(QString::fromUtf8(error.what()));
+    }
+    return true;
 }
 
 void MiniImSyncCoordinator::fail(const QString& error)

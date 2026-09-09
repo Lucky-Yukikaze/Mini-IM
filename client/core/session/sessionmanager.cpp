@@ -915,6 +915,11 @@ void MiniImSessionManager::handleIncomingEnvelope(const QByteArray& payload)
             restartConnection(QStringLiteral("session rejected; reconnecting"), true);
         }
         const QString request_id = QString::fromStdString(ack.request_id());
+        if (m_sync.handleConfirmationResult(request_id, ack.success(), ack.code(),
+                QString::fromStdString(ack.entity_id())))
+        {
+            return;
+        }
         handleMessageResult(request_id, ack.success(), ack.code(),
             QString::fromStdString(ack.message()), QString::fromStdString(ack.entity_id()));
         if (ack.success())
@@ -950,6 +955,10 @@ void MiniImSessionManager::handleIncomingEnvelope(const QByteArray& payload)
         if (error.code() == 401)
         {
             restartConnection(QStringLiteral("session rejected; reconnecting"), true);
+        }
+        if (m_sync.handleConfirmationResult(QString::fromStdString(envelope.request_id()), false, error.code(), QString()))
+        {
+            return;
         }
         m_controlWrites.handleResult(QString::fromStdString(envelope.request_id()), false, error.code(),
             QString::fromStdString(error.message()), QString());

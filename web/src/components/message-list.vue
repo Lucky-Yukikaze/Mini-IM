@@ -50,6 +50,7 @@
             </template>
           </div>
           <div class="message-actions">
+            <span v-if="deliveryLabel(item, currentUserId, conversationType)" class="pill">{{ deliveryLabel(item, currentUserId, conversationType) }}</span>
             <span v-if="readLabel(item)" class="pill">{{ readLabel(item) }}</span>
             <span v-if="!item.recalled && item.burnMode > 0" class="pill">焚毁 {{ item.burnTtlSec }}s</span>
             <button
@@ -73,6 +74,7 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
+import { deliveryLabel } from '../model/delivery';
 import type { MessageItem } from '../types';
 
 interface FilePayload {

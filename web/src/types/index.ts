@@ -11,6 +11,7 @@ export interface MessageItem {
   unreadCount: number;
   burnMode: number;
   burnTtlSec: number;
+  deliveries?: DeliveryUpdate[];
 }
 
 export interface ConversationItem {
@@ -36,6 +37,7 @@ export interface InitialStatePayload {
   unreadTotal?: number;
   globalCursor?: number;
   readProgressByConversation?: Record<string, Record<string, number>>;
+  deliveries?: DeliveryUpdate[];
   files?: FileProgressItem[];
   messageSends?: MessageSendItem[];
   fileTasks?: FileTaskItem[];
@@ -69,7 +71,22 @@ export interface BurnUpdate {
   operatorId: string;
 }
 
-export type MessageUpdate = ReceiptUpdate | RecallUpdate | BurnUpdate;
+export interface DeliveryUpdate {
+  type: 'delivery';
+  eventId: string;
+  globalSeq: number;
+  conversationId: string;
+  messageId: string;
+  userId: string;
+  status: 'sent' | 'delivered' | 'read' | 'failed';
+  sentAtMs: number;
+  deliveredAtMs: number;
+  readAtMs: number;
+  failedAtMs: number;
+  failureReason: string;
+}
+
+export type MessageUpdate = ReceiptUpdate | RecallUpdate | BurnUpdate | DeliveryUpdate;
 
 export interface FileProgressItem {
   eventId: string;

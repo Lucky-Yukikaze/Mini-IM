@@ -1,6 +1,8 @@
 #include "core/sync/coordinator.h"
 
 #include <QCoreApplication>
+#include <QEventLoop>
+#include <QThread>
 #include <QSqlError>
 #include <QTemporaryDir>
 #include <QUuid>
@@ -101,6 +103,87 @@ struct Fixture
     }
 };
 
+
+void WaitUntil(const std::function<bool()>& predicate, int timeoutMs = 2000)
+{
+    QElapsedTimer timeout;
+    timeout.start();
+    while (!predicate() && timeout.elapsed() < timeoutMs)
+    {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+        QThread::msleep(2);
+    }
+    Require(predicate(), "timed out waiting for sync confirmation");
+}
+
+void CheckDurableConfirmationRetries()
+{
+    Fixture fixture;
+    fixture.reply(fixture.sent.first().request_id(), {Message(1), Message(3)}, true, 3);
+    WaitUntil([&]() { return fixture.sent.last().has_sync_applied(); });
+    const auto original = fixture.sent.last();
+    const auto id = QString::fromStdString(original.request_id());
+    Require(original.sync_applied().global_cursor() == 1, "confirm only committed continuous prefix");
+    Require(fixture.store.pendingConfirmation().value("requestId") == id, "intent durable before sending");
+    const auto count = fixture.sent.size();
+    fixture.sync.handleConfirmationResult(id, false, 503, {});
+    WaitUntil([&]() { return fixture.sent.size() > count && fixture.sent.last().has_sync_applied(); }, 6500);
+    Require(fixture.sent.last().SerializeAsString() == original.SerializeAsString(), "retry same identity and body");
+    fixture.sync.stop();
+    fixture.store.close();
+    Require(fixture.store.open(fixture.root.path(), "endpoint", "bob", "device"), "reopen durable state");
+    fixture.sync.start();
+    WaitUntil([&]() { return fixture.sent.last().has_sync_applied(); });
+    Require(fixture.sent.last().request_id() == original.request_id(), "restart uses original request");
+    Require(fixture.sent.last().sync_applied().global_cursor() == 1, "restart does not widen pending intent");
+    fixture.sql("CREATE TRIGGER reject_ack BEFORE DELETE ON metadata WHEN OLD.key='sync_confirmation' "
+        "BEGIN SELECT RAISE(ABORT,'injected ack persistence failure'); END");
+    fixture.sync.handleConfirmationResult(id, true, 0, "1");
+    Require(fixture.failedCount == 1 && fixture.store.confirmedCursor() == 0, "ack save failure stops confirmation");
+    Require(!fixture.store.pendingConfirmation().isEmpty(), "ack save failure remains recoverable");
+    fixture.sql("DROP TRIGGER reject_ack");
+    fixture.sync.start();
+    WaitUntil([&]() { return fixture.sent.last().has_sync_applied(); });
+    fixture.sync.handleConfirmationResult(id, true, 0, "1");
+    Require(fixture.store.confirmedCursor() == 1, "matching response settles original intent");
+    Require(!fixture.sync.handleConfirmationResult(id, true, 0, "1"), "duplicate ack has no repeated effect");
+    fixture.reply("", {Message(2)});
+    WaitUntil([&]() { return fixture.sent.last().has_sync_applied() && fixture.sent.last().sync_applied().global_cursor() == 3; });
+    Require(fixture.sent.last().request_id() != original.request_id(), "new prefix uses new identity");
+    fixture.sync.handleConfirmationResult(QString::fromStdString(fixture.sent.last().request_id()), true, 0, "99");
+    Require(fixture.failedCount == 2 && fixture.store.confirmedCursor() == 1, "wrong response cursor cannot settle intent");
+}
+
+void CheckConfirmationSaveFailureAndDeliveryMapping()
+{
+    Fixture fixture;
+    fixture.reply(fixture.sent.first().request_id(), {Message(1)}, false, 1);
+    fixture.sql("CREATE TRIGGER reject_confirmation BEFORE INSERT ON metadata WHEN NEW.key='sync_confirmation' "
+        "BEGIN SELECT RAISE(ABORT,'injected confirmation persistence failure'); END");
+    WaitUntil([&]() { return fixture.failedCount == 1; });
+    for (const auto& request : fixture.sent)
+    {
+        Require(!request.has_sync_applied(), "unsaved intent must never reach transport");
+    }
+    fixture.sql("DROP TRIGGER reject_confirmation");
+    fixture.sync.start();
+    im::sync::SyncEvent event;
+    event.set_global_seq(2);
+    event.set_event_id("delivery-2");
+    auto* delivery = event.mutable_delivery_updated();
+    delivery->set_event_id("delivery-2");
+    delivery->set_message_id("message-1");
+    delivery->set_conversation_id("conversation");
+    delivery->set_user_id("bob");
+    delivery->set_status("delivered");
+    delivery->set_delivered_at_ms(12);
+    fixture.reply(fixture.sent.last().request_id(), {event}, false, 2);
+    const auto restored = fixture.store.snapshot().value("deliveries").toList();
+    Require(restored.size() == 1 && restored.first().toMap().value("globalSeq").toInt() == 2,
+        "delivery mapped and saved with stable event position");
+    Require(fixture.store.cursor() == 2 && fixture.sync.isReady(), "delivery is a supported sync event");
+}
+
 void CheckPaginationAndLateReply()
 {
     Fixture fixture;
@@ -193,6 +276,8 @@ int main(int argc, char** argv)
     QCoreApplication application(argc, argv);
     try
     {
+        CheckDurableConfirmationRetries();
+        CheckConfirmationSaveFailureAndDeliveryMapping();
         CheckPaginationAndLateReply();
         CheckNonAdvancingPages();
         CheckFailedCommitAndStop();

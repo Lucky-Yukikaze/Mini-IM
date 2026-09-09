@@ -183,6 +183,10 @@ class TestProtocol(MiniImQuicProtocol):
         super().send_sync_event(event)
 
     def _send(self, stream_id, envelope):
+        if (envelope.HasField("ack") and envelope.request_id in self.scenario.confirmation_requests
+                and self.m_user_id == "bob" and self.scenario.drop_confirmation_acks):
+            self.scenario.drop_confirmation_acks -= 1
+            return
         if envelope.HasField("ack") and envelope.request_id in self.scenario.control_requests:
             if self.scenario.drop_control_acks:
                 self.scenario.drop_control_acks -= 1
@@ -279,6 +283,21 @@ class RecordingControlService(ControlWriteService):
         return super().handle(user_id, envelope)
 
 
+class RecordingSyncService(SyncService):
+    def __init__(self, repo, scenario):
+        super().__init__(repo)
+        self.scenario = scenario
+
+    def handle_sync_applied(self, user_id, device_id, request_id, request):
+        self.scenario.confirmation_requests.add(request_id)
+        self.scenario.confirmation_attempts.append({"user": user_id, "device": device_id,
+            "requestId": request_id, "cursor": request.global_cursor, "body": request.SerializeToString().hex()})
+        if self.scenario.reject_confirmation and user_id == "bob":
+            return ControlWriteResult(message_pb2.Ack(request_id=request_id, success=False,
+                code=503, message="injected confirmation hold"), [])
+        return super().handle_sync_applied(user_id, device_id, request_id, request)
+
+
 class RecordingFileService(FileService):
     def __init__(self, *args, scenario, **kwargs):
         super().__init__(*args, **kwargs)
@@ -366,6 +385,10 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         self.block_file_init = False
         self.reject_file_cancel = 0
         self.cancel_attempts = []
+        self.confirmation_requests = set()
+        self.confirmation_attempts = []
+        self.drop_confirmation_acks = 0
+        self.reject_confirmation = False
         self.control_requests = set()
         self.control_attempts = []
         self.drop_control_acks = 0
@@ -395,7 +418,7 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
                 control_write_service=RecordingControlService(
                     ControlWriteRepo(self.db), ConversationService(conversations), DeliveryService(deliveries), scenario=self),
                 file_service=self.files, message_service=RecordingMessageService(messages, conversations, scenario=self),
-                sync_service=SyncService(SyncRepo(self.db)), online_hub=self.hub, fault_config=self.fault, **kwargs,
+                sync_service=RecordingSyncService(SyncRepo(self.db), self), online_hub=self.hub, fault_config=self.fault, **kwargs,
             ),
         )
         def record_udp_error(error):
@@ -418,6 +441,8 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
 
     async def cleanup(self):
         errors = []
+        (self.output_dir / f"{self._testMethodName}-confirmation-attempts.json").write_text(
+            json.dumps(self.confirmation_attempts, indent=2), encoding="utf-8")
         (self.output_dir / f"{self._testMethodName}-upload-conflicts.json").write_text(
             json.dumps(self.upload_conflicts, indent=2), encoding="utf-8")
         (self.output_dir / f"{self._testMethodName}-control-attempts.json").write_text(
@@ -546,6 +571,7 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         await bob_second.command("message", conversation=conversation, intent="multi-reply", text="from second device")
         messages["multi-reply"] = await self.alice.wait("message", lambda item: item["clientMsgId"] == "multi-reply")
 
+        await self.confirmations_settled([(user, state) for _, user, _, state in devices])
         for client, user, device, state in devices:
             await client.wait("message", lambda item: item["clientMsgId"] == "multi-reply")
             cursor = await self.synced(client, user)
@@ -581,6 +607,129 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(recalled["seq"], self.db.execute_fetchone(
             "SELECT last_read_seq FROM conversation_members WHERE conversation_id=? AND user_id='bob'",
             (conversation,))[0])
+
+
+    async def wait_for(self, predicate, timeout=10):
+        async with asyncio.timeout(timeout):
+            while not predicate():
+                await asyncio.sleep(0.02)
+
+    def confirmation_metadata(self, state):
+        paths = list(state.glob("*.sqlite"))
+        if not paths:
+            return {}
+        with closing(sqlite3.connect(paths[0])) as cache:
+            return dict(cache.execute("SELECT key,value FROM metadata"))
+
+    async def confirmations_settled(self, devices=None):
+        devices = devices or [("alice", self.root / "state-alice"), ("bob", self.root / "state-bob")]
+        def settled():
+            for user, state in devices:
+                maximum = self.db.execute_fetchone("SELECT COALESCE(MAX(seq),0) FROM sync_events WHERE user_id=?", (user,))[0]
+                metadata = self.confirmation_metadata(state)
+                if int(metadata.get("sync_confirmed_cursor", 0)) != maximum or metadata.get("sync_confirmation"):
+                    return False
+            return True
+        await self.wait_for(settled, timeout=14)
+
+    def delivered(self, message):
+        return dict(self.db.execute_fetchone(
+            "SELECT * FROM message_deliveries WHERE server_msg_id=? AND user_id='bob'", (message,)))
+
+    async def test_native_delivery_waits_for_offline_receiver_and_restores_sender_display(self):
+        await self.disconnect(self.bob)
+        await self.alice.command("message", conversation=self.conversation, intent="delivery-offline", text="offline")
+        message = await self.alice.wait("message", lambda item: item["clientMsgId"] == "delivery-offline")
+        self.assertEqual("sent", self.delivered(message["id"])["status"])
+        self.assertIsNone(self.delivered(message["id"])["delivered_at_ms"])
+        await self.bob.connect(self.endpoint, "bob")
+        delivered = await self.alice.wait("update", lambda item: item["type"] == "delivery" and item["messageId"] == message["id"])
+        self.assertEqual("bob", delivered["userId"])
+        self.assertEqual("delivered", delivered["status"])
+        self.assertEqual(self.delivered(message["id"])["delivered_at_ms"], delivered["deliveredAtMs"])
+        self.assertIsNone(self.delivered(message["id"])["read_at_ms"])
+        await self.confirmations_settled()
+        await self.disconnect(self.alice)
+        snapshot = await self.alice.connect(self.endpoint, "alice")
+        self.assertEqual([delivered], snapshot["deliveries"])
+        self.assertEqual(1, snapshot["recentMessages"][0]["unreadCount"])
+        await self.bob.command("receipt", conversation=self.conversation, seq=message["seq"])
+        await self.alice.wait("update", lambda item: item["type"] == "receipt")
+        self.assertEqual("read", self.delivered(message["id"])["status"])
+
+    async def test_native_delivery_lost_ack_retries_original_request(self):
+        await self.confirmations_settled()
+        self.drop_confirmation_acks = 1
+        await self.alice.command("message", conversation=self.conversation, intent="delivery-retry", text="retry")
+        message = await self.bob.wait("message", lambda item: item["clientMsgId"] == "delivery-retry")
+        await self.alice.wait("update", lambda item: item["type"] == "delivery" and item["messageId"] == message["id"])
+        original = json.loads(self.confirmation_metadata(self.root / "state-bob")["sync_confirmation"])
+        row = self.delivered(message["id"])
+        await self.confirmations_settled()
+        attempts = [item for item in self.confirmation_attempts if item["requestId"] == original["requestId"]]
+        self.assertEqual(2, len(attempts))
+        self.assertEqual(attempts[0], attempts[1])
+        self.assertEqual(row, self.delivered(message["id"]))
+        self.assertEqual(1, sum(packet["event"] == "update" and packet["data"].get("type") == "delivery"
+                                for packet in self.alice.events))
+
+    async def test_native_delivery_pending_confirmation_survives_process_restart(self):
+        await self.confirmations_settled()
+        self.reject_confirmation = True
+        await self.alice.command("message", conversation=self.conversation, intent="delivery-crash", text="persist")
+        message = await self.bob.wait("message", lambda item: item["clientMsgId"] == "delivery-crash")
+        await self.bob.wait("error", lambda item: "confirmation rejected temporarily" in item["message"])
+        pending = json.loads(self.confirmation_metadata(self.root / "state-bob")["sync_confirmation"])
+        self.assertEqual("sent", self.delivered(message["id"])["status"])
+        await self.bob.crash()
+        self.reject_confirmation = False
+        snapshot = await self.restart_bob()
+        self.assertEqual(message["id"], snapshot["recentMessages"][0]["id"])
+        await self.alice.wait("update", lambda item: item["type"] == "delivery" and item["messageId"] == message["id"])
+        await self.confirmations_settled()
+        attempts = [item for item in self.confirmation_attempts if item["requestId"] == pending["requestId"]]
+        self.assertEqual(2, len(attempts))
+        self.assertEqual(attempts[0], attempts[1])
+
+    async def test_native_delivery_does_not_confirm_past_sync_gap(self):
+        await self.confirmations_settled()
+        before = int(self.confirmation_metadata(self.root / "state-bob")["sync_confirmed_cursor"])
+        self.hold_bob_history = True
+        self.drop_next_bob_message = True
+        for intent in ("delivery-missing", "delivery-later"):
+            await self.alice.command("message", conversation=self.conversation, intent=intent, text=intent)
+            await self.alice.wait("message", lambda item: item["clientMsgId"] == intent)
+        await self.bob.wait("message", lambda item: item["clientMsgId"] == "delivery-later")
+        await self.wait_for(lambda: self.held_history_count > 0)
+        await asyncio.sleep(0.8)
+        self.assertEqual(before, int(self.confirmation_metadata(self.root / "state-bob")["sync_confirmed_cursor"]))
+        self.assertEqual(["sent", "sent"], [row[0] for row in self.db.execute_fetchall(
+            "SELECT status FROM message_deliveries WHERE user_id='bob' ORDER BY seq")])
+        self.hold_bob_history = False
+        await self.confirmations_settled()
+        self.assertEqual(["delivered", "delivered"], [row[0] for row in self.db.execute_fetchall(
+            "SELECT status FROM message_deliveries WHERE user_id='bob' ORDER BY seq")])
+
+    async def test_native_delivery_save_failure_never_reaches_server(self):
+        await self.confirmations_settled()
+        cache_path = next((self.root / "state-bob").glob("*.sqlite"))
+        with closing(sqlite3.connect(cache_path)) as cache:
+            cache.execute("CREATE TRIGGER reject_confirmation BEFORE INSERT ON metadata WHEN NEW.key='sync_confirmation' "
+                          "BEGIN SELECT RAISE(ABORT,'injected confirmation save failure'); END")
+            cache.commit()
+        count = len([item for item in self.confirmation_attempts if item["user"] == "bob"])
+        mark = await self.alice.command("message", conversation=self.conversation, intent="delivery-save", text="saved message")
+        message = await self.alice.wait("message", lambda item: item["clientMsgId"] == "delivery-save", since=mark)
+        await self.bob.wait("error", lambda item: "injected confirmation save failure" in item["message"])
+        await self.bob.wait("connection", lambda item: item["state"] == "disconnected")
+        self.assertEqual(count, len([item for item in self.confirmation_attempts if item["user"] == "bob"]))
+        self.assertEqual("sent", self.delivered(message["id"])["status"])
+        with closing(sqlite3.connect(cache_path)) as cache:
+            cache.execute("DROP TRIGGER reject_confirmation")
+            cache.commit()
+        await self.bob.connect(self.endpoint, "bob")
+        await self.alice.wait("update", lambda item: item["type"] == "delivery" and item["messageId"] == message["id"])
+        await self.confirmations_settled()
 
     async def test_message_receipt_recall_and_offline_sync(self):
         mark = await self.alice.command("message", conversation=self.conversation, intent="message-1", text="hello")

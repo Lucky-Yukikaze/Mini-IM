@@ -167,7 +167,28 @@ class DesktopCheck:
         assert len({item["requestId"] for item in attempts if item["intent"] == rejected_intent}) == 2
         for cancellation in state["cancellations"]:
             assert cancellation["owner_id"] == "alice"
-        return state
+        self.phase("delivery-send")
+        self.command("confirm-bob")
+        self.phase("delivery-status", image=str(self.artifacts / "delivery-confirmed.png"))
+        self.command("restart-client")
+        self.call("detach")
+        deadline = time.monotonic() + 12
+        while True:
+            try:
+                with urlopen(self.context["debug"] + "/json", timeout=1) as response:
+                    if json.load(response):
+                        break
+            except (URLError, TimeoutError):
+                pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError("restarted Qt page did not start")
+            time.sleep(0.1)
+        self.call("attach", "--cdp", self.context["debug"])
+        self.phase("login", user="alice", title="Desktop renamed", failure=True)
+        self.phase("delivery-status", image=str(self.artifacts / "delivery-restored.png"))
+        self.command("read-bob")
+        self.phase("delivery-status", read=True)
+        return self.command("snapshot")
 
 
 if __name__ == "__main__":

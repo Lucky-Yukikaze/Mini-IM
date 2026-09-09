@@ -3,6 +3,7 @@ import type {
   ConnectionState,
   ControlWriteItem,
   ConversationItem,
+  DeliveryUpdate,
   InitialStatePayload,
   FileProgressItem,
   FileTaskItem,
@@ -25,6 +26,7 @@ interface SessionStoreState {
   messagesByConversation: Record<string, MessageItem[]>;
   fileProgressByConversation: Record<string, FileProgressItem[]>;
   readProgressByConversation: Record<string, Record<string, number>>;
+  deliveriesByConversation: Record<string, Record<string, Record<string, DeliveryUpdate>>>;
   pendingMessageStateByConversation: Record<string, Record<string, { recalled: boolean; burned: boolean }>>;
 }
 
@@ -143,6 +145,7 @@ export const useSessionStore = defineStore('session', {
     messagesByConversation: {},
     fileProgressByConversation: {},
     readProgressByConversation: {},
+    deliveriesByConversation: {},
     pendingMessageStateByConversation: {}
   }),
   getters: {
@@ -153,7 +156,13 @@ export const useSessionStore = defineStore('session', {
       return state.messageSends.filter((item) => item.conversationId === state.activeConversationId);
     },
     currentMessages(state): MessageItem[] {
-      return state.messagesByConversation[state.activeConversationId] ?? [];
+      return (state.messagesByConversation[state.activeConversationId] ?? []).map(item => ({
+        ...item,
+        deliveries: Object.values(state.deliveriesByConversation[item.conversationId]?.[item.id] ?? {}).map(delivery => {
+          const readSeq = state.readProgressByConversation[item.conversationId]?.[delivery.userId] ?? 0;
+          return item.seq > 0 && item.seq <= readSeq ? { ...delivery, status: 'read' as const } : delivery;
+        })
+      }));
     },
     currentConversation(state): ConversationItem | undefined {
       return state.conversations.find((item) => item.conversationId === state.activeConversationId);
@@ -207,6 +216,10 @@ export const useSessionStore = defineStore('session', {
       }
       if (payload.messageSends !== undefined) {
         this.applyMessageSends(payload.messageSends);
+      }
+      if (payload.deliveries !== undefined) {
+        this.deliveriesByConversation = {};
+        for (const delivery of payload.deliveries) this.applyMessageUpdated(delivery);
       }
       if (payload.files !== undefined) {
         this.fileProgressByConversation = {};
@@ -294,6 +307,17 @@ export const useSessionStore = defineStore('session', {
       }
     },
     applyMessageUpdated(update: MessageUpdate): void {
+      if (update.type === 'delivery') {
+        const conversation = this.deliveriesByConversation[update.conversationId] ?? {};
+        const deliveries = conversation[update.messageId] ?? {};
+        const previous = deliveries[update.userId];
+        if (!previous || update.globalSeq > previous.globalSeq) {
+          deliveries[update.userId] = update;
+          conversation[update.messageId] = deliveries;
+          this.deliveriesByConversation[update.conversationId] = conversation;
+        }
+        return;
+      }
       if (update.type === 'recall' || update.type === 'burn') {
         const list = this.messagesByConversation[update.conversationId] ?? [];
         const item = list.find((message) => message.id === update.messageId);

@@ -190,6 +190,17 @@ QVariantMap MiniImStateStore::project(const MiniImStateEvent& event)
             saveObject(QStringLiteral("message"), id, event.position, protectMessage(message));
         }
     }
+    else if (event.type == QStringLiteral("delivery"))
+    {
+        const QString id = ReceiptId(data.value(QStringLiteral("messageId")).toString(),
+            data.value(QStringLiteral("userId")).toString());
+        auto previous = run(QStringLiteral("SELECT position,data FROM objects WHERE kind='delivery' AND id=?"), {id});
+        if (previous.next() && previous.value(0).toULongLong() > event.position)
+        {
+            return Decode(previous.value(1));
+        }
+        saveObject(QStringLiteral("delivery"), id, event.position, data);
+    }
     else if (event.type == QStringLiteral("receipt"))
     {
         const QString id = ReceiptId(conversation, data.value(QStringLiteral("readerId")).toString());
@@ -310,6 +321,7 @@ QVariantMap MiniImStateStore::snapshot() const
         QVariantList conversations;
         QVariantList messages;
         QVariantList files;
+        QVariantList deliveries;
         QVariantMap reads;
         auto query = run(QStringLiteral("SELECT kind,data FROM objects ORDER BY position"));
         while (query.next())
@@ -327,6 +339,10 @@ QVariantMap MiniImStateStore::snapshot() const
             else if (kind == QStringLiteral("file"))
             {
                 files.append(data);
+            }
+            else if (kind == QStringLiteral("delivery"))
+            {
+                deliveries.append(data);
             }
             else if (kind == QStringLiteral("receipt"))
             {
@@ -360,13 +376,58 @@ QVariantMap MiniImStateStore::snapshot() const
         }
         return {{"currentUser", QVariantMap{{"userId", m_user}}}, {"globalCursor", QVariant::fromValue(m_cursor)},
             {"conversations", conversations}, {"recentMessages", messages}, {"unreadTotal", unreadTotal},
-            {"readProgressByConversation", reads}, {"files", files}, {"messageSends", m_outbox.pending()}, {"fileTasks", m_fileTasks.pending()},
+            {"readProgressByConversation", reads}, {"deliveries", deliveries}, {"files", files}, {"messageSends", m_outbox.pending()}, {"fileTasks", m_fileTasks.pending()},
             {"controlWrites", m_controlWrites.pending()}};
     }
     catch (const std::exception& error)
     {
         m_error = QString::fromUtf8(error.what());
         return {};
+    }
+}
+
+QVariantMap MiniImStateStore::pendingConfirmation() const
+{
+    const auto value = metadata(QStringLiteral("sync_confirmation"));
+    return value.isEmpty() ? QVariantMap() : Decode(value.toUtf8());
+}
+
+quint64 MiniImStateStore::confirmedCursor() const
+{
+    return metadata(QStringLiteral("sync_confirmed_cursor")).toULongLong();
+}
+
+void MiniImStateStore::saveConfirmation(const QString& requestId, quint64 cursor)
+{
+    if (requestId.isEmpty() || cursor == 0 || cursor > m_cursor || cursor <= confirmedCursor()
+        || !pendingConfirmation().isEmpty())
+    {
+        throw std::runtime_error("invalid or overlapping sync confirmation");
+    }
+    const QVariantMap pending{{"requestId", requestId}, {"cursor", QString::number(cursor)}};
+    run(QStringLiteral("INSERT INTO metadata(key,value) VALUES('sync_confirmation',?)"),
+        {QString::fromUtf8(Encode(pending))});
+}
+
+void MiniImStateStore::completeConfirmation(const QString& requestId)
+{
+    try
+    {
+        run(QStringLiteral("BEGIN IMMEDIATE"));
+        const auto pending = pendingConfirmation();
+        if (pending.value(QStringLiteral("requestId")).toString() == requestId)
+        {
+            const auto cursor = pending.value(QStringLiteral("cursor")).toString();
+            run(QStringLiteral("INSERT INTO metadata(key,value) VALUES('sync_confirmed_cursor',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value"), {cursor});
+            run(QStringLiteral("DELETE FROM metadata WHERE key='sync_confirmation'"));
+        }
+        run(QStringLiteral("COMMIT"));
+    }
+    catch (...)
+    {
+        m_db.rollback();
+        throw;
     }
 }
 

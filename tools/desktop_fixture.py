@@ -4,7 +4,7 @@ Read context.json for endpoint, seeded group and local WebEngine debugging URL.
 Write {"id": "unique-command", "op": ...} to command.json and wait for the same
 id in response.json. Operations: snapshot, message(text), reject(code),
 drop-ack(count), cache-fault(enabled,user,device), file-init-reject(code),
-file-cancel-reject(code), restart-client, stop.
+file-cancel-reject(code), confirm-bob, read-bob, restart-client, stop.
 Only the private fixture databases are changed. No default development data is used.
 """
 from __future__ import annotations
@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
 
 from aioquic.quic.configuration import QuicConfiguration
-from protocol.pb import common_pb2, conversation_pb2, message_pb2
+from protocol.pb import common_pb2, conversation_pb2, message_pb2, sync_pb2
 from quic.endpoint import serve_quic
 from quic.server import FaultConfig, MiniImQuicProtocol, OnlineSessionHub, ensure_dev_cert
 from services.auth.service import AuthService
@@ -88,11 +88,11 @@ class DesktopFixture:
 
         controls = Controls(ControlWriteRepo(self.db), self.conversations, delivery)
         class Files(FileService):
-            def handle_file_init(self, user_id, request_id, request):
+            def handle_file_init(self, user_id, request_id, file_init):
                 if scenario.file_init_reject:
                     return FileServiceResult(message_pb2.Ack(request_id=request_id, success=False,
                         code=scenario.file_init_reject, message="injected file init rejection"), None, [])
-                return super().handle_file_init(user_id, request_id, request)
+                return super().handle_file_init(user_id, request_id, file_init)
 
             def handle_file_cancel(self, user_id, request_id, request):
                 scenario.file_cancel_attempts.append(dict(user=user_id, requestId=request_id,
@@ -191,6 +191,17 @@ class DesktopFixture:
                 content=data["text"].encode("utf-8")))
             if not result.ack.success:
                 raise ValueError(result.ack.message)
+            self.hub.fanout_sync_events(result.sync_events)
+        elif op == "confirm-bob":
+            cursor = self.db.execute_fetchone("SELECT MAX(seq) FROM sync_events WHERE user_id='bob'")[0]
+            result = SyncService(SyncRepo(self.db)).handle_sync_applied(
+                "bob", "desktop-fixture-bob", data["id"], sync_pb2.SyncApplied(global_cursor=cursor))
+            if not result.ack.success:
+                raise ValueError(result.ack.message)
+            self.hub.fanout_sync_events(result.sync_events)
+        elif op == "read-bob":
+            seq = self.db.execute_fetchone("SELECT MAX(conversation_seq) FROM messages WHERE conversation_id=?", (self.group,))[0]
+            result = DeliveryRepo(self.db).apply_receipt("bob", self.group, seq)
             self.hub.fanout_sync_events(result.sync_events)
         elif op == "cache-fault":
             identity = json.dumps([f"127.0.0.1:{self.port}", data.get("user", "alice"),

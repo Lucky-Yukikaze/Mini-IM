@@ -95,6 +95,23 @@ async page => {
     await status.getByText('邀请成员 · 未成功', { exact: true }).waitFor();
     check(await page.getByPlaceholder('成员 ID，逗号分隔', { exact: true }).inputValue() === '', 'saved rejected draft retained');
     if (data.image) await page.screenshot({ path: data.image });
+  } else if (data.phase === 'delivery-send') {
+    await page.getByPlaceholder('输入消息', { exact: true }).fill('Desktop delivery proof');
+    await button('发送').click();
+    const row = page.locator('.message-row').filter({ hasText: 'Desktop delivery proof' });
+    await row.getByText('等待送达', { exact: true }).waitFor();
+  } else if (data.phase === 'delivery-status') {
+    const row = page.locator('.message-row').filter({ hasText: 'Desktop delivery proof' });
+    await row.waitFor();
+    if (data.read) {
+      await row.getByText('1 人已送达', { exact: true }).waitFor({ state: 'hidden' });
+      await row.getByText('1 人未读', { exact: true }).waitFor({ state: 'hidden' });
+      await row.getByText('等待送达', { exact: true }).waitFor({ state: 'hidden' });
+    } else {
+      await row.getByText('1 人已送达', { exact: true }).waitFor();
+      await row.getByText('1 人未读', { exact: true }).waitFor();
+    }
+    if (data.image) await page.screenshot({ path: data.image });
   } else if (data.phase === 'recall') {
     await page.getByPlaceholder('输入消息', { exact: true }).fill('Desktop recall');
     await button('发送').click();

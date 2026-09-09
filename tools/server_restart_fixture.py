@@ -89,6 +89,12 @@ async def main(args):
             with gate.request("send_message", user_id, request_id, send_message):
                 return super().handle_send_message(user_id, request_id, send_message)
 
+    class Syncs(production.SyncService):
+        def handle_sync_applied(self, user_id, device_id, request_id, request):
+            operation = "sync_applied" if user_id == "bob" else "sender_sync_applied"
+            with gate.request(operation, user_id, request_id, request):
+                return super().handle_sync_applied(user_id, device_id, request_id, request)
+
     class Files(FileService):
         def handle_file_init(self, user_id, request_id, file_init):
             with gate.request("file_init", user_id, request_id, file_init):
@@ -162,6 +168,7 @@ async def main(args):
     with (patch.object(production, "MiniImSqliteDb", CrashDb),
           patch.object(production, "ControlWriteService", Controls),
           patch.object(production, "MessageService", Messages),
+          patch.object(production, "SyncService", Syncs),
           patch.object(production, "FileService", Files),
           patch.object(production, "FileRepo", FileStorage),
           patch.object(production, "MiniImQuicProtocol", Protocol),

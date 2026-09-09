@@ -1,6 +1,7 @@
 #include "core/model/eventmapper.h"
 
 #include "message.pb.h"
+#include "sync.pb.h"
 #include "conversation.pb.h"
 #include <QVariantList>
 
@@ -41,6 +42,19 @@ QVariantMap BuildConversationPayload(const im::conversation::ConversationUpdated
     payload.insert(QStringLiteral("ownerId"), QString::fromStdString(updated.owner_id()));
     payload.insert(QStringLiteral("memberIds"), member_ids);
     return payload;
+}
+
+QVariantMap BuildDeliveryPayload(const im::sync::DeliveryUpdated& updated)
+{
+    return {{"type", "delivery"}, {"eventId", QString::fromStdString(updated.event_id())},
+        {"conversationId", QString::fromStdString(updated.conversation_id())},
+        {"messageId", QString::fromStdString(updated.message_id())},
+        {"userId", QString::fromStdString(updated.user_id())}, {"status", QString::fromStdString(updated.status())},
+        {"sentAtMs", static_cast<qlonglong>(updated.sent_at_ms())},
+        {"deliveredAtMs", static_cast<qlonglong>(updated.delivered_at_ms())},
+        {"readAtMs", static_cast<qlonglong>(updated.read_at_ms())},
+        {"failedAtMs", static_cast<qlonglong>(updated.failed_at_ms())},
+        {"failureReason", QString::fromStdString(updated.failure_reason())}};
 }
 
 QVariantMap BuildReceiptPayload(const im::message::Receipt& receipt)

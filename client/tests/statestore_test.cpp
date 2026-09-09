@@ -420,6 +420,67 @@ void CheckFileCancellationRecovery()
         "legacy cancellation migration changed request on reopen");
 }
 
+
+void CheckDeliveryAndConfirmationPersistence()
+{
+    QTemporaryDir root;
+    MiniImStateStore store;
+    Open(store, root);
+    const MiniImStateEvent delivery{3, "delivery-event", "delivery", {{"type", "delivery"},
+        {"messageId", "first"}, {"conversationId", "conversation"}, {"userId", "bob"},
+        {"status", "delivered"}, {"deliveredAtMs", 50}, {"globalSeq", 3}}};
+    Apply(store, {delivery, Message(1, "first")});
+    Require(store.cursor() == 1 && store.hasGap(), "delivery must not skip history");
+    bool rejected = false;
+    try
+    {
+        store.saveConfirmation("ahead", 3);
+    }
+    catch (const std::exception&)
+    {
+        rejected = true;
+    }
+    Require(rejected && store.pendingConfirmation().isEmpty(), "cannot confirm uncommitted prefix");
+    store.saveConfirmation("original", 1);
+    Apply(store, {Receipt(2, "bob", 1)});
+    store.close();
+    Open(store, root);
+    Require(store.cursor() == 3 && !store.hasGap(), "complete durable prefix restored");
+    Require(store.pendingConfirmation().value("requestId") == "original", "pending confirmation identity survives restart");
+    Require(store.pendingConfirmation().value("cursor").toULongLong() == 1, "pending confirmation body does not grow");
+    Require(store.snapshot().value("deliveries").toList().size() == 1, "delivery restored before message and receipt");
+    Require(store.snapshot().value("unreadTotal").toInt() == 0, "receipt still projects read state");
+    Query(store.databasePath(), "CREATE TRIGGER reject_confirm BEFORE DELETE ON metadata "
+        "WHEN OLD.key='sync_confirmation' BEGIN SELECT RAISE(ABORT,'confirmation failure'); END");
+    rejected = false;
+    try
+    {
+        store.completeConfirmation("original");
+    }
+    catch (const std::exception&)
+    {
+        rejected = true;
+    }
+    Require(rejected && store.confirmedCursor() == 0, "confirmation completion rolls back as a whole");
+    Require(!store.pendingConfirmation().isEmpty(), "failed completion keeps original intent");
+    Query(store.databasePath(), "DROP TRIGGER reject_confirm");
+    store.completeConfirmation("unrelated");
+    Require(store.confirmedCursor() == 0, "unknown acknowledgment cannot advance position");
+    store.completeConfirmation("original");
+    store.completeConfirmation("original");
+    Require(store.confirmedCursor() == 1 && store.pendingConfirmation().isEmpty(), "acknowledgment settles once");
+    store.saveConfirmation("next", 3);
+    store.close();
+    Open(store, root, "alice");
+    Require(store.pendingConfirmation().isEmpty() && store.confirmedCursor() == 0, "confirmations isolate users");
+    Require(store.snapshot().value("deliveries").toList().isEmpty(), "deliveries isolate users");
+    store.close();
+    Open(store, root);
+    Require(store.pendingConfirmation().value("requestId") == "next", "returning account restores confirmation");
+    Apply(store, {delivery}, 0);
+    Require(store.snapshot().value("deliveries").toList().size() == 1, "replay cannot duplicate delivery");
+}
+
 void CheckMonotonicObjectVersions()
 {
     QTemporaryDir root;
@@ -445,6 +506,7 @@ int main(int argc, char* argv[])
     QCoreApplication app(argc, argv);
     try
     {
+        CheckDeliveryAndConfirmationPersistence();
         CheckGapsAndDuplicateReplay();
         CheckAtomicFailureAndRetry();
         CheckTerminalStatesSurviveReplay();

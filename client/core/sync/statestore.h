@@ -31,6 +31,10 @@ public:
     void close();
     bool apply(const QVector<MiniImStateEvent>& events, QVector<MiniImStateEvent>* applied);
     bool saveSession(const QString& session, const QString& ack);
+    QVariantMap pendingConfirmation() const;
+    quint64 confirmedCursor() const;
+    void saveConfirmation(const QString& requestId, quint64 cursor);
+    void completeConfirmation(const QString& requestId);
     QString sessionId() const;
     QString lastAck() const;
     quint64 cursor() const;

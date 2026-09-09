@@ -25,6 +25,7 @@ public:
     void start();
     void stop();
     bool isReady() const;
+    bool handleConfirmationResult(const QString& requestId, bool success, int code, const QString& entityId);
     bool handleEnvelope(const im::envelope::Envelope& envelope);
 
 signals:
@@ -40,6 +41,7 @@ signals:
 private:
     void requestNext();
     void retryRequest();
+    void pumpConfirmation();
     void clearRequest();
     bool apply(const QVector<MiniImStateEvent>& events);
     void handleResponse(const im::envelope::Envelope& envelope);
@@ -52,6 +54,10 @@ private:
     Sender m_sender;
     QTimer m_retryTimer;
     QElapsedTimer m_attemptTime;
+    QElapsedTimer m_confirmationAttempt;
+    QString m_confirmationId;
+    std::string m_confirmationPayload;
+    quint64 m_confirmationCursor = 0;
     QString m_requestId;
     std::string m_requestPayload;
     quint64 m_requestCursor = 0;

@@ -161,6 +161,15 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.02)
 
     async def check_sync(self):
+        def confirmations_settled():
+            for user in ("alice", "bob"):
+                cache = next((self.root / f"state-{user}").glob("*.sqlite"))
+                metadata = {row["key"]: row["value"] for row in self.rows("SELECT key,value FROM metadata", path=cache)}
+                maximum = self.scalar("SELECT COALESCE(MAX(seq),0) FROM sync_events WHERE user_id=?", (user,))
+                if int(metadata.get("sync_confirmed_cursor", 0)) != maximum or metadata.get("sync_confirmation"):
+                    return False
+            return True
+        await self.until(confirmations_settled, timeout=18)
         for user in ("alice", "bob"):
             expected = self.rows("SELECT seq,event_id FROM sync_events WHERE user_id=? ORDER BY seq", (user,))
             self.assertEqual(list(range(1, len(expected) + 1)), [row["seq"] for row in expected])
@@ -216,6 +225,39 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         self.workspace.cleanup()
         if errors:
             raise errors[0]
+
+
+    async def delivery_confirmation_crash(self, point):
+        await self.server.arm(point, "sync_applied")
+        await self.alice.command("message", conversation=self.conversation, intent="confirm-crash", text="delivery proof")
+        checkpoint = await self.kill_at_checkpoint()
+        message = self.rows("SELECT server_msg_id FROM messages WHERE client_msg_id='confirm-crash'")[0]["server_msg_id"]
+        committed = point == "before-ack"
+        before = self.rows("SELECT * FROM message_deliveries WHERE user_id='bob' AND server_msg_id=?", (message,))[0]
+        self.assertEqual("delivered" if committed else "sent", before["status"])
+        self.assertEqual(committed, before["delivered_at_ms"] is not None)
+        self.assertEqual(int(committed), self.scalar(
+            "SELECT COUNT(*) FROM control_write_results WHERE request_id=?", (checkpoint["requestId"],)))
+        self.assertEqual(2 if committed else 0, self.scalar(
+            "SELECT COUNT(*) FROM sync_events WHERE event_type='delivery_updated'"))
+        await self.start_server()
+        await self.alice.wait("update", lambda item: item["type"] == "delivery" and item["messageId"] == message,
+                              since=self.marks[0], timeout=18)
+        await self.check_new_sessions()
+        await self.check_sync()
+        self.assert_replayed("sync_applied", checkpoint["requestId"])
+        after = self.rows("SELECT * FROM message_deliveries WHERE user_id='bob' AND server_msg_id=?", (message,))[0]
+        self.assertEqual("delivered", after["status"])
+        if committed:
+            self.assertEqual(before, after)
+        self.assertEqual(2, self.scalar("SELECT COUNT(*) FROM sync_events WHERE event_type='delivery_updated'"))
+        self.assertIsNone(after["read_at_ms"])
+
+    async def test_delivery_confirmation_rolls_back_before_server_commit(self):
+        await self.delivery_confirmation_crash("before-commit")
+
+    async def test_delivery_confirmation_commit_survives_lost_ack(self):
+        await self.delivery_confirmation_crash("before-ack")
 
     async def test_message_commit_survives_crash_before_ack_and_push(self):
         await self.server.arm("before-ack", "send_message")
