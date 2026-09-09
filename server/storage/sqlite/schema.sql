@@ -94,6 +94,7 @@ CREATE TABLE IF NOT EXISTS message_deliveries (
   conversation_id TEXT NOT NULL,
   seq INTEGER NOT NULL,
   status TEXT NOT NULL,
+  sent_at_ms INTEGER NOT NULL DEFAULT 0,
   delivered_at_ms INTEGER,
   read_at_ms INTEGER,
   burn_started_at_ms INTEGER,
@@ -202,3 +203,12 @@ CREATE TABLE IF NOT EXISTS message_read_counters (
 
 CREATE INDEX IF NOT EXISTS idx_message_read_counters_conversation_seq
 ON message_read_counters(conversation_id, conversation_seq);
+
+CREATE TABLE IF NOT EXISTS sync_applied_cursors (
+  user_id TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  global_cursor INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (user_id, device_id),
+  FOREIGN KEY (user_id) REFERENCES users(user_id)
+);

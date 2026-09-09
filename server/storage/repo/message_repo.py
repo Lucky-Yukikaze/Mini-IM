@@ -150,7 +150,7 @@ class MessageRepo:
                     burn_at_ms = self._compute_burn_at_ms(burn_mode, burn_ttl_sec, now_ms)
                     burn_started_at_ms = now_ms if burn_at_ms is not None else None
                 else:
-                    status = "delivered"
+                    status = "sent"
                     read_at_ms = None
                     burn_started_at_ms = None
                     burn_at_ms = None
@@ -162,6 +162,7 @@ class MessageRepo:
                       conversation_id,
                       seq,
                       status,
+                      sent_at_ms,
                       delivered_at_ms,
                       read_at_ms,
                       burn_started_at_ms,
@@ -169,7 +170,7 @@ class MessageRepo:
                       burned_at_ms,
                       failed_at_ms,
                       failure_reason
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
                     """,
                     (
                         message_id,
@@ -178,6 +179,7 @@ class MessageRepo:
                         conversation_seq,
                         status,
                         now_ms,
+                        now_ms if member_id == sender_id else None,
                         read_at_ms,
                         burn_started_at_ms,
                         burn_at_ms,

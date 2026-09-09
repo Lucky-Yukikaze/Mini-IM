@@ -44,6 +44,26 @@ def _ensure_message_deliveries_burn_columns(db: MiniImSqliteDb) -> None:
     )
 
 
+def _ensure_delivery_confirmation_columns(db: MiniImSqliteDb) -> None:
+    rows = db.execute_fetchall("PRAGMA table_info(message_deliveries)")
+    if not rows or "sent_at_ms" in {str(row["name"]) for row in rows}:
+        return
+    # The old delivered timestamp was written at send time, even for offline users.
+    # Add the migration marker and repair its data in the same transaction.
+    with db.transaction() as connection:
+        connection.execute("ALTER TABLE message_deliveries ADD COLUMN sent_at_ms INTEGER NOT NULL DEFAULT 0")
+        connection.execute("""
+            UPDATE message_deliveries SET
+              sent_at_ms = COALESCE((SELECT created_at_ms FROM messages
+                                    WHERE server_msg_id = message_deliveries.server_msg_id), 0),
+              delivered_at_ms = CASE WHEN status IN ('read', 'delivered') THEN read_at_ms
+                                     ELSE delivered_at_ms END,
+              status = CASE WHEN status = 'delivered' THEN
+                              CASE WHEN read_at_ms IS NULL THEN 'sent' ELSE 'read' END
+                            ELSE status END
+        """)
+
+
 def _ensure_sync_event_columns(db: MiniImSqliteDb) -> None:
     rows = db.execute_fetchall("PRAGMA table_info(sync_events)")
     if rows and "entity_id" not in {str(row["name"]) for row in rows}:
@@ -59,6 +79,7 @@ def init_db(db_path: Path) -> None:
         _ensure_messages_burn_columns(db)
         _ensure_message_deliveries_burn_columns(db)
         _ensure_sync_event_columns(db)
+        _ensure_delivery_confirmation_columns(db)
         db.init_schema()
         with db.transaction() as connection:
             MigrateMessageEvents(connection)

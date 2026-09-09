@@ -16,7 +16,7 @@ from aioquic.asyncio import connect, QuicConnectionProtocol
 from aioquic.quic.events import StopSendingReceived
 from aioquic.quic.configuration import QuicConfiguration
 from protocol.codec import EnvelopeCodec
-from protocol.pb import auth_pb2, common_pb2, conversation_pb2, envelope_pb2, file_pb2
+from protocol.pb import auth_pb2, common_pb2, conversation_pb2, envelope_pb2, file_pb2, message_pb2, sync_pb2
 from quic.endpoint import serve_quic
 from quic.server import FaultConfig, MiniImQuicProtocol, OnlineSessionHub, ensure_dev_cert
 from services.auth.service import AuthService
@@ -138,7 +138,7 @@ class ControlWriteNetworkTest(unittest.IsolatedAsyncioTestCase):
         return await asyncio.wait_for(receive(), 3)
 
     @asynccontextmanager
-    async def peer(self, user="alice", device="first-device", with_protocol=False):
+    async def peer(self, user="alice", device="first-device", with_protocol=False, claimed_device=None):
         config = QuicConfiguration(is_client=True, alpn_protocols=["mini-im"])
         config.verify_mode = ssl.CERT_NONE
         async with connect("127.0.0.1", self.port, configuration=config, create_protocol=ObservedPeer) as protocol:
@@ -152,10 +152,101 @@ class ControlWriteNetworkTest(unittest.IsolatedAsyncioTestCase):
             def send(request_id, **body):
                 envelope = envelope_pb2.Envelope(
                     version=1, request_id=request_id, channel=common_pb2.CHANNEL_CONTROL,
-                    session_id=welcome.welcome.session_id, device_id=device, **body)
+                    session_id=welcome.welcome.session_id, device_id=claimed_device if claimed_device is not None else device, **body)
                 writer.write(EnvelopeCodec.encode_frame(envelope))
             yield (reader, send, protocol) if with_protocol else (reader, send)
             writer.close()
+
+
+    async def send_delivery_message(self):
+        async with self.peer() as (reader, send):
+            send("offline-message", send_message=message_pb2.SendMessage(
+                conversation_id=self.conversation, client_msg_id="offline-message",
+                type=common_pb2.MSG_TEXT, content=b"offline body"))
+            ack = (await self.read(reader, "offline-message", "ack")).ack
+            self.assertTrue(ack.success)
+        cursor = self.db.execute_fetchone(
+            "SELECT seq FROM sync_events WHERE user_id='bob' AND entity_id=?", (ack.entity_id,))[0]
+        return ack.entity_id, cursor
+
+    def delivery_row(self, message):
+        return dict(self.db.execute_fetchone(
+            "SELECT * FROM message_deliveries WHERE server_msg_id=? AND user_id='bob'", (message,)))
+
+    async def test_delivery_confirmation_uses_authenticated_device_and_preserves_first_delivery(self):
+        message, cursor = await self.send_delivery_message()
+        before = self.delivery_row(message)
+        self.assertEqual("sent", before["status"])
+        self.assertIsNone(before["delivered_at_ms"])
+        request = sync_pb2.SyncApplied(global_cursor=cursor)
+        async with self.peer(user="bob", device="actual-device", claimed_device="forged-device") as (reader, send):
+            send("fetch", sync_request=sync_pb2.SyncRequest(global_cursor=0, limit=200))
+            await self.read(reader, "fetch", "sync_response")
+            self.assertEqual(before, self.delivery_row(message))
+            send("received", sync_applied=request)
+            original = (await self.read(reader, "received", "ack")).ack
+            self.assertTrue(original.success)
+            observer = MiniImSqliteDb(self.root / "test.db")
+            try:
+                self.assertEqual("delivered", observer.execute_fetchone(
+                    "SELECT status FROM message_deliveries WHERE server_msg_id=? AND user_id='bob'", (message,))[0])
+                self.assertEqual("actual-device", observer.execute_fetchone(
+                    "SELECT device_id FROM sync_applied_cursors WHERE user_id='bob'")[0])
+                self.assertIsNotNone(observer.execute_fetchone(
+                    "SELECT ack FROM control_write_results WHERE request_id='received'"))
+            finally:
+                observer.close()
+            pushed = (await self.read(reader, body="sync_response")).sync_response.events[0]
+            self.assertEqual(message, pushed.delivery_updated.message_id)
+            self.assertEqual("bob", pushed.delivery_updated.user_id)
+            delivered = self.delivery_row(message)
+            send("received", sync_applied=request)
+            self.assertEqual(original, (await self.read(reader, "received", "ack")).ack)
+        async with self.peer(user="bob", device="second-device") as (reader, send):
+            send("second", sync_applied=request)
+            self.assertTrue((await self.read(reader, "second", "ack")).ack.success)
+        self.assertEqual(delivered, self.delivery_row(message))
+        self.assertEqual(2, self.db.execute_fetchone(
+            "SELECT COUNT(*) FROM sync_events WHERE event_type='delivery_updated'")[0])
+
+    async def test_delivery_confirmation_lost_ack_survives_server_reopen(self):
+        message, cursor = await self.send_delivery_message()
+        request = sync_pb2.SyncApplied(global_cursor=cursor)
+        self.drop_ack.add("received")
+        async with self.peer(user="bob") as (reader, send):
+            send("received", sync_applied=request)
+            await self.read(reader, body="sync_response")
+        self.assertNotIn("received", self.drop_ack)
+        delivered = self.delivery_row(message)
+        ack = bytes(self.db.execute_fetchone(
+            "SELECT ack FROM control_write_results WHERE request_id='received'")[0])
+        count = self.event_count()
+        self.server.close()
+        self.db.close()
+        await self.start_server()
+        async with self.peer(user="bob") as (reader, send):
+            send("received", sync_applied=request)
+            self.assertEqual(ack, (await self.read(reader, "received", "ack")).ack.SerializeToString())
+        self.assertEqual(count, self.event_count())
+        self.assertEqual(delivered, self.delivery_row(message))
+
+    async def test_delivery_confirmation_failure_rolls_back_and_retries_over_quic(self):
+        message, cursor = await self.send_delivery_message()
+        request = sync_pb2.SyncApplied(global_cursor=cursor)
+        before = self.delivery_row(message)
+        count = self.event_count()
+        self.db.execute_write("CREATE TRIGGER reject_confirmation BEFORE INSERT ON control_write_results "
+                              "BEGIN SELECT RAISE(ABORT,'injected confirmation failure'); END")
+        async with self.peer(user="bob") as (reader, send):
+            send("received", sync_applied=request)
+            self.assertEqual(503, (await self.read(reader, "received", "error")).error.code)
+            self.assertEqual(before, self.delivery_row(message))
+            self.assertEqual(count, self.event_count())
+            self.assertEqual(0, self.db.execute_fetchone("SELECT COUNT(*) FROM sync_applied_cursors")[0])
+            self.db.execute_write("DROP TRIGGER reject_confirmation")
+            send("received", sync_applied=request)
+            self.assertTrue((await self.read(reader, "received", "ack")).ack.success)
+        self.assertEqual("delivered", self.delivery_row(message)["status"])
 
     def title(self):
         return self.db.execute_fetchone(

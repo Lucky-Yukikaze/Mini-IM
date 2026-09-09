@@ -221,6 +221,8 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
             item = file_pb2.FileUpdated()
             item.ParseFromString(event.payload)
             sync_event.file_updated.CopyFrom(item)
+        elif event.event_type == "delivery_updated":
+            sync_event.delivery_updated.ParseFromString(event.payload)
         else:
             return
 
@@ -508,6 +510,20 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
                 )
                 if result.file_updated is not None:
                     self._send_file_updated(event.stream_id, envelope, result.file_updated, sender_event)
+                self.m_online_hub.fanout_sync_events(result.sync_events)
+                continue
+
+            if envelope.HasField("sync_applied"):
+                try:
+                    result = self.m_sync_service.handle_sync_applied(
+                        session.user_id, session.device_id, envelope.request_id, envelope.sync_applied)
+                except sqlite3.Error as error:
+                    self._debug(f"delivery confirmation transaction failed: {error}")
+                    self._send_error(event.stream_id, envelope, 503, "delivery confirmation could not be committed")
+                    continue
+                response = self._new_response_from_request(envelope)
+                response.ack.CopyFrom(result.ack)
+                self._send(event.stream_id, response)
                 self.m_online_hub.fanout_sync_events(result.sync_events)
                 continue
 

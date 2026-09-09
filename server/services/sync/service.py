@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+
+from storage.repo.control_write_repo import ControlWriteRepo, ControlWriteResult
 from protocol.pb import conversation_pb2, file_pb2, message_pb2, sync_pb2
 from storage.repo import SyncRepo
 
@@ -7,6 +10,15 @@ from storage.repo import SyncRepo
 class SyncService:
     def __init__(self, sync_repo: SyncRepo) -> None:
         self.m_sync_repo = sync_repo
+        self.m_requests = ControlWriteRepo(sync_repo.m_db)
+
+    def handle_sync_applied(self, user_id: str, device_id: str, request_id: str,
+                            request: sync_pb2.SyncApplied) -> ControlWriteResult:
+        # Bind the fingerprint to the authenticated device, not the envelope's claimed device.
+        fingerprint = json.dumps([device_id, request.SerializeToString(deterministic=True).hex()],
+                                 separators=(",", ":")).encode("utf-8")
+        return self.m_requests.execute(user_id, request_id, "sync_applied", fingerprint,
+            lambda: self.m_sync_repo.confirm_applied(user_id, device_id, request_id, int(request.global_cursor)))
 
     def handle_sync_request(self, user_id: str, request: sync_pb2.SyncRequest) -> tuple[sync_pb2.SyncResponse, int]:
         limit = int(request.limit) if request.limit > 0 else 50
@@ -51,6 +63,8 @@ class SyncService:
                 updated = file_pb2.FileUpdated()
                 updated.ParseFromString(row.payload)
                 event.file_updated.CopyFrom(updated)
+            elif row.event_type == "delivery_updated":
+                event.delivery_updated.ParseFromString(row.payload)
             else:
                 continue
 

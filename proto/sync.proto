@@ -13,6 +13,24 @@ message SyncRequest {
   uint64 conversation_cursor = 4;
 }
 
+// A device confirms only the continuous prefix committed to its local cache.
+message SyncApplied {
+  uint64 global_cursor = 1;
+}
+
+message DeliveryUpdated {
+  string event_id = 1;
+  string conversation_id = 2;
+  string message_id = 3;
+  string user_id = 4;
+  string status = 5;
+  int64 sent_at_ms = 6;
+  int64 delivered_at_ms = 7;
+  int64 read_at_ms = 8;
+  int64 failed_at_ms = 9;
+  string failure_reason = 10;
+}
+
 message SyncEvent {
   string event_id = 1;
   uint64 global_seq = 2;
@@ -22,6 +40,7 @@ message SyncEvent {
     im.message.Receipt receipt = 12;
     im.conversation.ConversationUpdated conversation_updated = 13;
     im.file.FileUpdated file_updated = 14;
+    DeliveryUpdated delivery_updated = 15;
   }
 }
 

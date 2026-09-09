@@ -82,10 +82,11 @@ class DeliveryRepo:
             connection.execute(
                 """
                 UPDATE message_deliveries
-                SET status = 'read', read_at_ms = COALESCE(read_at_ms, ?)
+                SET status = 'read', read_at_ms = COALESCE(read_at_ms, ?),
+                    delivered_at_ms = COALESCE(delivered_at_ms, ?)
                 WHERE user_id = ? AND conversation_id = ? AND seq > ? AND seq <= ?
                 """,
-                (now_ms, user_id, conversation_id, old_last_read_seq, new_last_read_seq),
+                (now_ms, now_ms, user_id, conversation_id, old_last_read_seq, new_last_read_seq),
             )
             if self.m_burn_enabled:
                 connection.execute(

@@ -71,6 +71,11 @@ Web 按 web/src/api、store、components、views、events、types 分职责。
 - 控制写入的请求结果与业务变化、同步事件共同提交；同一用户复用请求 ID 时核对操作和内容，
   重放返回原结果，不重复执行已处理操作；认证会话标识不参与持久去重键。
 - 收到重复 ACK、断连和进程重启时，待确认写入仍须可恢复并使用原意图重试。
+- SyncApplied = 设备声明已完整保存到本地的连续同步事件位置；只能在本地事务提交后发送，
+  不能用在线事件最大位置或发起补拉替代。确认按已认证用户和设备保存，位置只推进。
+- 收件确认引起的送达状态、设备确认位置、DeliveryUpdated 同步事件及请求结果共同提交。
+  同一用户另一设备的重复确认不改写首次送达时间；已读和确定失败不得被迟到收件确认降级。
+  送达不推进已读、不启动接收者焚毁计时；跨重启重试继续原确认意图。
 
 四条底线：传输层负责到达，应用层负责语义，每个写操作可重试，每个状态可恢复。
 
@@ -94,13 +99,13 @@ Web 按 web/src/api、store、components、views、events、types 分职责。
 
 核心表按实现演进：users、devices、sessions、conversations、conversation_create_requests、
 control_write_results、conversation_members、messages、message_deliveries、message_read_counters、attachments、
-file_transfers、file_cancellations、sync_events、sync_cursors。
+file_transfers、file_cancellations、sync_events、sync_cursors、sync_applied_cursors。
 
 ## 已读、撤回与焚毁
 
 - conversation_members.last_read_seq 是已读真值，只能推进。
 - message_read_counters 是可重算的展示缓存；按消息发送时的成员数计算，排除发送者本人。
-- 同步统一使用 SyncEvent，承载消息、撤回、已读、会话更新和文件状态，禁止拆成互不关联的恢复接口。
+- 同步统一使用 SyncEvent，承载消息、投递、撤回、已读、会话更新和文件状态，禁止拆成互不关联的恢复接口。
 - 旧消息重放不得覆盖已生效的撤回或焚毁状态；先收到状态变化时，消息后到也必须正确合并。
 - 用户切换必须隔离会话、消息、已读、文件任务、待处理事件和恢复位置。
 - 阅后即焚按用户投递记录计时；发送者入库即视为已读，接收者首次已读后开始计时。

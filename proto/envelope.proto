@@ -45,6 +45,7 @@ message Envelope {
 
     im.sync.SyncRequest sync_request = 50;
     im.sync.SyncResponse sync_response = 51;
+    im.sync.SyncApplied sync_applied = 52;
 
     im.common.Error error = 99;
   }

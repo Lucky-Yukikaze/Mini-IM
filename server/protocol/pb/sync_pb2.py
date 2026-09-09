@@ -27,7 +27,7 @@ from . import file_pb2 as file__pb2
 from . import message_pb2 as message__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\nsync.proto\x12\x07im.sync\x1a\x12\x63onversation.proto\x1a\nfile.proto\x1a\rmessage.proto\"i\n\x0bSyncRequest\x12\x15\n\rglobal_cursor\x18\x01 \x01(\x04\x12\r\n\x05limit\x18\x02 \x01(\r\x12\x17\n\x0f\x63onversation_id\x18\x03 \x01(\t\x12\x1b\n\x13\x63onversation_cursor\x18\x04 \x01(\x04\"\xa3\x02\n\tSyncEvent\x12\x10\n\x08\x65vent_id\x18\x01 \x01(\t\x12\x12\n\nglobal_seq\x18\x02 \x01(\x04\x12&\n\x07message\x18\n \x01(\x0b\x32\x13.im.message.MessageH\x00\x12$\n\x06recall\x18\x0b \x01(\x0b\x32\x12.im.message.RecallH\x00\x12&\n\x07receipt\x18\x0c \x01(\x0b\x32\x13.im.message.ReceiptH\x00\x12\x44\n\x14\x63onversation_updated\x18\r \x01(\x0b\x32$.im.conversation.ConversationUpdatedH\x00\x12,\n\x0c\x66ile_updated\x18\x0e \x01(\x0b\x32\x14.im.file.FileUpdatedH\x00\x42\x06\n\x04\x62ody\"_\n\x0cSyncResponse\x12\x19\n\x11new_global_cursor\x18\x01 \x01(\x04\x12\"\n\x06\x65vents\x18\x02 \x03(\x0b\x32\x12.im.sync.SyncEvent\x12\x10\n\x08has_more\x18\x03 \x01(\x08\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\nsync.proto\x12\x07im.sync\x1a\x12\x63onversation.proto\x1a\nfile.proto\x1a\rmessage.proto\"i\n\x0bSyncRequest\x12\x15\n\rglobal_cursor\x18\x01 \x01(\x04\x12\r\n\x05limit\x18\x02 \x01(\r\x12\x17\n\x0f\x63onversation_id\x18\x03 \x01(\t\x12\x1b\n\x13\x63onversation_cursor\x18\x04 \x01(\x04\"$\n\x0bSyncApplied\x12\x15\n\rglobal_cursor\x18\x01 \x01(\x04\"\xe0\x01\n\x0f\x44\x65liveryUpdated\x12\x10\n\x08\x65vent_id\x18\x01 \x01(\t\x12\x17\n\x0f\x63onversation_id\x18\x02 \x01(\t\x12\x12\n\nmessage_id\x18\x03 \x01(\t\x12\x0f\n\x07user_id\x18\x04 \x01(\t\x12\x0e\n\x06status\x18\x05 \x01(\t\x12\x12\n\nsent_at_ms\x18\x06 \x01(\x03\x12\x17\n\x0f\x64\x65livered_at_ms\x18\x07 \x01(\x03\x12\x12\n\nread_at_ms\x18\x08 \x01(\x03\x12\x14\n\x0c\x66\x61iled_at_ms\x18\t \x01(\x03\x12\x16\n\x0e\x66\x61ilure_reason\x18\n \x01(\t\"\xd9\x02\n\tSyncEvent\x12\x10\n\x08\x65vent_id\x18\x01 \x01(\t\x12\x12\n\nglobal_seq\x18\x02 \x01(\x04\x12&\n\x07message\x18\n \x01(\x0b\x32\x13.im.message.MessageH\x00\x12$\n\x06recall\x18\x0b \x01(\x0b\x32\x12.im.message.RecallH\x00\x12&\n\x07receipt\x18\x0c \x01(\x0b\x32\x13.im.message.ReceiptH\x00\x12\x44\n\x14\x63onversation_updated\x18\r \x01(\x0b\x32$.im.conversation.ConversationUpdatedH\x00\x12,\n\x0c\x66ile_updated\x18\x0e \x01(\x0b\x32\x14.im.file.FileUpdatedH\x00\x12\x34\n\x10\x64\x65livery_updated\x18\x0f \x01(\x0b\x32\x18.im.sync.DeliveryUpdatedH\x00\x42\x06\n\x04\x62ody\"_\n\x0cSyncResponse\x12\x19\n\x11new_global_cursor\x18\x01 \x01(\x04\x12\"\n\x06\x65vents\x18\x02 \x03(\x0b\x32\x12.im.sync.SyncEvent\x12\x10\n\x08has_more\x18\x03 \x01(\x08\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -36,8 +36,12 @@ if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
   _globals['_SYNCREQUEST']._serialized_start=70
   _globals['_SYNCREQUEST']._serialized_end=175
-  _globals['_SYNCEVENT']._serialized_start=178
-  _globals['_SYNCEVENT']._serialized_end=469
-  _globals['_SYNCRESPONSE']._serialized_start=471
-  _globals['_SYNCRESPONSE']._serialized_end=566
+  _globals['_SYNCAPPLIED']._serialized_start=177
+  _globals['_SYNCAPPLIED']._serialized_end=213
+  _globals['_DELIVERYUPDATED']._serialized_start=216
+  _globals['_DELIVERYUPDATED']._serialized_end=440
+  _globals['_SYNCEVENT']._serialized_start=443
+  _globals['_SYNCEVENT']._serialized_end=788
+  _globals['_SYNCRESPONSE']._serialized_start=790
+  _globals['_SYNCRESPONSE']._serialized_end=885
 # @@protoc_insertion_point(module_scope)
