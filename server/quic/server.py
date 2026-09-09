@@ -590,8 +590,8 @@ def _env_bool(name: str, default: bool) -> bool:
     return normalized in {"1", "true", "yes", "on"}
 
 
-async def run_server() -> None:
-    base_path = Path(__file__).resolve().parents[1]
+async def run_server(*, data_root: Path | None = None, port: int = 4433) -> None:
+    base_path = data_root if data_root is not None else Path(__file__).resolve().parents[1]
     cert_path = base_path / "quic" / "dev_cert.pem"
     key_path = base_path / "quic" / "dev_key.pem"
     db_path = base_path / "storage" / "sqlite" / "miniim.db"
@@ -604,6 +604,8 @@ async def run_server() -> None:
     burn_sweep_batch_size = int(os.getenv("MINIIM_BURN_SWEEP_BATCH_SIZE", "200"))
     burn_purge_batch_size = int(os.getenv("MINIIM_BURN_PURGE_BATCH_SIZE", "200"))
 
+    cert_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
     ensure_dev_cert(cert_path, key_path)
 
     init_db(db_path)
@@ -639,7 +641,7 @@ async def run_server() -> None:
 
     server = await serve_quic(
         host="127.0.0.1",
-        port=4433,
+        port=port,
         configuration=configuration,
         create_protocol=lambda *args, **kwargs: MiniImQuicProtocol(
             *args,
@@ -667,7 +669,8 @@ async def run_server() -> None:
             )
         )
 
-    print("mini-im quic server listening at 127.0.0.1:4433")
+    bound_port = server._transport.get_extra_info("sockname")[1]
+    print(f"mini-im quic server listening at 127.0.0.1:{bound_port}")
     try:
         await asyncio.Future()
     finally:
