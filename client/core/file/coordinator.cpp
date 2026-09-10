@@ -437,7 +437,8 @@ void MiniImFileCoordinator::handleFileResult(
     }
     else if (code != 401 && code != 408 && code != 429 && code < 500)
     {
-        m_tasks.update(id, {{"status", "failed"}, {"error", error}});
+        m_tasks.update(id, {{"status", "failed"}, {"error", error},
+            {"finishRejected", requestId == task.value("finishRequestId").toString()}});
         m_activeFileTasks.remove(id);
         m_fileControlAttempts.remove(requestId);
     }
@@ -453,7 +454,13 @@ bool MiniImFileCoordinator::retryFile(const QString& clientFileId)
         {
             return false;
         }
-        m_tasks.update(clientFileId, {{"status", "pending"}, {"error", ""}});
+        QVariantMap changes{{"status", "pending"}, {"error", ""}};
+        if (task.value("finishRejected").toBool())
+        {
+            changes.insert("finishRequestId", m_requestIdFactory(QStringLiteral("filefinish")));
+            changes.insert("finishRejected", false);
+        }
+        m_tasks.update(clientFileId, changes);
         publishFileTasks();
         // Releasing the old stream prevents duplicate writes when retrying the same intent.
         emit restartRequested(QStringLiteral("resuming file task"));

@@ -53,9 +53,9 @@ class FileStorageRecoveryTest(unittest.TestCase):
         self.assertEqual(self.file_id, result.ack.entity_id)
         return result
 
-    def complete(self, offset):
+    def complete(self, offset, request_id="finish"):
         self.files.append_file_chunk("alice", self.file_id, self.payload[offset:])
-        result = self.files.handle_file_finish("alice", "finish",
+        result = self.files.handle_file_finish("alice", request_id,
             file_pb2.FileFinish(file_id=self.file_id, success=True))
         self.assertTrue(result.ack.success, result.ack.message)
         self.assertTrue(result.file_updated.completed)
@@ -141,7 +141,7 @@ class FileStorageRecoveryTest(unittest.TestCase):
         self.assertEqual(0, self.repo.get_transfer_by_file_id(self.file_id).received_bytes)
         self.assertEqual((None, []), self.files.append_file_chunk("alice", self.file_id, b"late bytes"))
         self.assertEqual(0, self.resume().file_updated.transferred_bytes)
-        self.complete(0)
+        self.complete(0, "finish-repaired")
         finished = self.repo.get_transfer_by_file_id(self.file_id)
         self.path.write_bytes(b"externally changed completed file")
         self.assertTrue(self.resume().file_updated.completed)

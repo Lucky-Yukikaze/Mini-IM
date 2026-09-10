@@ -234,6 +234,24 @@ class FileService:
         request_id: str,
         file_finish: file_pb2.FileFinish,
     ) -> FileServiceResult:
+        identity = file_pb2.FileFinish(file_id=file_finish.file_id, success=file_finish.success,
+            transferred_bytes=file_finish.transferred_bytes, sha256=file_finish.sha256.lower())
+        applied = None
+
+        def apply():
+            nonlocal applied
+            applied = self._apply_file_finish(user_id, request_id, file_finish)
+            return ControlWriteResult(applied.ack, applied.sync_events)
+
+        result = self.m_cancel_requests.execute(user_id, request_id, "file_finish",
+            identity.SerializeToString(deterministic=True), apply)
+        if applied is not None:
+            return FileServiceResult(result.ack, applied.file_updated, result.sync_events)
+        transfer = self.m_file_repo.get_transfer_by_file_id(result.ack.entity_id) if result.ack.success else None
+        updated = self._file_updated(transfer, [], user_id) if transfer and transfer.owner_id == user_id else None
+        return FileServiceResult(result.ack, updated, result.sync_events)
+
+    def _apply_file_finish(self, user_id: str, request_id: str, file_finish: file_pb2.FileFinish) -> FileServiceResult:
         now_ms = self._now_ms()
         ack = message_pb2.Ack(
             request_id=request_id,

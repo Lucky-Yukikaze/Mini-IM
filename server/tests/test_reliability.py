@@ -229,6 +229,58 @@ class ReliabilityTest(unittest.TestCase):
         )["n"]
         self.assertEqual(1, count)
 
+    def test_finish_result_replays_exactly_and_rejects_other_intents(self):
+        file_id = self._upload().ack.entity_id
+        request = file_pb2.FileFinish(file_id=file_id, success=True)
+        first = self.m_files.handle_file_finish("u-alice", "finish-bound", request)
+        self.assertTrue(first.ack.success)
+        before = self.m_db.execute_fetchone("SELECT COUNT(*) FROM sync_events")[0]
+        self.m_db.close()
+        self.m_db = MiniImSqliteDb(self.m_db_path)
+        self._build_services()
+        replay = self.m_files.handle_file_finish("u-alice", "finish-bound", request)
+        self.assertEqual(first.ack.SerializeToString(), replay.ack.SerializeToString())
+        self.assertEqual([], replay.sync_events)
+        for changed in (file_pb2.FileFinish(file_id="different", success=True),
+                        file_pb2.FileFinish(file_id=file_id, success=False)):
+            self.assertEqual(409, self.m_files.handle_file_finish("u-alice", "finish-bound", changed).ack.code)
+        message = message_pb2.SendMessage(conversation_id=self.m_conversation_id, client_msg_id="stolen",
+                                         type=common_pb2.MSG_TEXT, content=b"different write")
+        self.assertEqual(409, self.m_messages.handle_send_message("u-alice", "finish-bound", message).ack.code)
+        self.assertEqual(before, self.m_db.execute_fetchone("SELECT COUNT(*) FROM sync_events")[0])
+        self.assertEqual(1, self.m_db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+
+    def test_finish_integrity_failure_is_stable_and_new_attempt_recovers(self):
+        file_id = self._upload().ack.entity_id
+        path = self.m_files.get_storage_path(file_id)
+        path.write_bytes(b"x" * 17)
+        request = file_pb2.FileFinish(file_id=file_id, success=True)
+        first = self.m_files.handle_file_finish("u-alice", "finish-damaged", request)
+        self.assertEqual(409, first.ack.code)
+        before = self.m_db.execute_fetchone("SELECT COUNT(*) FROM sync_events")[0]
+        replay = self.m_files.handle_file_finish("u-alice", "finish-damaged", request)
+        self.assertEqual(first.ack.SerializeToString(), replay.ack.SerializeToString())
+        self.assertEqual([], replay.sync_events)
+        self.assertEqual(before, self.m_db.execute_fetchone("SELECT COUNT(*) FROM sync_events")[0])
+        self._upload()
+        self.assertEqual(409, self.m_files.handle_file_finish("u-alice", "finish-damaged", request).ack.code)
+        self.assertTrue(self.m_files.handle_file_finish("u-alice", "finish-repaired", request).ack.success)
+        self.assertEqual(1, self.m_db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+
+    def test_finish_result_insert_failure_rolls_back_all_effects(self):
+        file_id = self._upload().ack.entity_id
+        before = self.m_db.execute_fetchone("SELECT COUNT(*) FROM sync_events")[0]
+        self.m_db.execute_write("CREATE TRIGGER reject_finish_result BEFORE INSERT ON control_write_results "
+            "WHEN NEW.operation='file_finish' BEGIN SELECT RAISE(ABORT,'finish result unavailable'); END")
+        request = file_pb2.FileFinish(file_id=file_id, success=True)
+        with self.assertRaisesRegex(Exception, "finish result unavailable"):
+            self.m_files.handle_file_finish("u-alice", "finish-result", request)
+        self.assertEqual("uploaded", self.m_file_repo.get_transfer_by_file_id(file_id).status)
+        self.assertEqual(0, self.m_db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+        self.assertEqual(before, self.m_db.execute_fetchone("SELECT COUNT(*) FROM sync_events")[0])
+        self.m_db.execute_write("DROP TRIGGER reject_finish_result")
+        self.assertTrue(self.m_files.handle_file_finish("u-alice", "finish-result", request).ack.success)
+
     def test_retry_repairs_preexisting_completed_file_without_message(self):
         uploaded = self._upload()
         file_id = uploaded.ack.entity_id
@@ -342,6 +394,33 @@ class ReliabilityTest(unittest.TestCase):
             self.assertTrue(result.file_updated.completed)
         self.assertEqual(1, self.m_db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
 
+    def test_download_finish_binds_verification_and_failed_attempt_does_not_repeat(self):
+        source = self._upload().ack.entity_id
+        self.m_files.handle_file_finish("u-alice", "publish", file_pb2.FileFinish(file_id=source, success=True))
+        download = self.m_files.handle_file_init("u-bob", "download",
+            file_pb2.FileInit(client_file_id="download", source_file_id=source,
+                             direction=common_pb2.FILE_DIRECTION_DOWNLOAD))
+        transfer = self.m_file_repo.get_transfer_by_file_id(download.ack.entity_id)
+        request = file_pb2.FileFinish(file_id=transfer.file_id, success=False)
+        first = self.m_files.handle_file_finish("u-bob", "failed-download", request)
+        self.assertTrue(first.ack.success)
+        request.success = True
+        request.transferred_bytes = transfer.file_size
+        request.sha256 = transfer.sha256
+        self.assertEqual(409, self.m_files.handle_file_finish("u-bob", "failed-download", request).ack.code)
+        completed = self.m_files.handle_file_finish("u-bob", "verified-download", request)
+        self.assertTrue(completed.ack.success)
+        request.sha256 = request.sha256.upper()
+        self.assertEqual(completed.ack.SerializeToString(), self.m_files.handle_file_finish(
+            "u-bob", "verified-download", request).ack.SerializeToString())
+        request.transferred_bytes -= 1
+        self.assertEqual(409, self.m_files.handle_file_finish("u-bob", "verified-download", request).ack.code)
+        failure_replay = self.m_files.handle_file_finish("u-bob", "failed-download",
+            file_pb2.FileFinish(file_id=transfer.file_id, success=False))
+        self.assertEqual(first.ack.SerializeToString(), failure_replay.ack.SerializeToString())
+        self.assertTrue(failure_replay.file_updated.completed)
+        self.assertEqual([], failure_replay.sync_events)
+
     def test_file_intent_rejects_changed_metadata_and_other_conversation(self):
         uploaded = self._upload()
         original = self.m_files.get_transfer_by_file_id(uploaded.ack.entity_id)
@@ -374,7 +453,7 @@ class ReliabilityTest(unittest.TestCase):
         count = self.m_db.execute_fetchone("SELECT COUNT(*) FROM sync_events")[0]
         for success in (True, False, True):
             result = self.m_files.handle_file_finish(
-                "u-alice", "finish-retry", file_pb2.FileFinish(file_id=file_id, success=success),
+                "u-alice", "finish-retry-" + str(success), file_pb2.FileFinish(file_id=file_id, success=success),
             )
             self.assertTrue(result.ack.success)
             self.assertEqual("completed", result.file_updated.status)

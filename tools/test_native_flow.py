@@ -1623,8 +1623,21 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
             and "sha256 mismatch" in task["error"] for task in item["items"]))
         self.assertEqual("failed_integrity", self.files.get_transfer_by_file_id(row["file_id"]).status)
         self.assertEqual(0, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+        failed_request = self.db.execute_fetchone(
+            "SELECT request_id,ack FROM control_write_results WHERE operation='file_finish' AND user_id='alice'")
+        self.assertIsNotNone(failed_request)
+        await self.alice.crash()
+        initial = await self.restart_alice()
+        self.assertTrue(initial["fileTasks"][0]["finishRejected"])
+        self.assertEqual(failed_request["request_id"], initial["fileTasks"][0]["finishRequestId"])
         mark = await self.alice.command("retry-file", intent=row["client_file_id"])
         await self.alice.wait("file-tasks", lambda item: not item["items"], since=mark)
+        results = self.db.execute_fetchall(
+            "SELECT request_id,ack FROM control_write_results WHERE operation='file_finish' AND user_id='alice'")
+        self.assertEqual(2, len(results))
+        self.assertEqual({0, 409}, {message_pb2.Ack.FromString(item["ack"]).code for item in results})
+        self.assertEqual(failed_request["ack"], next(item["ack"] for item in results
+            if item["request_id"] == failed_request["request_id"]))
         recovered, attempts = self.assert_single_file_intent("alice", 1)
         self.assertEqual(0, attempts[-1]["acceptedOffset"])
         self.assertEqual(payload, stored.read_bytes())

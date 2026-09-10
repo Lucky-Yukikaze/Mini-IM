@@ -503,6 +503,53 @@ class ControlWriteNetworkTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(5, (await self.read(reader, "repair", "file_updated")).file_updated.transferred_bytes)
             self.assertEqual(payload[:5], path.read_bytes())
 
+    async def test_finish_result_survives_reopen_and_blocks_cross_operation_reuse(self):
+        payload, request = self.upload_request()
+        initialized = self.files.handle_file_init("alice", "setup-upload", request)
+        file_id = initialized.ack.entity_id
+        self.files.append_file_chunk("alice", file_id, payload)
+        finish = file_pb2.FileFinish(file_id=file_id, success=True)
+        async with self.peer() as (reader, send):
+            send("finish-bound", file_finish=finish)
+            first = (await self.read(reader, "finish-bound", "ack")).ack.SerializeToString()
+        before = self.event_count()
+        self.server.close()
+        await asyncio.sleep(0.05)
+        self.db.close()
+        await self.start_server()
+        async with self.peer(device="second-device") as (reader, send):
+            send("finish-bound", file_finish=finish)
+            self.assertEqual(first, (await self.read(reader, "finish-bound", "ack")).ack.SerializeToString())
+            send("finish-bound", send_message=message_pb2.SendMessage(conversation_id=self.conversation,
+                client_msg_id="stolen-finish", type=common_pb2.MSG_TEXT, content=b"different"))
+            self.assertEqual(409, (await self.read(reader, "finish-bound", "ack")).ack.code)
+            send("finish-bound", file_init=request)
+            self.assertEqual(409, (await self.read(reader, "finish-bound", "ack")).ack.code)
+            send("setup-upload", file_finish=finish)
+            self.assertEqual(409, (await self.read(reader, "setup-upload", "ack")).ack.code)
+        self.assertEqual(before, self.event_count())
+        self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+        self.assertEqual(payload, self.files.get_storage_path(file_id).read_bytes())
+
+    async def test_finish_result_insert_fault_returns_retryable_error_without_publication(self):
+        payload, request = self.upload_request()
+        file_id = self.files.handle_file_init("alice", "setup-upload", request).ack.entity_id
+        self.files.append_file_chunk("alice", file_id, payload)
+        before = self.event_count()
+        self.db.execute_write("CREATE TRIGGER reject_finish_result BEFORE INSERT ON control_write_results "
+            "WHEN NEW.operation='file_finish' BEGIN SELECT RAISE(ABORT,'injected finish result failure'); END")
+        finish = file_pb2.FileFinish(file_id=file_id, success=True)
+        async with self.peer() as (reader, send):
+            send("finish-result", file_finish=finish)
+            self.assertEqual(503, (await self.read(reader, "finish-result")).error.code)
+            self.assertEqual("uploaded", self.files.get_transfer_by_file_id(file_id).status)
+            self.assertEqual(0, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+            self.assertEqual(before, self.event_count())
+            self.db.execute_write("DROP TRIGGER reject_finish_result")
+            send("finish-result", file_finish=finish)
+            self.assertTrue((await self.read(reader, "finish-result", "ack")).ack.success)
+        self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM control_write_results WHERE operation='file_finish'")[0])
+
     async def test_file_finish_failure_rolls_back_completion_and_message_before_retry(self):
         payload, request = self.upload_request()
         initialized = self.files.handle_file_init("alice", "setup-upload", request)

@@ -157,10 +157,17 @@ void MiniImFileTaskStore::update(const QString& id, const QVariantMap& changes)
         return;
     }
     const bool metadataWasReady = value.value("metadataReady").toBool();
-    const QStringList immutable{"clientFileId", "requestId", "finishRequestId", "conversationId",
+    const QVariant originalFinishRejected = value.value("finishRejected");
+    const QStringList immutable{"clientFileId", "requestId", "conversationId",
         "path", "direction", "sourceFileId", "priority"};
     for (auto it = changes.begin(); it != changes.end(); ++it)
     {
+        if (it.key() == "finishRequestId" && value.value(it.key()) != it.value()
+            && (previousStatus != "failed" || nextStatus != "pending"
+                || !originalFinishRejected.toBool() || it.value().toString().isEmpty()))
+        {
+            throw std::runtime_error("pending file completion identity cannot change");
+        }
         if (it.key() == "cancelRequestId" && !value.value(it.key()).toString().isEmpty()
             && previousStatus != "cancel_failed" && value.value(it.key()) != it.value())
         {
@@ -178,7 +185,7 @@ void MiniImFileTaskStore::update(const QString& id, const QVariantMap& changes)
         }
         value.insert(it.key(), it.value());
     }
-    run(QStringLiteral("UPDATE file_tasks SET file_id=?,status=?,data=?,cancel_request=? WHERE id=?"),
+    run(QStringLiteral("UPDATE file_tasks SET file_id=?,status=?,data=?,cancel_request=?,finish_request=? WHERE id=?"),
         {value.value("fileId", QStringLiteral("")), value.value("status"), Encode(value),
-         value.value("cancelRequestId", QStringLiteral("")), id});
+         value.value("cancelRequestId", QStringLiteral("")), value.value("finishRequestId"), id});
 }

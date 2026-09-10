@@ -399,6 +399,22 @@ void CheckDurableFileTasks()
     store.close();
     Open(store, root);
     Require(store.fileTasks().byRequest("finish-request").value("status") == "finishing", "finish intent not recovered");
+    rejected = false;
+    try { store.fileTasks().update("intent", {{"finishRequestId", "changed"}}); }
+    catch (const std::exception&) { rejected = true; }
+    Require(rejected, "unconfirmed completion request was replaced");
+    store.fileTasks().update("intent", {{"status", "failed"}, {"finishRejected", true}});
+    Query(store.databasePath(), "CREATE TRIGGER reject_retry BEFORE UPDATE ON file_tasks BEGIN SELECT RAISE(ABORT,'injected'); END");
+    rejected = false;
+    try { store.fileTasks().update("intent", {{"status", "pending"}, {"finishRequestId", "new-finish"}, {"finishRejected", false}}); }
+    catch (const std::exception&) { rejected = true; }
+    Require(rejected && store.fileTasks().byRequest("new-finish").isEmpty(), "failed retry saved a partial identity");
+    Query(store.databasePath(), "DROP TRIGGER reject_retry");
+    store.fileTasks().update("intent", {{"status", "pending"}, {"finishRequestId", "new-finish"}, {"finishRejected", false}});
+    store.close();
+    Open(store, root);
+    Require(store.fileTasks().byRequest("finish-request").isEmpty(), "old completion response still maps to new attempt");
+    Require(store.fileTasks().byRequest("new-finish").value("clientFileId") == "intent", "new completion identity was not restored");
     store.fileTasks().update("intent", {{"status", "completed"}});
     store.fileTasks().update("intent", {{"status", "failed"}});
     Require(store.fileTasks().pending().isEmpty(), "late failure regressed completed file");

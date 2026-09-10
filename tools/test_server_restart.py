@@ -13,6 +13,8 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import ssl
+import struct
 import subprocess
 import sys
 import tempfile
@@ -20,7 +22,10 @@ import time
 import unittest
 
 from test_native_flow import NativeClient
-from protocol.pb import file_pb2, message_pb2
+from aioquic.asyncio import connect
+from aioquic.quic.configuration import QuicConfiguration
+from protocol.codec import EnvelopeCodec
+from protocol.pb import common_pb2, envelope_pb2, file_pb2, message_pb2
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -401,6 +406,7 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         checkpoint = await self.kill_at_checkpoint()
         self.assertEqual("uploaded", self.scalar("SELECT status FROM file_transfers"))
         self.assertEqual(0, self.scalar("SELECT COUNT(*) FROM messages"))
+        self.assertEqual(0, self.scalar("SELECT COUNT(*) FROM control_write_results WHERE operation='file_finish'"))
         await self.start_server()
         await self.alice.wait("file-tasks", lambda item: not item["items"], since=self.marks[0], timeout=20)
         await self.assert_replayed("file_finish", checkpoint["requestId"])
@@ -481,6 +487,36 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(before + 2, self.scalar("SELECT COUNT(*) FROM sync_events"))
         await self.check_sync()
 
+    async def replay_completed_file_request(self, request_id):
+        original = next(item for server in self.servers for item in server.events
+            if item["event"] == "request" and item["operation"] == "file_finish" and item["requestId"] == request_id)
+        config = QuicConfiguration(is_client=True, alpn_protocols=["mini-im"])
+        config.verify_mode = ssl.CERT_NONE
+        async with connect("127.0.0.1", self.server.port, configuration=config) as protocol:
+            reader, writer = await protocol.create_stream()
+
+            async def receive(body):
+                async with asyncio.timeout(5):
+                    while True:
+                        size = struct.unpack(">I", await reader.readexactly(4))[0]
+                        response = EnvelopeCodec.decode(await reader.readexactly(size))
+                        if response.HasField(body):
+                            return response
+
+            hello = envelope_pb2.Envelope(version=1, request_id="replay-hello", channel=common_pb2.CHANNEL_CONTROL)
+            hello.hello.token = "dev-token:alice"
+            hello.hello.device_id = "finish-replay-device"
+            writer.write(EnvelopeCodec.encode_frame(hello))
+            welcome = await receive("welcome")
+            request = envelope_pb2.Envelope(version=1, request_id=request_id, channel=common_pb2.CHANNEL_FILE,
+                session_id=welcome.welcome.session_id, device_id=hello.hello.device_id)
+            request.file_finish.ParseFromString(bytes.fromhex(original["body"]))
+            writer.write(EnvelopeCodec.encode_frame(request))
+            response = await receive("ack")
+            self.assertEqual(request_id, response.request_id)
+            writer.close()
+            return response.ack.SerializeToString()
+
     async def test_file_completion_commit_survives_lost_confirmation(self):
         payload = b"published file survives" * 4096
         source = self.root / "published.bin"
@@ -490,6 +526,8 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         checkpoint = await self.kill_at_checkpoint()
         self.assertEqual("completed", self.scalar("SELECT status FROM file_transfers"))
         self.assertEqual(1, self.scalar("SELECT COUNT(*) FROM messages"))
+        committed_ack = self.scalar("SELECT ack FROM control_write_results WHERE user_id='alice' AND request_id=?",
+                                    (checkpoint["requestId"],))
         before = self.rows("SELECT seq,event_id FROM sync_events ORDER BY user_id,seq")
         stored = self.data / "storage/files" / self.scalar("SELECT storage_path FROM file_transfers")
         await self.start_server()
@@ -499,6 +537,11 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(before, self.rows("SELECT seq,event_id FROM sync_events ORDER BY user_id,seq"))
         self.assertEqual(payload, stored.read_bytes())
         self.assertEqual(1, self.scalar("SELECT COUNT(*) FROM messages"))
+        # The Qt upload may finish through sync without resending FileFinish; exercise the saved request explicitly.
+        self.assertEqual(committed_ack, await self.replay_completed_file_request(checkpoint["requestId"]))
+        replayed_ack = await self.server.wait("finish-ack", lambda item: item["requestId"] == checkpoint["requestId"])
+        self.assertEqual(committed_ack.hex(), replayed_ack["payload"])
+        await self.assert_replayed("file_finish", checkpoint["requestId"])
         await self.check_sync()
 
     async def test_receipt_and_recall_commits_survive_lost_confirmations(self):
