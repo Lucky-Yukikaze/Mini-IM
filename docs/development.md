@@ -22,6 +22,9 @@ Sql = Qt 访问数据库的模块；本地缓存使用其 QSQLITE 驱动，部�
 
 Python 依赖约束见 [requirements.txt](../server/requirements.txt)；
 Web 依赖由 [package.json](../web/package.json) 声明、[package-lock.json](../web/package-lock.json) 固定。
+更新依赖时一并提交声明和锁文件；使用 `npm --prefix ./web audit` 检查当前已知告警，
+再用 `npm --prefix ./web ci`、类型检查、页面测试、打包与受影响的桌面专项验收升级结果。
+审计结果只覆盖当次依赖及公告库，日期和结果记录在执行记录中。
 C++ 通过 vcpkg 查找 MsQuic 和 Protobuf；当前尚未固定 vcpkg 基线版本。
 
 创建项目虚拟环境并安装 Python 与 Web 依赖：
