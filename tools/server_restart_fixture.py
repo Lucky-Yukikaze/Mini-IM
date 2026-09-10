@@ -151,6 +151,9 @@ async def main(args):
                 emit("message-ack", requestId=envelope.request_id, payload=envelope.ack.SerializeToString().hex())
             if envelope.HasField("ack") and gate.requests.get(envelope.request_id) == "file_finish":
                 emit("finish-ack", requestId=envelope.request_id, payload=envelope.ack.SerializeToString().hex())
+            if envelope.HasField("ack") and gate.requests.get(envelope.request_id) in ("file_cancel", "sync_applied"):
+                emit("durable-ack", operation=gate.requests[envelope.request_id],
+                     requestId=envelope.request_id, payload=envelope.ack.SerializeToString().hex())
             if envelope.HasField("ack") and envelope.ack.success:
                 gate.check("before-ack", operation=gate.requests.get(envelope.request_id, ""),
                            request_id=envelope.request_id, entityId=envelope.ack.entity_id)

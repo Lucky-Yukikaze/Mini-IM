@@ -25,7 +25,7 @@ from test_native_flow import NativeClient
 from aioquic.asyncio import connect
 from aioquic.quic.configuration import QuicConfiguration
 from protocol.codec import EnvelopeCodec
-from protocol.pb import common_pb2, envelope_pb2, file_pb2, message_pb2
+from protocol.pb import common_pb2, envelope_pb2, file_pb2, message_pb2, sync_pb2
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -177,12 +177,13 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         for table, key, columns, fields, terminal in (
             ("message_outbox", "messageSends", "request_id,client_msg_id", ("requestId", "clientMsgId"), "'confirmed'"),
             ("control_outbox", "controlWrites", "request_id,operation", ("requestId", "operation"), "'confirmed'"),
-            ("file_tasks", "fileTasks", "id,init_request,finish_request", ("clientFileId", "requestId", "finishRequestId"),
+            ("file_tasks", "fileTasks", "id,init_request,finish_request,cancel_request",
+             ("clientFileId", "requestId", "finishRequestId", "cancelRequestId"),
              "'completed','cancelled'"),
         ):
             persisted = self.rows(f"SELECT {columns} FROM {table} WHERE status NOT IN ({terminal})", path=cache)
             self.assertEqual({tuple(row.values()) for row in persisted},
-                             {tuple(item[field] for field in fields) for item in initial[key]})
+                             {tuple(item.get(field, "") for field in fields) for item in initial[key]})
         cursor = self.rows("SELECT value FROM metadata WHERE key='cursor'", path=cache)
         self.assertGreaterEqual(int(initial["globalCursor"]), int(cursor[0]["value"]) if cursor else 0)
 
@@ -297,6 +298,19 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         message = self.rows("SELECT server_msg_id FROM messages WHERE client_msg_id='confirm-crash'")[0]["server_msg_id"]
         committed = point == "before-ack"
         before = self.rows("SELECT * FROM message_deliveries WHERE user_id='bob' AND server_msg_id=?", (message,))[0]
+        committed_ack = self.scalar("SELECT ack FROM control_write_results WHERE request_id=?",
+                                    (checkpoint["requestId"],)) if committed else None
+        if self.restart_all_clients:
+            cache = self.output / f"bob-before-crash-{len(self.servers)}.sqlite"
+            metadata = {row["key"]: row["value"] for row in self.rows("SELECT key,value FROM metadata", path=cache)}
+            pending = json.loads(metadata["sync_confirmation"])
+            self.assertEqual(checkpoint["requestId"], pending["requestId"])
+            request = next(item for item in self.server.events if item["event"] == "request"
+                           and item["requestId"] == checkpoint["requestId"])
+            body = sync_pb2.SyncApplied.FromString(bytes.fromhex(request["body"]))
+            self.assertEqual(int(pending["cursor"]), body.global_cursor)
+            self.assertLessEqual(int(pending["cursor"]), int(metadata["cursor"]))
+            self.assertGreater(int(pending["cursor"]), int(metadata.get("sync_confirmed_cursor", 0)))
         self.assertEqual("delivered" if committed else "sent", before["status"])
         self.assertEqual(committed, before["delivered_at_ms"] is not None)
         self.assertEqual(int(committed), self.scalar(
@@ -309,6 +323,11 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         await self.check_new_sessions()
         await self.check_sync()
         await self.assert_replayed("sync_applied", checkpoint["requestId"])
+        replay_ack = await self.server.wait("durable-ack", lambda item: item["requestId"] == checkpoint["requestId"])
+        saved_ack = self.scalar("SELECT ack FROM control_write_results WHERE request_id=?", (checkpoint["requestId"],))
+        self.assertEqual(saved_ack.hex(), replay_ack["payload"])
+        if committed:
+            self.assertEqual(committed_ack, saved_ack)
         after = self.rows("SELECT * FROM message_deliveries WHERE user_id='bob' AND server_msg_id=?", (message,))[0]
         self.assertEqual("delivered", after["status"])
         if committed:
@@ -435,6 +454,77 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, self.scalar("SELECT COUNT(*) FROM messages"))
         self.assertEqual(1, self.scalar("SELECT COUNT(*) FROM file_cancellations"))
         await self.check_sync()
+
+    async def cancellation_joint_crash(self, point):
+        source = self.root / "cancel-joint.bin"
+        source.write_bytes(b"cancel original file task" * 4096)
+        await self.server.arm("before-ack", "file_init")
+        mark = await self.alice.command("upload", conversation=self.conversation, path=str(source))
+        pending = await self.alice.wait("file-tasks", lambda item: bool(item["items"]), since=mark)
+        intent = pending["items"][0]["clientFileId"]
+        await self.kill_at_checkpoint()
+        # Stop automatic reconnect, save cancellation offline, then arm the next service before connecting.
+        mark = await self.alice.command("disconnect")
+        await self.alice.wait("connection", lambda item: item["state"] == "disconnected", since=mark)
+        mark = await self.alice.command("cancel-file", intent=intent)
+        cancelling = await self.alice.wait("file-tasks", lambda item: any(task["status"] == "cancelling"
+            for task in item["items"]), since=mark)
+        request_id = cancelling["items"][0]["cancelRequestId"]
+        original = self.rows("SELECT * FROM file_transfers")[0]
+        before_events = self.rows("SELECT seq,event_id,payload FROM sync_events WHERE event_type='file_updated' ORDER BY user_id,seq")
+        await self.start_server()
+        await self.server.arm(point, "file_cancel")
+        await self.alice.connect(self.endpoint, "alice")
+        self.restart_all_clients = True
+        checkpoint = await self.kill_at_checkpoint()
+        self.assertEqual(request_id, checkpoint["requestId"])
+        committed = point == "before-ack"
+        self.assertEqual(int(committed), self.scalar("SELECT COUNT(*) FROM file_cancellations"))
+        self.assertEqual(int(committed), self.scalar("SELECT COUNT(*) FROM control_write_results WHERE operation='file_cancel'"))
+        stopped = self.rows("SELECT * FROM file_transfers")[0]
+        if committed:
+            self.assertEqual("cancelled", stopped["status"])
+        else:
+            self.assertEqual(original, stopped)
+            self.assertEqual(before_events, self.rows(
+                "SELECT seq,event_id,payload FROM sync_events WHERE event_type='file_updated' ORDER BY user_id,seq"))
+        committed_ack = self.scalar("SELECT ack FROM control_write_results WHERE request_id=?", (request_id,)) if committed else None
+        self.assertEqual(0, self.scalar("SELECT COUNT(*) FROM messages"))
+        cache = self.output / f"alice-before-crash-{len(self.servers)}.sqlite"
+        saved = self.rows("SELECT id,cancel_request,status FROM file_tasks", path=cache)[0]
+        self.assertEqual(dict(id=intent, cancel_request=request_id, status="cancelling"), saved)
+        await self.start_server()
+        await self.alice.wait("file-tasks", lambda item: not item["items"], since=self.marks[0], timeout=20)
+        await self.assert_replayed("file_cancel", request_id)
+        replay_ack = await self.server.wait("durable-ack", lambda item: item["requestId"] == request_id)
+        result = self.scalar("SELECT ack FROM control_write_results WHERE request_id=?", (request_id,))
+        self.assertEqual(result.hex(), replay_ack["payload"])
+        final = self.rows("SELECT * FROM file_transfers")[0]
+        self.assertEqual("cancelled", final["status"])
+        self.assertEqual(original["file_id"], final["file_id"])
+        self.assertEqual(original["received_bytes"], final["received_bytes"])
+        if committed:
+            self.assertEqual(committed_ack, result)
+            self.assertEqual(stopped, final)
+        self.assertEqual(1, self.scalar("SELECT COUNT(*) FROM file_cancellations"))
+        self.assertEqual(1, self.scalar("SELECT COUNT(*) FROM control_write_results WHERE operation='file_cancel'"))
+        self.assertEqual(0, self.scalar("SELECT COUNT(*) FROM messages"))
+        self.assertEqual(len(before_events) + 2, self.scalar("SELECT COUNT(*) FROM sync_events WHERE event_type='file_updated'"))
+        await self.check_sync()
+
+    async def test_joint_crash_cancel_before_commit(self):
+        await self.cancellation_joint_crash("before-commit")
+
+    async def test_joint_crash_cancel_after_commit(self):
+        await self.cancellation_joint_crash("before-ack")
+
+    async def test_joint_crash_delivery_before_commit(self):
+        self.restart_all_clients = True
+        await self.delivery_confirmation_crash("before-commit")
+
+    async def test_joint_crash_delivery_after_commit(self):
+        self.restart_all_clients = True
+        await self.delivery_confirmation_crash("before-ack")
 
     async def test_partial_download_survives_server_process_restart(self):
         payload = bytes(range(251)) * 4096
