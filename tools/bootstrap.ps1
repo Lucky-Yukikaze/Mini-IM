@@ -1,55 +1,44 @@
-﻿$ErrorActionPreference = 'Stop'
-
-Set-Location (Split-Path -Parent $MyInvocation.MyCommand.Path)
-Set-Location ..
-
-Write-Host '执行环境检查...' -ForegroundColor Cyan
-powershell -ExecutionPolicy Bypass -File .\tools\check_env.ps1
-
-Write-Host '安装 Python 依赖...' -ForegroundColor Cyan
-python -m pip install -r .\server\requirements.txt
-
-Write-Host '生成 protobuf Python 代码...' -ForegroundColor Cyan
-python .\server\tools\generate_proto.py
-
-Write-Host '初始化 SQLite...' -ForegroundColor Cyan
-python -c "from pathlib import Path; import sys; sys.path.insert(0, 'server'); from storage.sqlite.init_db import init_db; init_db(Path('server/storage/sqlite/miniim.db'))"
-
-Write-Host '安装 Web 依赖...' -ForegroundColor Cyan
-Set-Location .\web
-npm install
-
-Write-Host '构建 Web...' -ForegroundColor Cyan
-npm run build
-Set-Location ..
-
-Write-Host '配置 Qt6 客户端...' -ForegroundColor Cyan
-$vcpkgToolchain = Join-Path (Get-Location) 'thirdparty_install\vcpkg\scripts\buildsystems\vcpkg.cmake'
-if (Test-Path $vcpkgToolchain)
-{
-    cmake -S .\client -B .\build\client_qt6 -DCMAKE_PREFIX_PATH=D:\Qt\6.8.0\msvc2019_64 -DCMAKE_TOOLCHAIN_FILE=$vcpkgToolchain
+[CmdletBinding()]
+param(
+    [string]$QtRoot = $env:QT_DIR,
+    [string]$VcpkgRoot = $env:VCPKG_ROOT,
+    [string]$VenvPath = '.venv',
+    [string]$BuildDirectory = 'build/client',
+    [string]$Python = 'python',
+    [switch]$SkipInstall
+)
+$ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'dev_common.ps1')
+& (Join-Path $PSScriptRoot 'check_env.ps1') -QtRoot $QtRoot -VcpkgRoot $VcpkgRoot -Python $Python -Prerequisites
+$venv = Get-MiniImPath $VenvPath
+$build = Get-MiniImPath $BuildDirectory
+$interpreter = Join-Path $venv 'Scripts/python.exe'
+if (-not $SkipInstall) {
+    if (-not (Test-Path -LiteralPath $interpreter)) { Invoke-MiniImCommand $Python @('-m', 'venv', $venv) }
+    Invoke-MiniImCommand $interpreter @('-m', 'pip', 'install', '-r', (Join-Path $MiniImRoot 'server/requirements.txt'))
+    Invoke-MiniImCommand 'npm.cmd' @('--prefix', (Join-Path $MiniImRoot 'web'), 'ci')
 }
-else
-{
-    Write-Warning "未找到 vcpkg toolchain: $vcpkgToolchain，将按无 toolchain 方式配置。"
-    cmake -S .\client -B .\build\client_qt6 -DCMAKE_PREFIX_PATH=D:\Qt\6.8.0\msvc2019_64
-}
-
-Write-Host '编译 Qt6 客户端(Debug)...' -ForegroundColor Cyan
-cmake --build .\build\client_qt6 --config Debug
-
-Write-Host '部署 Qt6 运行时与平台插件...' -ForegroundColor Cyan
-$windeployqt = 'D:\Qt\6.8.0\msvc2019_64\bin\windeployqt.exe'
-$clientExe = Join-Path (Get-Location) 'build\client_qt6\Debug\mini_im_client.exe'
-if ((Test-Path $windeployqt) -and (Test-Path $clientExe))
-{
-    & $windeployqt --debug --qmldir (Join-Path (Get-Location) 'web') $clientExe
-}
-else
-{
-    Write-Warning "跳过 windeployqt：未找到 $windeployqt 或 $clientExe"
-}
-
-Write-Host '完成。建议下一步：' -ForegroundColor Green
-Write-Host '1) 启动开发环境: powershell -ExecutionPolicy Bypass -File .\tools\dev_start.ps1'
-Write-Host '2) 停止开发环境: powershell -ExecutionPolicy Bypass -File .\tools\dev_stop.ps1'
+& (Join-Path $PSScriptRoot 'check_env.ps1') -QtRoot $QtRoot -VcpkgRoot $VcpkgRoot -VenvPath $VenvPath
+Invoke-MiniImCommand $interpreter @((Join-Path $MiniImRoot 'server/tools/generate_proto.py'))
+$typeChecker = Join-Path $MiniImRoot 'web/node_modules/vue-tsc/bin/vue-tsc.js'
+Assert-MiniImFile $typeChecker
+Invoke-MiniImCommand 'node' @($typeChecker, '--noEmit', '-p', (Join-Path $MiniImRoot 'web/tsconfig.json'))
+Invoke-MiniImCommand 'npm.cmd' @('--prefix', (Join-Path $MiniImRoot 'web'), 'run', 'build')
+if (-not $VcpkgRoot) { $VcpkgRoot = 'thirdparty_install/vcpkg' }
+$toolchain = Join-Path (Get-MiniImPath $VcpkgRoot) 'scripts/buildsystems/vcpkg.cmake'
+Invoke-MiniImCommand 'cmake' @('-S', (Join-Path $MiniImRoot 'client'), '-B', $build, '-G', 'Visual Studio 17 2022', '-A', 'x64',
+    "-DCMAKE_TOOLCHAIN_FILE=$toolchain", '-DVCPKG_TARGET_TRIPLET=x64-windows', "-DCMAKE_PREFIX_PATH=$(Get-MiniImPath $QtRoot)", '-DBUILD_TESTING=ON')
+Invoke-MiniImCommand 'cmake' @('--build', $build, '--config', 'Release')
+$release = Join-Path $build 'Release'
+$instance = Select-String -LiteralPath (Join-Path $build 'CMakeCache.txt') -Pattern '^CMAKE_GENERATOR_INSTANCE:INTERNAL=(.+)$'
+if (-not $instance) { throw 'Configured Visual Studio installation is missing from CMakeCache.txt' }
+$previousVcDirectory = $env:VCINSTALLDIR
+try {
+    $env:VCINSTALLDIR = Join-Path $instance.Matches[0].Groups[1].Value 'VC'
+    Invoke-MiniImCommand (Join-Path (Get-MiniImPath $QtRoot) 'bin/windeployqt.exe') @('--release', '--compiler-runtime', '--dir', $release,
+        (Join-Path $release 'mini_im_client.exe'), (Join-Path $release 'mini_im_native_driver.exe'))
+} finally { $env:VCINSTALLDIR = $previousVcDirectory }
+Assert-MiniImFile (Join-Path $release 'Qt6Sql.dll')
+Assert-MiniImFile (Join-Path $release 'sqldrivers/qsqlite.dll')
+Invoke-MiniImCommand 'ctest' @('--test-dir', $build, '-C', 'Release', '--output-on-failure')
+Write-Host "Bootstrap completed: $release"

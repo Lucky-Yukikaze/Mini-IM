@@ -1,49 +1,40 @@
-﻿$ErrorActionPreference = 'SilentlyContinue'
-
-Write-Host '== Mini-IM 环境检查 ==' -ForegroundColor Cyan
-
-function Test-Cmd($name) {
-    $cmd = Get-Command $name -ErrorAction SilentlyContinue
-    if ($null -eq $cmd) {
-        Write-Host "[MISSING] $name" -ForegroundColor Yellow
-        return $false
-    }
-
-    Write-Host "[OK] $name -> $($cmd.Source)" -ForegroundColor Green
-    return $true
-}
-
-Test-Cmd python | Out-Null
-Test-Cmd node | Out-Null
-Test-Cmd npm | Out-Null
-Test-Cmd cmake | Out-Null
-Test-Cmd qmake | Out-Null
-if (-not (Test-Cmd cl)) {
-    Write-Host '[WARN] cl 不在当前 shell PATH，使用 CMake + VS 生成器仍可编译。' -ForegroundColor Yellow
-}
-
-$qt6Qmake = 'D:\Qt\6.8.0\msvc2019_64\bin\qmake.exe'
-$qt6CoreConfig = 'D:\Qt\6.8.0\msvc2019_64\lib\cmake\Qt6\Qt6Config.cmake'
-$qt6WebEngineConfig = 'D:\Qt\6.8.0\msvc2019_64\lib\cmake\Qt6WebEngineWidgets\Qt6WebEngineWidgetsConfig.cmake'
-if (Test-Path $qt6Qmake) {
-    Write-Host "[OK] qmake(Qt6) -> $qt6Qmake" -ForegroundColor Green
-    & $qt6Qmake -v
+[CmdletBinding()]
+param(
+    [string]$QtRoot = $env:QT_DIR,
+    [string]$VcpkgRoot = $env:VCPKG_ROOT,
+    [string]$VenvPath = '.venv',
+    [string]$Python = 'python',
+    [switch]$Prerequisites,
+    [switch]$RuntimeOnly
+)
+$ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'dev_common.ps1')
+foreach ($name in @('node', 'npm.cmd')) { Get-Command $name -ErrorAction Stop | Out-Null }
+if ($Prerequisites) {
+    Get-Command $Python -ErrorAction Stop | Out-Null
+    Invoke-MiniImCommand $Python @('--version')
 } else {
-    Write-Host '[MISSING] qmake(Qt6)' -ForegroundColor Yellow
+    $interpreter = Join-Path (Get-MiniImPath $VenvPath) 'Scripts/python.exe'
+    Assert-MiniImFile $interpreter
+    Invoke-MiniImCommand $interpreter @('-c', 'import aioquic, google.protobuf; print("Python runtime dependencies available")')
+    if (-not $RuntimeOnly) { Invoke-MiniImCommand $interpreter @('-c', 'import grpc_tools.protoc') }
 }
-Write-Host "[OK] Qt6Config: $(Test-Path $qt6CoreConfig)" -ForegroundColor Green
-Write-Host "[OK] Qt6WebEngineWidgetsConfig: $(Test-Path $qt6WebEngineConfig)" -ForegroundColor Green
-
-$protoGen = 'D:\Codex\Mini-IM\server\tools\generate_proto.py'
-if (Test-Path $protoGen) {
-    Write-Host "[OK] proto 脚本: $protoGen" -ForegroundColor Green
+if (-not $RuntimeOnly) {
+    Get-Command cmake -ErrorAction Stop | Out-Null
+    if (-not $QtRoot) { throw 'Set QT_DIR or pass -QtRoot with the Qt MSVC installation directory' }
+    $QtRoot = Get-MiniImPath $QtRoot
+    foreach ($module in @('Core', 'Sql', 'Network', 'Widgets', 'WebChannel', 'WebEngineWidgets')) {
+        Assert-MiniImFile (Join-Path $QtRoot "lib/cmake/Qt6$module/Qt6${module}Config.cmake")
+    }
+    Assert-MiniImFile (Join-Path $QtRoot 'bin/windeployqt.exe')
+    if (-not $VcpkgRoot) { $VcpkgRoot = 'thirdparty_install/vcpkg' }
+    $VcpkgRoot = Get-MiniImPath $VcpkgRoot
+    Assert-MiniImFile (Join-Path $VcpkgRoot 'scripts/buildsystems/vcpkg.cmake')
+    foreach ($package in @('msquic', 'protobuf')) {
+        Assert-MiniImFile (Join-Path $VcpkgRoot "installed/x64-windows/share/$package/$package-config.cmake")
+    }
 }
-
-$serverMain = 'D:\Codex\Mini-IM\server\main.py'
-$webPkg = 'D:\Codex\Mini-IM\web\package.json'
-$clientCmake = 'D:\Codex\Mini-IM\client\CMakeLists.txt'
-Write-Host "[OK] server: $(Test-Path $serverMain)" -ForegroundColor Green
-Write-Host "[OK] web: $(Test-Path $webPkg)" -ForegroundColor Green
-Write-Host "[OK] client: $(Test-Path $clientCmake)" -ForegroundColor Green
-
-Write-Host '== 检查完成 ==' -ForegroundColor Cyan
+foreach ($file in @('server/main.py', 'server/tools/generate_proto.py', 'web/package.json', 'client/CMakeLists.txt')) {
+    Assert-MiniImFile (Join-Path $MiniImRoot $file)
+}
+Write-Host 'Environment checks passed.'

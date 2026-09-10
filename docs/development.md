@@ -4,7 +4,7 @@
 架构和编码规则见 [AGENTS.md](../AGENTS.md)，
 本机环境、已执行检查与遗留问题见 [重构执行记录](refactoring-progress.md)。
 以下安装与配置步骤按代码整理；已实际执行的组合和结果以执行记录为准。
-本机已有目录的增量构建不能证明新环境安装成功。
+本机已有目录的增量构建不能证明新环境安装成功；新构建目录的本机验证也不代表重新安装了 Qt、编译器或 vcpkg。
 
 | 任务 | 本文入口 |
 | --- | --- |
@@ -40,6 +40,23 @@ git clone https://github.com/microsoft/vcpkg ./thirdparty_install/vcpkg
 & ./thirdparty_install/vcpkg/vcpkg.exe install msquic protobuf --triplet x64-windows
 ~~~
 
+依赖和 Qt 安装完成后，可使用统一入口；脚本从自身位置定位项目，参数中的相对路径均相对项目根目录。
+
+~~~powershell
+$env:QT_DIR = 'D:/Qt/6.11.0/msvc2022_64'
+& ./tools/check_env.ps1 -Prerequisites
+& ./tools/bootstrap.ps1 -BuildDirectory build/client
+~~~
+
+[环境检查](../tools/check_env.ps1) 的 `-Prerequisites` 检查系统 Python、Node/npm、CMake、Qt 模块和已安装的 C++ 包；
+默认还检查 `.venv` 及协议生成依赖，`-RuntimeOnly` 仅检查服务和 Web 运行所需入口。
+缺失依赖或命令失败会抛出错误，使用 `pwsh -File` 调用时返回非零退出码。
+[安装构建入口](../tools/bootstrap.ps1) 在项目 `.venv` 安装固定 Python 直接依赖，用 `npm ci` 安装锁定 Web 依赖，
+生成协议、执行类型检查和打包，再配置 Visual Studio 2022/x64、构建 Release、部署 Qt 并执行组件测试。
+`-QtRoot` 或 `QT_DIR` 指定 Qt；`-VcpkgRoot` 或 `VCPKG_ROOT` 指定 vcpkg，默认 `thirdparty_install/vcpkg`。
+`-Python` 选择创建虚拟环境的解释器，`-VenvPath` 选择虚拟环境；`-SkipInstall` 要求依赖已经安装，不执行 pip 或 npm 安装。
+入口不安装 Qt、Visual Studio 或 vcpkg，也不提前创建业务数据库；数据库由服务启动时初始化。
+
 ## 生成协议与构建
 
 协议定义只在 [proto/](../proto/) 中修改；Python 生成文件纳入 Git，
@@ -65,6 +82,8 @@ cmake --build ./build/client_qt611 --config Release --target mini_im_client mini
 `windeployqt` = 将 Qt 运行时和插件复制到程序目录的部署工具；
 MsQuic、Protobuf 等非 Qt 依赖由所用依赖配置提供，运行前需保证其 DLL 可被找到。
 部署前先退出使用该构建目录的客户端和测试驱动；出现 DLL 无法覆盖时，处理占用后重新执行部署。
+统一脚本从 CMake 记录的 Visual Studio 安装目录设置临时 `VCINSTALLDIR`，部署后恢复原值；
+输出的 `vc_redist.x64.exe` 是运行库安装程序，目标机器仍需具备相应运行库，不能只凭本机构建证明空机器部署完成。
 Qt 部署结果应包含 `Qt6Sql.dll` 和 `sqldrivers/qsqlite.dll`；缺少 SQLite 驱动会使缓存打开失败。
 打包页面后，客户端可直接读取 `web/dist/index.html`。
 
@@ -95,6 +114,22 @@ npm --prefix ./web run dev -- --host 127.0.0.1 --port 5173 --strictPort
 其中的“已连接”和消息仅用于页面调试，真实网络联调须从 Qt 客户端进入。
 
 停止服务端和页面开发服务时，在各自终端按 Ctrl+C；退出客户端时关闭其窗口。
+
+也可用 [开发启动](../tools/dev_start.ps1) 和 [开发停止](../tools/dev_stop.ps1) 管理后台服务：
+
+~~~powershell
+& ./tools/dev_start.ps1
+& ./tools/dev_stop.ps1
+~~~
+
+启动使用 `.venv` Python 和本地 Vite，后台窗口隐藏；服务就绪及页面 HTTP 响应通过后才报告成功，最多等待 20 秒。
+默认服务端口 4433、页面端口 5173；`-ServerPort`、`-WebPort` 可覆盖，`-DataRoot` 默认 `server`。
+`-RunDirectory` 默认 `tmp/dev`，保存日志和进程记录；停止时使用相同目录。
+进程记录核对程序路径和开始时间，拒绝过期身份；重复启动不停止已有服务，启动失败清理本次启动的进程。
+停止会强制终止匹配的进程及其已识别子进程，释放端口并移除记录，保留业务数据和日志。
+旧 `tools/.dev_processes.json` 缺少身份信息，不自动导入；旧窗口仍需由原终端停止。
+服务命令行另支持 `--data-root` 与 `--port`，默认行为保持原值，端口有效范围为 1 至 65535。
+
 本节描述本机开发方式；正式认证、证书验证与外网部署须先明确产品目标。
 
 | 数据 | 当前默认位置或行为 |
@@ -388,7 +423,17 @@ Qt 将明确完成拒绝保存为 `finishRejected`；用户点击重试时，在
 ## 验证
 
 下面各组命令分别检查服务端、页面和原生组件；每个命令退出码均须单独检查。
-页面的 `build` 当前只做打包，不包含类型检查。
+页面的 `build` 当前只做打包，不包含类型检查；统一验证入口会单独执行类型检查。
+
+~~~powershell
+& ./tools/verify.ps1 -QtRoot 'D:/Qt/6.11.0/msvc2022_64' -BuildDirectory build/client
+& ./tools/verify.ps1 -QtRoot 'D:/Qt/6.11.0/msvc2022_64' -BuildDirectory build/client -Integration
+~~~
+
+[统一验证](../tools/verify.ps1) 复用已有依赖，依次执行协议生成、类型检查、构建部署、组件测试、服务端与页面测试及开发脚本验收。
+`-Integration` 继续运行真实原生网络与独立服务宕机全量，使用本次构建目录中的驱动；不会替代完整桌面交互或性能验收。
+[开发脚本验收](../tools/test_dev_scripts.ps1) 可独立运行，使用随机端口和 `tmp/dev-script-tests/` 隔离数据，
+检查路径引用、缺失环境、命令失败、重复启动、过期进程身份、停止释放端口及占用端口时的清理。
 
 ~~~powershell
 & ./.venv/Scripts/python.exe -m unittest discover server/tests -v
@@ -540,8 +585,9 @@ SHA-256 = 根据文件内容计算的固定摘要，此处配合逐字节比较�
 | 入口 | 当前使用边界 |
 | --- | --- |
 | [generate_proto.py](../server/tools/generate_proto.py) | 使用调用它的 Python 环境内的 `grpc_tools.protoc` 生成协议并修正包内导入 |
-| [bootstrap.ps1](../tools/bootstrap.ps1)、[check_env.ps1](../tools/check_env.ps1) | 仍含 Qt 6.8.0、旧构建目录或本机绝对路径；本轮统一前使用上文显式命令 |
-| [dev_start.ps1](../tools/dev_start.ps1)、[dev_stop.ps1](../tools/dev_stop.ps1) | 启动入口使用全局 Python 和独立终端；停止入口使用与 PowerShell 内置变量冲突的 `$pid`，暂不作为推荐启停方式 |
+| [bootstrap.ps1](../tools/bootstrap.ps1)、[check_env.ps1](../tools/check_env.ps1) | 可配置 Qt、vcpkg、虚拟环境和构建目录，命令失败即停止；操作见 [准备依赖](#准备依赖) |
+| [dev_start.ps1](../tools/dev_start.ps1)、[dev_stop.ps1](../tools/dev_stop.ps1) | 管理隐藏的后台服务、就绪检查和进程身份，操作见 [运行与数据](#运行与数据) |
+| [verify.ps1](../tools/verify.ps1) | 统一基础与可选全量网络验证，范围见 [验证](#验证) |
 
 已有评估环境把 Python 依赖放在被 Git 忽略的 `tmp/architecture-review-deps`。
 只有该目录已存在时，才可在单独终端用下述方式复核；新环境仍按本指南建立 `.venv`：

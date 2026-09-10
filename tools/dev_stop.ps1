@@ -1,21 +1,16 @@
-﻿$ErrorActionPreference = 'SilentlyContinue'
-
-$repoRoot = (Resolve-Path (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) '..')).Path
-$pidFile = Join-Path $repoRoot 'tools\.dev_processes.json'
-
-if (-not (Test-Path $pidFile)) {
-    Write-Host '未找到运行中的 dev 进程记录。' -ForegroundColor Yellow
-    exit 0
-}
-
-$procInfo = Get-Content $pidFile | ConvertFrom-Json
-
-foreach ($pid in @($procInfo.server_pid, $procInfo.web_pid)) {
-    if ($pid -and (Get-Process -Id $pid -ErrorAction SilentlyContinue)) {
-        Stop-Process -Id $pid -Force
-        Write-Host "已停止 PID: $pid" -ForegroundColor Green
-    }
-}
-
-Remove-Item -Force $pidFile
-Write-Host '开发环境已停止。' -ForegroundColor Green
+[CmdletBinding()]
+param([string]$RunDirectory = 'tmp/dev')
+$ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'dev_common.ps1')
+$run = Get-MiniImPath $RunDirectory
+$statePath = Join-Path $run 'processes.json'
+if (-not (Test-Path -LiteralPath $statePath)) { Write-Host 'No development process record.'; return }
+$lock = [IO.File]::Open((Join-Path $run 'processes.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
+try {
+    $state = Get-Content -Raw -Encoding UTF8 -LiteralPath $statePath | ConvertFrom-Json
+    if ($state.version -ne 1 -or $state.root -ne $MiniImRoot) { throw 'Development process record belongs to another format or workspace' }
+    foreach ($record in $state.processes) { Get-MiniImOwnedProcess $record | Out-Null }
+    foreach ($record in $state.processes) { Stop-MiniImProcess $record }
+    Remove-Item -LiteralPath $statePath -Force
+    Write-Host 'Development services stopped.'
+} finally { $lock.Dispose() }
