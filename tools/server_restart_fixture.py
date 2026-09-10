@@ -25,7 +25,7 @@ from storage.sqlite.db import MiniImSqliteDb
 from services.control.service import ControlWriteService
 from services.message.service import MessageService
 from services.file.service import FileService
-from storage.repo import FileRepo
+from storage.repo import FileRepo, DeliveryRepo
 
 
 def emit(event, **data):
@@ -74,9 +74,23 @@ async def main(args):
         def transaction(self):
             outermost = not self.m_connection.in_transaction
             with super().transaction() as connection:
+                changes = connection.total_changes
                 yield connection
-                if outermost:
+                if outermost and (gate.operation != "burn" or connection.total_changes > changes):
                     gate.check("before-commit")
+
+    class Deliveries(DeliveryRepo):
+        def collect_due_burn_sync_events(self, limit):
+            previous = gate.operation
+            gate.operation = "burn"
+            try:
+                events = super().collect_due_burn_sync_events(limit)
+                if events:
+                    gate.check("after-commit", eventIds=[event.event_id for event in events])
+                emit("burn-scan", events=len(events))
+                return events
+            finally:
+                gate.operation = previous
 
     class Controls(ControlWriteService):
         def handle(self, user_id, envelope):
@@ -171,6 +185,7 @@ async def main(args):
           patch.object(production, "SyncService", Syncs),
           patch.object(production, "FileService", Files),
           patch.object(production, "FileRepo", FileStorage),
+          patch.object(production, "DeliveryRepo", Deliveries),
           patch.object(production, "MiniImQuicProtocol", Protocol),
           patch.object(production, "serve_quic", listen),
           patch.object(download, "ReadChunk", read_chunk), redirect_stdout(sys.stderr)):

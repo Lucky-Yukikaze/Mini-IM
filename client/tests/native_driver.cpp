@@ -60,7 +60,8 @@ bool Dispatch(ImBridge& bridge, const QJsonObject& command)
     }
     if (operation == QStringLiteral("message"))
     {
-        return bridge.sendMessage(value("conversation"), value("intent"), value("text"), 0, 0);
+        return bridge.sendMessage(value("conversation"), value("intent"), value("text"),
+            command.value("burnMode").toInt(), command.value("burnTtlSec").toInt());
     }
     if (operation == QStringLiteral("retry-message"))
     {

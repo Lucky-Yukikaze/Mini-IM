@@ -411,7 +411,7 @@ ctest --test-dir ./build/client_qt611 -C Release --output-on-failure
 & ./.venv/Scripts/python.exe ./tools/test_server_restart.py --client ./build/client_qt611/Release/mini_im_native_driver.exe
 ~~~
 
-此入口启动两个真实 Qt 原生客户端，通过 [服务进程夹具](../tools/server_restart_fixture.py)
+此入口先启动两个真实 Qt 原生客户端，焚毁场景另启动同用户的第二设备与新缓存设备，通过 [服务进程夹具](../tools/server_restart_fixture.py)
 直接调用 [生产启动流程](../server/quic/server.py) 的 `run_server(data_root=..., port=...)`。
 默认开发启动参数和数据位置保持原值；上述函数参数仅用于选择隔离目录与端口，首次启动可传 0 分配端口。
 测试清除继承的 `MINIIM_` 配置，使用独立证书、数据库、文件目录和随机本机端口；
@@ -431,8 +431,15 @@ ctest --test-dir ./build/client_qt611 -C Release --output-on-failure
 每个场景保存服务进程日志、请求与中断位置、客户端事件、`lifecycle.json` 和最终数据库副本。
 `lifecycle.json` 记录进程编号、端口、退出码和是否被强制终止，`results.json` 汇总结果。
 结束时关闭测试进程并清理临时运行目录；上述证据被 Git 忽略，不作为新环境复现前提。
-验证不覆盖机器断电、磁盘损坏、阅后即焚计时跨服务重启、客户端与服务端同时宕机、
-默认 15 分钟上传接管等待或完整 Qt WebEngine 页面；实际结果见 [执行记录](refactoring-progress.md#独立服务进程宕机与原请求恢复--2026-09-09)。
+焚毁专项可追加 `--test test_burn_scan_rolls_back_before_server_commit --test test_burn_scan_commit_survives_lost_push`。
+驱动的 `message` 命令接受可选 `burnMode`、`burnTtlSec`，省略均为 0；专项通过真实接口发送 5 秒焚毁消息。
+服务按默认 1000 毫秒间隔扫描，在实际修改投递的事务提交前、提交后但推送前暂停；不改写业务时间或伪造过期。
+恢复后检查发送者已焚毁而未读接收者仍可读，同用户第二设备的重复已读不延长截止时间。
+随后在接收者到期前终止服务和该用户一个客户端，等待真实时间跨过期限后，用原数据和缓存重启。
+核对各设备正文清理、历史同步副本、连续事件位置与确认、重复扫描的稳定事件标识及首次焚毁时间。
+额外证据 `bob-crash.json` 记录客户端退出码、停止时间与截止时间，`burn-scan` 日志证明后续空扫描实际执行。
+验证不覆盖机器断电、磁盘损坏、其他业务的客户端与服务端同时宕机、
+默认 15 分钟上传接管等待或完整 Qt WebEngine 页面；实际结果见 [焚毁恢复批次](refactoring-progress.md#焚毁计时跨进程恢复--2026-09-10)。
 
 ## 真实桌面页面联调
 

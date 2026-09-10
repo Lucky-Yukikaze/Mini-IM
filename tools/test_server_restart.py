@@ -20,7 +20,7 @@ import time
 import unittest
 
 from test_native_flow import NativeClient
-from protocol.pb import file_pb2
+from protocol.pb import file_pb2, message_pb2
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -497,6 +497,136 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         self.assert_replayed("receipt", checkpoint["requestId"])
         self.assertEqual(2, self.scalar("SELECT COUNT(*) FROM sync_events WHERE event_type='read_count_updated'"))
         await self.check_sync()
+
+    def burn_delivery(self, message, user):
+        return self.rows("SELECT * FROM message_deliveries WHERE server_msg_id=? AND user_id=?",
+                         (message, user))[0]
+
+    def cached_message(self, user, message):
+        cache = next((self.root / f"state-{user}").glob("*.sqlite"))
+        rows = self.rows("SELECT data FROM objects WHERE kind='message' AND id=?", (message,), cache)
+        return json.loads(rows[0]["data"]) if rows else None
+
+    def assert_burn_copies(self, message, user, burned):
+        rows = self.rows("SELECT payload FROM sync_events WHERE event_type='message' AND user_id=?", (user,))
+        copies = [message_pb2.Message.FromString(row["payload"]) for row in rows]
+        copies = [copy for copy in copies if copy.message_id == message]
+        self.assertEqual(1, len(copies))
+        self.assertEqual(burned, copies[0].recalled)
+        self.assertEqual(b"" if burned else b"private across restart", copies[0].content)
+
+    async def check_burn_device_sync(self, cache_user):
+        cache = next((self.root / f"state-{cache_user}").glob("*.sqlite"))
+        maximum = self.scalar("SELECT MAX(seq) FROM sync_events WHERE user_id='bob'")
+        await self.until(lambda: self.rows("SELECT value FROM metadata WHERE key='sync_confirmed_cursor'", path=cache)
+                         == [{"value": str(maximum)}])
+        self.assertEqual(self.rows("SELECT seq,event_id FROM sync_events WHERE user_id='bob' ORDER BY seq"),
+                         self.rows("SELECT position AS seq,event_id FROM seen ORDER BY position", path=cache))
+
+    async def burn_crash(self, point):
+        await self.server.arm(point, "burn")
+        mark = await self.alice.command("message", conversation=self.conversation, intent="burn-restart",
+                                        text="private across restart", burnMode=1, burnTtlSec=5)
+        message = await self.bob.wait("message", lambda item: item["clientMsgId"] == "burn-restart")
+        message_id = message["id"]
+        await self.alice.wait("message-sends", lambda item: not item["items"], since=mark)
+        await self.check_sync()
+        sender = self.burn_delivery(message_id, "alice")
+        self.assertEqual(5000, sender["burn_at_ms"] - sender["burn_started_at_ms"])
+        self.assertIsNone(self.burn_delivery(message_id, "bob")["burn_at_ms"])
+        checkpoint = await self.kill_at_checkpoint()
+        self.assertEqual("burn", checkpoint["operation"])
+        committed = point == "after-commit"
+        self.assertEqual(committed, self.burn_delivery(message_id, "alice")["burned_at_ms"] is not None)
+        self.assertEqual(int(committed), self.scalar("SELECT COUNT(*) FROM sync_events WHERE event_type='recall'"))
+        self.assert_burn_copies(message_id, "alice", committed)
+        self.assert_burn_copies(message_id, "bob", False)
+        self.assertEqual(b"private across restart", self.scalar("SELECT content FROM messages"))
+        if committed:
+            self.assertEqual(checkpoint["eventIds"], [row["event_id"] for row in self.rows(
+                "SELECT event_id FROM sync_events WHERE event_type='recall'")])
+        before = self.burn_delivery(message_id, "alice")
+        await self.start_server()
+        await self.check_new_sessions()
+        await self.check_sync()
+        await self.until(lambda: self.cached_message("alice", message_id)["recalled"])
+        self.assertEqual("", self.cached_message("alice", message_id)["text"])
+        self.assertEqual("private across restart", self.cached_message("bob", message_id)["text"])
+        after = self.burn_delivery(message_id, "alice")
+        self.assertEqual(sender["burn_at_ms"], after["burn_at_ms"])
+        self.assertGreaterEqual(after["burned_at_ms"], after["burn_at_ms"])
+        if committed:
+            self.assertEqual(before, after)
+        self.assertEqual(1, self.scalar("SELECT COUNT(*) FROM sync_events WHERE event_type='recall'"))
+        self.assert_burn_copies(message_id, "alice", True)
+        self.assert_burn_copies(message_id, "bob", False)
+
+        # A second device shares the first user's read deadline; duplicate reads cannot restart it.
+        second = await NativeClient.start(self.driver_path, self.output / "bob-second.log", self.root / "state-bob-second")
+        self.clients.append(second)
+        await second.connect(self.endpoint, "bob", "device-bob-second")
+        await self.until(lambda: self.cached_message("bob-second", message_id) is not None)
+        mark = await self.bob.command("receipt", conversation=self.conversation, seq=message["seq"])
+        await self.bob.wait("control-writes", lambda item: not item["items"], since=mark)
+        reader = self.burn_delivery(message_id, "bob")
+        self.assertEqual(5000, reader["burn_at_ms"] - reader["burn_started_at_ms"])
+        mark = await second.command("receipt", conversation=self.conversation, seq=message["seq"])
+        await second.wait("control-writes", lambda item: not item["items"], since=mark)
+        self.assertEqual(reader, self.burn_delivery(message_id, "bob"))
+        await self.check_sync()
+        self.marks = [len(client.events) for client in self.clients]
+        await self.server.close(kill=True)
+        self.assertNotEqual(0, self.server.process.returncode)
+        await self.bob.crash()
+        stopped_at = int(time.time() * 1000)
+        self.assertLess(stopped_at, reader["burn_at_ms"])
+        self.assertNotEqual(0, self.bob.process.returncode)
+        (self.output / "bob-before-crash.json").write_text(json.dumps(self.bob.events), encoding="utf-8")
+        (self.output / "bob-crash.json").write_text(json.dumps(dict(pid=self.bob.process.pid,
+            exitCode=self.bob.process.returncode, stoppedAt=stopped_at, deadline=reader["burn_at_ms"])), encoding="utf-8")
+        # Let real wall time cross the persisted deadline while the service is absent.
+        await self.until(lambda: int(time.time() * 1000) > reader["burn_at_ms"] + 100, timeout=8)
+        self.assertIsNone(self.burn_delivery(message_id, "bob")["burned_at_ms"])
+        await self.start_server()
+        replacement = await NativeClient.start(self.driver_path, self.output / "bob-restored.log", self.root / "state-bob")
+        self.clients[1] = self.bob = replacement
+        await replacement.connect(self.endpoint, "bob")
+        await self.until(lambda: self.scalar("SELECT content_purged_at_ms FROM messages") > 0)
+        for user in ("alice", "bob", "bob-second"):
+            await self.until(lambda user=user: self.cached_message(user, message_id)["recalled"])
+            self.assertEqual("", self.cached_message(user, message_id)["text"])
+        await self.check_sync()
+        reader_after = self.burn_delivery(message_id, "bob")
+        self.assertEqual(reader["burn_at_ms"], reader_after["burn_at_ms"])
+        self.assertEqual(reader["burn_started_at_ms"], reader_after["burn_started_at_ms"])
+        self.assertGreaterEqual(reader_after["burned_at_ms"], reader["burn_at_ms"])
+        self.assertEqual(b"", self.scalar("SELECT content FROM messages"))
+        self.assertEqual(1, self.scalar("SELECT recalled FROM messages"))
+        self.assert_burn_copies(message_id, "alice", True)
+        self.assert_burn_copies(message_id, "bob", True)
+        recalls = self.rows("SELECT event_id,user_id,seq,payload FROM sync_events WHERE event_type='recall' ORDER BY user_id")
+        self.assertEqual(2, len(recalls))
+        deliveries = self.rows("SELECT * FROM message_deliveries ORDER BY user_id")
+        # A fresh cache must replay redacted history; repeated scans must keep event identity and time.
+        fresh = await NativeClient.start(self.driver_path, self.output / "bob-fresh.log", self.root / "state-bob-fresh")
+        self.clients.append(fresh)
+        await fresh.connect(self.endpoint, "bob", "device-bob-fresh")
+        await self.until(lambda: self.cached_message("bob-fresh", message_id) is not None and
+                         self.cached_message("bob-fresh", message_id)["recalled"])
+        self.assertEqual("", self.cached_message("bob-fresh", message_id)["text"])
+        self.assertFalse(any(packet["event"] == "message" and packet["data"].get("text") == "private across restart"
+                             for packet in fresh.events))
+        await self.check_burn_device_sync("bob-second")
+        await self.check_burn_device_sync("bob-fresh")
+        await self.server.wait("burn-scan", lambda item: item["events"] == 0, since=len(self.server.events))
+        self.assertEqual(recalls, self.rows("SELECT event_id,user_id,seq,payload FROM sync_events WHERE event_type='recall' ORDER BY user_id"))
+        self.assertEqual(deliveries, self.rows("SELECT * FROM message_deliveries ORDER BY user_id"))
+
+    async def test_burn_scan_rolls_back_before_server_commit(self):
+        await self.burn_crash("before-commit")
+
+    async def test_burn_scan_commit_survives_lost_push(self):
+        await self.burn_crash("after-commit")
 
     async def test_idle_server_restart_uses_default_failure_detection(self):
         self.marks = [len(client.events) for client in self.clients]
