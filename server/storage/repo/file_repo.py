@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import hashlib
 import uuid
 from dataclasses import dataclass
 
@@ -70,6 +71,52 @@ class FileRepo:
     def _is_uploading_status(status: str) -> bool:
         return status in {"init", "uploading", "uploaded"}
 
+    @staticmethod
+    def init_fingerprint(request: file_pb2.FileInit) -> bytes:
+        identity = file_pb2.FileInit(client_file_id=request.client_file_id, direction=request.direction,
+                                    source_file_id=request.source_file_id)
+        if request.direction != common_pb2.FILE_DIRECTION_DOWNLOAD:
+            identity.conversation_id = request.conversation_id
+            identity.file_name = request.file_name
+            identity.file_size = request.file_size
+            identity.sha256 = request.sha256.lower()
+        return hashlib.sha256(identity.SerializeToString(deterministic=True)).digest()
+
+    def init_request_conflict(self, user_id: str, request_id: str, fingerprint: bytes) -> bool:
+        connection = self.m_db.m_connection
+        if connection.execute("SELECT 1 FROM control_write_results WHERE user_id=? AND request_id=?",
+                              (user_id, request_id)).fetchone():
+            return True
+        if connection.execute("SELECT 1 FROM messages WHERE sender_id=? AND request_id=?",
+                              (user_id, request_id)).fetchone():
+            return True
+        previous = connection.execute("SELECT fingerprint FROM file_init_requests WHERE user_id=? AND request_id=?",
+                                      (user_id, request_id)).fetchone()
+        if previous is not None:
+            return bytes(previous["fingerprint"]) != fingerprint
+        rows = connection.execute("SELECT * FROM file_transfers WHERE owner_id=? AND request_id=? LIMIT 2",
+                                  (user_id, request_id)).fetchall()
+        if len(rows) > 1:
+            return True
+        if rows:
+            row = rows[0]
+            legacy = file_pb2.FileInit(client_file_id=row["client_file_id"], direction=row["direction"],
+                source_file_id=row["source_file_id"], conversation_id=row["conversation_id"],
+                file_name=row["file_name"], file_size=row["file_size"], sha256=row["sha256"])
+            return self.init_fingerprint(legacy) != fingerprint
+        return False
+
+    def owns_init_request(self, user_id: str, request_id: str) -> bool:
+        connection = self.m_db.m_connection
+        return bool(connection.execute("SELECT 1 FROM file_init_requests WHERE user_id=? AND request_id=?",
+                                       (user_id, request_id)).fetchone()
+                    or connection.execute("SELECT 1 FROM file_transfers WHERE owner_id=? AND request_id=?",
+                                          (user_id, request_id)).fetchone())
+
+    def remember_init_request(self, user_id: str, request_id: str, fingerprint: bytes) -> None:
+        self.m_db.m_connection.execute("INSERT OR IGNORE INTO file_init_requests(user_id,request_id,fingerprint) VALUES(?,?,?)",
+                                      (user_id, request_id, fingerprint))
+
     def create_or_resume_transfer(
         self, user_id: str, request_id: str, file_init: file_pb2.FileInit,
         member_ids: list[str], storage_relative_path: str, stale_timeout_ms: int,
@@ -110,6 +157,13 @@ class FileRepo:
                         return FileTransferInitResult(transfer, [], False, f"intent_id {field} mismatch")
                 if transfer.status == "cancelled":
                     return FileTransferInitResult(transfer, [], False, "file intent was cancelled")
+                old_request = str(rows[0]["request_id"])
+                if old_request.strip():
+                    owners = connection.execute(
+                        "SELECT file_id FROM file_transfers WHERE owner_id=? AND request_id=? LIMIT 2",
+                        (user_id, old_request)).fetchall()
+                    old_fingerprint = self.init_fingerprint(file_init) if len(owners) == 1 else b""
+                    self.remember_init_request(user_id, old_request, old_fingerprint)
                 stale = (stale_timeout_ms > 0 and self._is_uploading_status(transfer.status)
                          and now_ms - transfer.updated_at_ms > stale_timeout_ms)
                 if transfer.status != "completed":

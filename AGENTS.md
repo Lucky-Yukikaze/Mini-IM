@@ -103,7 +103,7 @@ Web 按 web/src/api、store、components、views、events、types 分职责。
 核心表按实现演进：users、devices、sessions、conversations、conversation_create_requests、
 control_write_results、conversation_members、conversation_read_history、messages、message_deliveries、
 message_read_counters、attachments、schema_migrations、
-file_transfers、file_cancellations、sync_events、sync_cursors、sync_applied_cursors。
+file_transfers、file_init_requests、file_cancellations、sync_events、sync_cursors、sync_applied_cursors。
 
 ## 已读、撤回与焚毁
 
@@ -129,6 +129,9 @@ file_transfers、file_cancellations、sync_events、sync_cursors、sync_applied_
 - FileInit、FileFinish、FileCancel 负责控制；FileUpdated 带单调版本和更新时间，旧版本不能覆盖新状态。
 - client_file_id 是发送意图 ID；断线或进程重启后继续原任务，不自动改成新上传。
   复用意图时校验大小、摘要、方向及引用一致性。
+- 初始化请求身份与文件任务共同保存，同一请求 ID 不能换文件意图、上传元数据或下载来源。
+  续传偏移与调度优先级可变化；下载服务补齐的元数据不改变请求身份，初始化仍返回最新恢复状态。
+  已接受的旧初始化请求 ID 不能因后续换请求续传而重新分配给其他操作。
 - 文件流与控制流独立仍需应用层调度；按发送进度分批读取，限制未完成发送数据。
 - priority 只影响传输调度，不改变业务权限、状态与一致性。
 - 同一上传意图同时只允许一个初始化连接的一条文件流写入；流起始偏移必须等于获准续传位置。

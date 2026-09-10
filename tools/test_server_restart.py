@@ -562,6 +562,41 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(2, self.scalar("SELECT COUNT(*) FROM sync_events WHERE event_type='read_count_updated'"))
         await self.check_sync()
 
+    async def init_identity_crash(self, point):
+        self.restart_all_clients = True
+        payload = b"persistent initialization request" * 4096
+        source = self.root / "init-identity.bin"
+        source.write_bytes(payload)
+        before = self.scalar("SELECT COUNT(*) FROM sync_events")
+        await self.server.arm(point, "file_init")
+        await self.alice.command("upload", conversation=self.conversation, path=str(source))
+        checkpoint = await self.kill_at_checkpoint()
+        committed = point == "before-ack"
+        self.assertEqual(int(committed), self.scalar("SELECT COUNT(*) FROM file_transfers"))
+        bindings = self.rows("SELECT * FROM file_init_requests")
+        self.assertEqual(int(committed), len(bindings))
+        self.assertEqual(before + (2 if committed else 0), self.scalar("SELECT COUNT(*) FROM sync_events"))
+        await self.start_server()
+        await self.alice.wait("file-tasks", lambda data: not data["items"], since=0, timeout=20)
+        await self.assert_replayed("file_init", checkpoint["requestId"])
+        after = self.rows("SELECT * FROM file_init_requests")
+        self.assertEqual(1, len(after))
+        self.assertEqual(checkpoint["requestId"], after[0]["request_id"])
+        if committed:
+            self.assertEqual(bindings, after)
+        self.assertEqual(1, self.scalar("SELECT COUNT(*) FROM file_transfers"))
+        self.assertEqual("completed", self.scalar("SELECT status FROM file_transfers"))
+        stored = self.data / "storage/files" / self.scalar("SELECT storage_path FROM file_transfers")
+        self.assertEqual(payload, stored.read_bytes())
+        self.assertEqual(1, self.scalar("SELECT COUNT(*) FROM messages"))
+        await self.check_sync()
+
+    async def test_init_identity_rolls_back_before_joint_crash(self):
+        await self.init_identity_crash("before-commit")
+
+    async def test_init_identity_commit_survives_joint_crash(self):
+        await self.init_identity_crash("before-ack")
+
     async def test_joint_crash_message_before_commit(self):
         self.restart_all_clients = True
         await self.test_message_uncommitted_transaction_is_rolled_back()

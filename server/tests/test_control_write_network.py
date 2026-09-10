@@ -563,6 +563,50 @@ class ControlWriteNetworkTest(unittest.IsolatedAsyncioTestCase):
             while not predicate():
                 await asyncio.sleep(0.01)
 
+    async def test_init_request_conflicts_after_reopen_and_resumes_latest_bytes(self):
+        payload = b"persistent init identity"
+        request = self.shared_upload_request(payload)
+        async with self.peer(with_protocol=True) as (reader, send, protocol):
+            updated = await self.initialize_upload(reader, send, request, "reserved-init")
+            writer = await self.upload_stream(protocol, updated.file_id, 0, payload[:8])
+            await self.until(lambda: self.files.get_transfer_by_file_id(updated.file_id).received_bytes == 8)
+            send("reserved-init", file_finish=file_pb2.FileFinish(file_id=updated.file_id, success=True))
+            self.assertEqual(409, (await self.read(reader, "reserved-init", "ack")).ack.code)
+        self.server.close(); await asyncio.sleep(0.05); self.db.close(); await self.start_server()
+        async with self.peer(device="second-device", with_protocol=True) as (reader, send, protocol):
+            message = message_pb2.SendMessage(conversation_id=self.conversation, client_msg_id="conflict",
+                type=common_pb2.MSG_TEXT, content=b"must not write")
+            send("reserved-init", send_message=message)
+            self.assertEqual(409, (await self.read(reader, "reserved-init", "ack")).ack.code)
+            changed = file_pb2.FileInit(); changed.CopyFrom(request); changed.client_file_id = "changed-intent"
+            send("reserved-init", file_init=changed)
+            self.assertEqual(409, (await self.read(reader, "reserved-init", "ack")).ack.code)
+            request.resume_offset = 8; request.priority = 4
+            resumed = await self.initialize_upload(reader, send, request, "reserved-init")
+            self.assertEqual((updated.file_id, 8), (resumed.file_id, resumed.transferred_bytes))
+            writer = await self.upload_stream(protocol, updated.file_id, 8, payload[8:]); writer.write_eof()
+            await self.until(lambda: self.files.get_transfer_by_file_id(updated.file_id).received_bytes == len(payload))
+            send("finish-original", file_finish=file_pb2.FileFinish(file_id=updated.file_id, success=True))
+            self.assertTrue((await self.read(reader, "finish-original", "ack")).ack.success)
+            self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+            self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM file_transfers")[0])
+            self.assertEqual(payload, self.files.get_storage_path(updated.file_id).read_bytes())
+
+    async def test_init_identity_insert_error_rolls_back_and_retries_over_network(self):
+        self.db.execute_write("CREATE TRIGGER fail_init_identity BEFORE INSERT ON file_init_requests "
+                              "BEGIN SELECT RAISE(ABORT,'identity failure'); END")
+        async with self.peer() as (reader, send):
+            request = self.shared_upload_request(b"retry initialization")
+            before = self.event_count()
+            send("retry-init", file_init=request)
+            self.assertEqual(503, (await self.read(reader, "retry-init", "error")).error.code)
+            self.assertEqual(0, self.db.execute_fetchone("SELECT COUNT(*) FROM file_transfers")[0])
+            self.assertEqual(0, self.db.execute_fetchone("SELECT COUNT(*) FROM file_init_requests")[0])
+            self.assertEqual(before, self.event_count())
+            self.db.execute_write("DROP TRIGGER fail_init_identity")
+            await self.initialize_upload(reader, send, request, "retry-init")
+            self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM file_init_requests")[0])
+
     async def initialize_upload(self, reader, send, request, request_id="init"):
         send(request_id, file_init=request)
         ack = (await self.read(reader, request_id, "ack")).ack

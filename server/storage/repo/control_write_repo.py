@@ -48,6 +48,11 @@ class ControlWriteRepo:
                         return self.reject(request_id, 409, "request id already belongs to a different write")
                     ack = message_pb2.Ack.FromString(bytes(previous["ack"]))
                     return ControlWriteResult(ack, [])
+                if (connection.execute("SELECT 1 FROM file_init_requests WHERE user_id=? AND request_id=?",
+                                       (user_id, request_id)).fetchone()
+                        or connection.execute("SELECT 1 FROM file_transfers WHERE owner_id=? AND request_id=?",
+                                              (user_id, request_id)).fetchone()):
+                    return self.reject(request_id, 409, "request id already belongs to a file initialization")
                 legacy = connection.execute(
                     "SELECT intent_fingerprint FROM messages WHERE sender_id=? AND request_id=?",
                     (user_id, request_id)).fetchall()

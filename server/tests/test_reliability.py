@@ -81,6 +81,88 @@ class ReliabilityTest(unittest.TestCase):
         self.m_files.append_file_chunk("u-alice", result.ack.entity_id, payload)
         return result
 
+    def test_file_init_request_cannot_switch_intent_or_message_operation(self):
+        initialized = self._upload()
+        finish = file_pb2.FileFinish(file_id=initialized.ack.entity_id, success=True)
+        self.assertEqual(409, self.m_files.handle_file_finish("u-alice", "file-init", finish).ack.code)
+        request = file_pb2.FileInit(conversation_id=self.m_conversation_id, client_file_id="different-intent",
+            file_name="test.bin", file_size=17, sha256=hashlib.sha256(b"atomic completion").hexdigest(),
+            direction=common_pb2.FILE_DIRECTION_UPLOAD)
+        conflict = self.m_files.handle_file_init("u-alice", "file-init", request)
+        self.assertEqual(409, conflict.ack.code)
+        message = message_pb2.SendMessage(conversation_id=self.m_conversation_id, client_msg_id="new-message",
+            type=common_pb2.MSG_TEXT, content=b"do not create")
+        self.assertEqual(409, self.m_messages.handle_send_message("u-alice", "file-init", message).ack.code)
+        self.assertTrue(self.m_messages.handle_send_message("u-alice", "message-owned", message).ack.success)
+        self.assertEqual(409, self.m_files.handle_file_init("u-alice", "message-owned", request).ack.code)
+        self.assertEqual(1, self.m_db.execute_fetchone("SELECT COUNT(*) FROM file_transfers")[0])
+        self.assertEqual(initialized.ack.entity_id, self.m_db.execute_fetchone("SELECT file_id FROM file_transfers")[0])
+
+    def test_init_request_binding_survives_reopen_and_allows_current_progress(self):
+        initialized = self._upload()
+        payload = b"atomic completion"
+        request = file_pb2.FileInit(conversation_id=self.m_conversation_id, client_file_id="intent",
+            file_name="test.bin", file_size=len(payload), sha256=hashlib.sha256(payload).hexdigest(),
+            direction=common_pb2.FILE_DIRECTION_UPLOAD, resume_offset=3, priority=5)
+        self.m_db.close(); init_db(self.m_db_path)
+        self.m_db = MiniImSqliteDb(self.m_db_path); self._build_services()
+        resumed = self.m_files.handle_file_init("u-alice", "file-init", request)
+        self.assertTrue(resumed.ack.success)
+        self.assertEqual(initialized.ack.entity_id, resumed.ack.entity_id)
+        self.assertEqual(len(payload), resumed.file_updated.transferred_bytes)
+        request.file_name = "changed.bin"
+        self.assertEqual(409, self.m_files.handle_file_init("u-alice", "file-init", request).ack.code)
+
+    def test_legacy_init_request_is_protected_and_new_alias_retains_old_binding(self):
+        self._upload()
+        self.m_db.execute_write("DROP TABLE file_init_requests")
+        self.m_db.close(); init_db(self.m_db_path)
+        self.m_db = MiniImSqliteDb(self.m_db_path); self._build_services()
+        request = file_pb2.FileInit(conversation_id=self.m_conversation_id, client_file_id="intent",
+            file_name="test.bin", file_size=17, sha256=hashlib.sha256(b"atomic completion").hexdigest(),
+            direction=common_pb2.FILE_DIRECTION_UPLOAD)
+        # The first post-upgrade resume already uses a new request; the old ID must remain protected.
+        request.priority = 3
+        self.assertTrue(self.m_files.handle_file_init("u-alice", "replacement-init", request).ack.success)
+        self.assertEqual("replacement-init", self.m_db.execute_fetchone("SELECT request_id FROM file_transfers")[0])
+        self.assertEqual(2, self.m_db.execute_fetchone("SELECT COUNT(*) FROM file_init_requests")[0])
+        self.m_db.close(); init_db(self.m_db_path)
+        self.m_db = MiniImSqliteDb(self.m_db_path); self._build_services()
+        request.client_file_id = "another-intent"
+        self.assertEqual(409, self.m_files.handle_file_init("u-alice", "file-init", request).ack.code)
+
+    def test_download_init_identity_allows_metadata_and_offset_refresh(self):
+        upload = self._upload()
+        self.assertTrue(self.m_files.handle_file_finish("u-alice", "finish-upload",
+            file_pb2.FileFinish(file_id=upload.ack.entity_id, success=True)).ack.success)
+        request = file_pb2.FileInit(client_file_id="download", direction=common_pb2.FILE_DIRECTION_DOWNLOAD,
+                                   source_file_id=upload.ack.entity_id)
+        first = self.m_files.handle_file_init("u-bob", "download-init", request)
+        self.assertTrue(first.ack.success)
+        request.conversation_id = self.m_conversation_id
+        request.file_name = "local destination.bin"
+        request.file_size = first.file_updated.file_size
+        request.sha256 = first.file_updated.sha256
+        request.resume_offset = 3
+        request.priority = 9
+        resumed = self.m_files.handle_file_init("u-bob", "download-init", request)
+        self.assertTrue(resumed.ack.success)
+        self.assertEqual(first.ack.entity_id, resumed.ack.entity_id)
+        self.assertEqual(3, resumed.download_offset)
+        request.source_file_id = "other-source"
+        self.assertEqual(409, self.m_files.handle_file_init("u-bob", "download-init", request).ack.code)
+
+    def test_init_binding_write_failure_rolls_back_transfer_and_events(self):
+        self.m_db.execute_write("CREATE TRIGGER fail_init_identity BEFORE INSERT ON file_init_requests "
+                                "BEGIN SELECT RAISE(ABORT,'init identity failure'); END")
+        before = self.m_db.execute_fetchone("SELECT COUNT(*) FROM sync_events")[0]
+        with self.assertRaises(Exception):
+            self._upload()
+        self.assertEqual(0, self.m_db.execute_fetchone("SELECT COUNT(*) FROM file_transfers")[0])
+        self.assertEqual(before, self.m_db.execute_fetchone("SELECT COUNT(*) FROM sync_events")[0])
+        self.m_db.execute_write("DROP TRIGGER fail_init_identity")
+        self.assertTrue(self._upload().ack.success)
+
     def _replayed_message(self, user_id, message_id):
         response, _ = self.m_sync.handle_sync_request(
             user_id, sync_pb2.SyncRequest(global_cursor=0, limit=200),

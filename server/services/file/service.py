@@ -62,6 +62,20 @@ class FileService:
         request_id: str,
         file_init: file_pb2.FileInit,
     ) -> FileServiceResult:
+        if not user_id or not request_id.strip():
+            return FileServiceResult(message_pb2.Ack(request_id=request_id, success=False, code=400,
+                message="file initialization requires user and request id"), None, [])
+        fingerprint = self.m_file_repo.init_fingerprint(file_init)
+        with self.m_file_repo.m_db.transaction():
+            if self.m_file_repo.init_request_conflict(user_id, request_id, fingerprint):
+                return FileServiceResult(message_pb2.Ack(request_id=request_id, success=False, code=409,
+                    message="request id already belongs to a different initialization or write"), None, [])
+            result = self._apply_file_init(user_id, request_id, file_init)
+            if result.ack.success:
+                self.m_file_repo.remember_init_request(user_id, request_id, fingerprint)
+            return result
+
+    def _apply_file_init(self, user_id: str, request_id: str, file_init: file_pb2.FileInit) -> FileServiceResult:
         now_ms = self._now_ms()
         ack = message_pb2.Ack(
             request_id=request_id,
@@ -229,6 +243,10 @@ class FileService:
             entity_id="",
             server_time_ms=now_ms,
         )
+        if self.m_file_repo.owns_init_request(user_id, request_id):
+            ack.code = 409
+            ack.message = "request id already belongs to a file initialization"
+            return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
         if not file_finish.file_id.strip():
             return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
 

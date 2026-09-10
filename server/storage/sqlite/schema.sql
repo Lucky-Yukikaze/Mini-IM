@@ -8,6 +8,13 @@ CREATE TABLE IF NOT EXISTS users (
   created_at_ms INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS file_init_requests (
+  user_id TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  fingerprint BLOB NOT NULL,
+  PRIMARY KEY (user_id, request_id)
+);
+
 CREATE TABLE IF NOT EXISTS control_write_results (
   user_id TEXT NOT NULL,
   request_id TEXT NOT NULL,
@@ -225,6 +232,8 @@ CREATE TABLE IF NOT EXISTS conversation_read_history (
   FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id),
   FOREIGN KEY (user_id) REFERENCES users(user_id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_file_transfers_owner_request ON file_transfers(owner_id, request_id);
 
 CREATE TABLE IF NOT EXISTS schema_migrations (
   name TEXT PRIMARY KEY,
