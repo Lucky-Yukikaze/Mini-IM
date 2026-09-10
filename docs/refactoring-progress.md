@@ -27,9 +27,10 @@ Qt 收件确认持久重试与送达展示已提交为 `85c2853`。
 跨端成员已读计数与旧缓存纠正已提交为 `1925a8c`。
 真实桌面文件传输与恢复已提交为 `df99559`。
 焚毁计时跨进程恢复已提交为 `751999b`。
-最新验收批次为 [客户端与服务共同退出恢复](#客户端与服务共同退出恢复--2026-09-10)：
-新增消息、文件与控制操作在两个客户端和服务共同退出后从原缓存恢复的检查；
-27 项完整独立服务宕机检查通过，包含 10 项共同退出场景；持久队列身份与最终缓存均已核对。整体恢复与工程保障继续进行。
+客户端与服务共同退出恢复已提交为 `8078fbe`。
+最新实现批次为 [消息意图内容一致性](#消息意图内容一致性--2026-09-10)：
+修复同消息意图内容冲突误报成功，保存摘要并兼容仍有正文的旧库；
+124 项服务端、4 项原生消息专项和 5 项独立服务恢复专项通过。整体恢复与工程保障继续进行。
 历史结果按批次保留；当前缺口见 [下一步与未验证项](#下一步与未验证项)，文档整理记录位于文末。
 
 阶段须满足整体验收条件才可标记完成。
@@ -1138,6 +1139,49 @@ Python 使用 `PYTHONPATH=tmp/architecture-review-deps`，桌面加载本机 `we
 取消与收件确认的共同退出、桌面并发与桌面/服务共同终止、已发布文件损坏恢复和清理、
 统一业务写入口、依赖脚本、空目录构建及性能仍待完成。阶段验收后独立提交，整体重构保持进行中。
 
+## 消息意图内容一致性 · 2026-09-10
+
+[消息服务](../server/services/message/service.py) 原先按会话、用户与 `client_msg_id` 找到已有消息后直接成功，
+第二设备换正文、消息类型或焚毁设置仍会得到原消息的成功确认。
+本批新增 [意图摘要](../server/storage/repo/message_intent.py)，在全局焚毁开关处理前，
+对已解释业务字段计算 32 字节 SHA-256，并由 [消息仓储](../server/storage/repo/message_repo.py) 与消息、投递及同步事件共同提交。
+默认类型等价于文本；关闭模式不比较无效时长，系统消息不比较忽略的焚毁设置；未知协议字段不影响已解释业务身份。
+冲突返回 409，不改已有实体、不增加消息或事件；原请求重放仍返回原消息 ID。
+正文焚毁清理后保留摘要，不通过重试恢复正文；全局开关变化不改变新记录的请求身份。
+
+[数据库初始化](../server/storage/sqlite/init_db.py) 将新增列与旧记录回填共同提交；失败回滚列和数据，再启动可重试。
+未清理正文的旧记录依据现存正文与有效设置回填；已经清理的旧记录保持摘要为空，复用明确返回 409，不能伪造原意图。
+旧全局开关等处理丢弃的原始参数无法恢复，回填只能表达旧库有效设置；该升级边界已写入开发指南。
+不增加另一份明文请求正文，不重置旧同步位置或事件记录。
+
+[业务回归](../server/tests/test_message_intents.py) 共 8 项，覆盖内容/类型/焚毁冲突、默认值等价、
+配置切换、正文清理后重试、旧库完整与已清理数据、升级失败回滚和消息写入失败回滚。
+首轮 7 项在旧实现报告 6 个断言失败与 3 个错误（子场景分别计数），明确暴露冲突误报成功及缺少摘要列；
+初步实现后 7 项通过，追加迁移失败回滚及跨端场景后执行下述正式验收。
+[真实 QUIC 回归](../server/tests/test_control_write_network.py) 从第二设备提交冲突并重开服务和数据库后重复，
+核对 409、原请求成功及消息/事件无增量；该网络重开是同进程测试，不替代独立进程恢复检查。
+[原生专项](../tools/test_native_flow.py) 使用第二个 Alice 设备，核对冲突失败、客户端被终止后原队列恢复、
+显式重试仍为原请求且保持失败、服务正文仍为最初内容。
+
+环境：2026-09-10，Windows、Python 3.14.3、aioquic 1.3.0、protobuf 6.33.6；
+使用 `PYTHONPATH=tmp/architecture-review-deps`，Qt 6.11.0 `msvc2022_64` 原生驱动沿用已构建版本，客户端核心未变。
+命令说明见 [开发指南](development.md#消息发送与恢复)。
+
+| 本批命令 | 结果与范围 |
+| --- | --- |
+| `python -m unittest discover server/tests -v` | 124 项通过，13.179 秒；8 项新业务测试及 1 项新网络测试，既有服务回归全部通过 |
+| `python tools/test_native_flow.py --test test_second_device_message_intent_conflict_is_durable --test test_message_outbox_restarts_after_committed_but_missing_ack --test test_message_outbox_restarts_before_server_commit --test test_message_receipt_recall_and_offline_sync` | 4 项通过，1.924 秒；跨设备冲突及原生确认/重试/离线恢复 |
+| `python tools/test_server_restart.py --test test_joint_crash_message_before_commit --test test_joint_crash_message_after_commit --test test_burn_scan_commit_survives_lost_push --test test_joint_crash_completion_before_commit --test test_joint_crash_completion_after_commit` | 5 项通过，30.947 秒；消息和文件提交前后共同退出、焚毁与服务重启 |
+
+日志 `tmp/message-intent-before.log`、`tmp/message-intent-after.log`、`tmp/message-intent-server.log`、
+`tmp/message-intent-native.log` 和 `tmp/message-intent-crash.log`；证据目录
+`tmp/native-integration/20260910-163206/` 与 `tmp/server-restart/20260910-163219/`，均被 Git 忽略。
+5 项独立进程检查共启动 11 个服务进程，6 次强制终止和 5 次正常退出，退出码符合预期；两组隔离目录已清理。
+文档检查：7 份 Markdown 的 UTF-8、280 个内部链接、15 段 PowerShell 示例与 7 个 CMake 目标通过；
+`git diff --check` 通过。
+未修改 Qt 核心、页面或协议，不重跑页面/桌面/完整原生及完整 27 项宕机检查；只报告本批实际范围。
+本模块验收后独立提交；消息请求 ID 跨意图/跨操作约束、统一写入口、剩余恢复和工程保障继续待完成。
+
 ## 下一步与未验证项
 
 按当前依赖顺序推进，完成后同时更新阶段摘要与相应验证批次：
@@ -1149,8 +1193,9 @@ Python 使用 `PYTHONPATH=tmp/architecture-review-deps`，桌面加载本机 `we
 | 完成工程保障 | 统一环境及依赖脚本，把类型检查、构建、协议拆包和跨端测试纳入自动验证；落实完整业务事务的统一写入入口 | 空目录构建，数据升级，聊天与文件并行传输的延迟及资源测量 |
 
 服务端写队列虽已启动，业务仓储仍直接操作连接。
-2026-09-10 核对 [消息服务](../server/services/message/service.py) 发现：同会话、同用户复用 `client_msg_id` 时，
-当前分支直接返回已有消息成功结果，未核对本次正文、类型或焚毁设置；需补充跨设备冲突回归并修复意图内容校验。
+消息意图内容校验已修复，见 [对应批次](#消息意图内容一致性--2026-09-10)。
+消息 `request_id` 与其他控制写入的统一持久结果约束仍需核对：本批只证明同消息意图的内容一致性，
+不证明同请求 ID 改用新消息意图或跨操作复用已被统一拒绝。
 客户端哈希计算及发布目标文件仍同步执行，服务端上传写盘和业务事务仍在事件循环中执行；
 后续结合真实并发测量处理延迟。当前缓存读取全部已保存消息，消息数量增加后的启动成本仍需测量。
 文件调度测试不覆盖以上事项，客户端与工程保障阶段继续保持未完成。

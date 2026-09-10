@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from protocol.pb import message_pb2
 from storage.repo.sync_event import AppendSyncEvents, StoredSyncEvent
+from storage.repo.message_intent import MessageIntentFingerprint
 from storage.sqlite.db import MiniImSqliteDb
 
 
@@ -63,6 +64,10 @@ class MessageRepo:
             return None
         return self._row_to_message(row)
 
+    def get_intent_fingerprint(self, message_id: str) -> bytes | None:
+        row = self.m_db.execute_fetchone("SELECT intent_fingerprint FROM messages WHERE server_msg_id=?", (message_id,))
+        return bytes(row["intent_fingerprint"]) if row and row["intent_fingerprint"] is not None else None
+
     def get_message_by_id(self, conversation_id: str, message_id: str) -> message_pb2.Message | None:
         row = self.m_db.execute_fetchone(
             """
@@ -96,6 +101,7 @@ class MessageRepo:
         sender_id: str,
         send_message: message_pb2.SendMessage,
         member_ids: list[str],
+        intent_fingerprint: bytes | None = None,
     ) -> StoredMessage:
         now_ms = self._now_ms()
         message_id = str(uuid.uuid4())
@@ -125,8 +131,9 @@ class MessageRepo:
                   created_at_ms,
                   recalled,
                   burn_mode,
-                  burn_ttl_sec
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                  burn_ttl_sec,
+                  intent_fingerprint
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
                 """,
                 (
                     message_id,
@@ -140,6 +147,7 @@ class MessageRepo:
                     now_ms,
                     burn_mode,
                     burn_ttl_sec,
+                    intent_fingerprint if intent_fingerprint is not None else MessageIntentFingerprint(send_message),
                 ),
             )
 

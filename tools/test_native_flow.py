@@ -1143,6 +1143,32 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         )[0])
         return recorded[0]["requestId"]
 
+    async def test_second_device_message_intent_conflict_is_durable(self):
+        mark = await self.alice.command("message", conversation=self.conversation, intent="shared-message", text="original")
+        await self.bob.wait("message", lambda item: item["clientMsgId"] == "shared-message")
+        await self.alice.wait("message-sends", lambda item: not item["items"], since=mark)
+        cache_root = self.root / "state-alice-conflict"
+        second = await NativeClient.start(self.driver_path, self.output_dir / "intent-second.log", cache_root)
+        self.clients.append(second)
+        await second.connect(self.endpoint, "alice", "device-alice-conflict")
+        mark = await second.command("message", conversation=self.conversation, intent="shared-message", text="different")
+        failed = await second.wait("message-sends", lambda data: any(item["code"] == 409 for item in data["items"]), since=mark)
+        pending = next(item for item in failed["items"] if item["code"] == 409)
+        self.assertEqual("failed", pending["status"])
+        self.assertEqual("different", pending["text"])
+        await second.crash()
+        restored = await NativeClient.start(self.driver_path, self.output_dir / "intent-restored.log", cache_root)
+        self.clients.append(restored)
+        initial = await restored.connect(self.endpoint, "alice", "device-alice-conflict")
+        self.assertEqual(pending["requestId"], initial["messageSends"][0]["requestId"])
+        mark = await restored.command("retry-message", conversation=self.conversation, intent="shared-message")
+        await restored.wait("message-sends", lambda data: any(item["code"] == 409 for item in data["items"]), since=mark)
+        self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+        self.assertEqual(b"original", self.db.execute_fetchone("SELECT content FROM messages")[0])
+        attempts = [item for item in self.message_attempts if item["requestId"] == pending["requestId"]]
+        self.assertEqual(2, len(attempts))
+        self.assertEqual(1, len({item["body"] for item in attempts}))
+
     async def test_message_outbox_restarts_after_committed_but_missing_ack(self):
         self.drop_message_ack_count = 1
         mark = await self.alice.command("message", conversation=self.conversation, intent="ack-lost", text="write once")

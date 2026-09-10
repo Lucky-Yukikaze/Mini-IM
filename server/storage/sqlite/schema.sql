@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS messages (
   recalled INTEGER NOT NULL DEFAULT 0,
   burn_mode INTEGER NOT NULL DEFAULT 0,
   burn_ttl_sec INTEGER NOT NULL DEFAULT 0,
+  intent_fingerprint BLOB,
   content_purged_at_ms INTEGER NOT NULL DEFAULT 0,
   UNIQUE (conversation_id, sender_id, client_msg_id),
   UNIQUE (conversation_id, conversation_seq),

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from protocol.pb import common_pb2, message_pb2
 from storage.repo import ConversationRepo, MessageRepo, StoredSyncEvent
+from storage.repo.message_intent import MessageIntentFingerprint
 
 
 @dataclass
@@ -57,12 +58,19 @@ class MessageService:
             ack.message = "sender is not a conversation member"
             return SendMessageResult(ack=ack, message_push=None, sync_events=[])
 
+        fingerprint = MessageIntentFingerprint(send_message)
         existing = self.m_message_repo.get_message_by_client_msg_id(
             send_message.conversation_id,
             user_id,
             send_message.client_msg_id,
         )
         if existing is not None:
+            original = self.m_message_repo.get_intent_fingerprint(existing.message_id)
+            if original is None or original != fingerprint:
+                ack.code = 409
+                ack.message = ("original message intent unavailable after legacy content purge" if original is None
+                               else "client_msg_id reused with different message content or settings")
+                return SendMessageResult(ack=ack, message_push=None, sync_events=[])
             ack.success = True
             ack.code = 0
             ack.message = "ok(idempotent)"
@@ -104,6 +112,7 @@ class MessageService:
             sender_id=user_id,
             send_message=normalized,
             member_ids=member_ids,
+            intent_fingerprint=fingerprint,
         )
 
         message_push = message_pb2.MessagePush(

@@ -158,6 +158,34 @@ class ControlWriteNetworkTest(unittest.IsolatedAsyncioTestCase):
             writer.close()
 
 
+    async def test_message_intent_conflict_from_second_device_survives_server_reopen(self):
+        request = message_pb2.SendMessage(conversation_id=self.conversation, client_msg_id="shared-intent",
+            type=common_pb2.MSG_TEXT, content=b"original", burn_mode=1, burn_ttl_sec=5)
+        async with self.peer() as (reader, send):
+            send("original-request", send_message=request)
+            original = (await self.read(reader, "original-request", "ack")).ack
+            self.assertTrue(original.success)
+        before = self.event_count()
+        for reopen in (False, True):
+            if reopen:
+                self.server.close()
+                await asyncio.sleep(0.05)
+                self.db.close()
+                await self.start_server()
+            async with self.peer(device="second-device") as (reader, send):
+                changed = message_pb2.SendMessage(); changed.CopyFrom(request); changed.content = b"conflicting"
+                send("conflicting-request", send_message=changed)
+                conflict = (await self.read(reader, "conflicting-request", "ack")).ack
+                self.assertFalse(conflict.success)
+                self.assertEqual(409, conflict.code)
+                send("original-retry", send_message=request)
+                replay = (await self.read(reader, "original-retry", "ack")).ack
+                self.assertTrue(replay.success)
+                self.assertEqual(original.entity_id, replay.entity_id)
+                self.assertEqual(before, self.event_count())
+                self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+                self.assertEqual(b"original", self.db.execute_fetchone("SELECT content FROM messages")[0])
+
     async def send_delivery_message(self):
         async with self.peer() as (reader, send):
             send("offline-message", send_message=message_pb2.SendMessage(
