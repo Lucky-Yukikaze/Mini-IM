@@ -123,6 +123,9 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         self.data = self.root / "server"
         self.db_path = self.data / "storage/sqlite/miniim.db"
         self.servers, self.clients = [], []
+        self.joint_crashes = []
+        self.restart_all_clients = False
+        self.clients_need_restart = False
         self.addAsyncCleanup(self.cleanup)
         await self.start_server()
         self.endpoint = f"quic://127.0.0.1:{self.server.port}"
@@ -146,6 +149,37 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         if port:
             self.assertEqual(port, self.server.port)
             self.assertNotEqual(self.servers[-2].process.pid, self.server.process.pid)
+        if self.clients_need_restart:
+            old_clients = list(self.clients)
+            self.marks = [0, 0]
+            restored = {}
+            for index, user in enumerate(("alice", "bob")):
+                client = await NativeClient.start(self.driver_path,
+                    self.output / f"{user}-restart-{len(self.servers)}.log", self.root / f"state-{user}")
+                self.clients[index] = client
+                self.assertNotEqual(old_clients[index].process.pid, client.process.pid)
+                restored[user] = await client.connect(self.endpoint, user)
+                self.assert_restored_queue_identity(user, restored[user])
+                self.joint_crashes[-1]["clients"][index]["replacementPid"] = client.process.pid
+            self.alice, self.bob = self.clients
+            self.clients_need_restart = False
+            (self.output / f"joint-initial-{len(self.servers)}.json").write_text(
+                json.dumps(restored, ensure_ascii=False), encoding="utf-8")
+            await self.check_new_sessions()
+
+    def assert_restored_queue_identity(self, user, initial):
+        cache = self.output / f"{user}-before-crash-{len(self.servers) - 1}.sqlite"
+        for table, key, columns, fields, terminal in (
+            ("message_outbox", "messageSends", "request_id,client_msg_id", ("requestId", "clientMsgId"), "'confirmed'"),
+            ("control_outbox", "controlWrites", "request_id,operation", ("requestId", "operation"), "'confirmed'"),
+            ("file_tasks", "fileTasks", "id,init_request,finish_request", ("clientFileId", "requestId", "finishRequestId"),
+             "'completed','cancelled'"),
+        ):
+            persisted = self.rows(f"SELECT {columns} FROM {table} WHERE status NOT IN ({terminal})", path=cache)
+            self.assertEqual({tuple(row.values()) for row in persisted},
+                             {tuple(item[field] for field in fields) for item in initial[key]})
+        cursor = self.rows("SELECT value FROM metadata WHERE key='cursor'", path=cache)
+        self.assertGreaterEqual(int(initial["globalCursor"]), int(cursor[0]["value"]) if cursor else 0)
 
     def rows(self, sql, params=(), path=None):
         with closing(sqlite3.connect(path or self.db_path, timeout=3)) as db:
@@ -186,9 +220,26 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         await self.server.close(kill=True)
         self.assertIsNotNone(self.server.process.returncode)
         self.assertNotEqual(0, self.server.process.returncode)
+        if self.restart_all_clients:
+            self.assertEqual(2, len(self.clients))
+            await asyncio.gather(*(client.crash() for client in self.clients))
+            record = dict(serverPid=self.server.process.pid, checkpoint=checkpoint, clients=[])
+            for user, client in zip(("alice", "bob"), self.clients):
+                self.assertNotEqual(0, client.process.returncode)
+                record["clients"].append(dict(user=user, pid=client.process.pid, exitCode=client.process.returncode))
+                (self.output / f"{user}-before-crash-{len(self.servers)}.json").write_text(
+                    json.dumps(client.events, ensure_ascii=False), encoding="utf-8")
+                cache = next((self.root / f"state-{user}").glob("*.sqlite"))
+                with closing(sqlite3.connect(cache)) as db, closing(sqlite3.connect(
+                        self.output / f"{user}-before-crash-{len(self.servers)}.sqlite")) as copy:
+                    db.backup(copy)
+            self.joint_crashes.append(record)
+            self.clients_need_restart = True
         return checkpoint
 
-    def assert_replayed(self, operation, request_id, same_body=True):
+    async def assert_replayed(self, operation, request_id, same_body=True):
+        # Client acknowledgements and server stdout are collected independently.
+        await self.server.wait("request", lambda item: item["operation"] == operation and item["requestId"] == request_id)
         attempts = [item for server in self.servers for item in server.events
                     if item["event"] == "request" and item["operation"] == operation and item["requestId"] == request_id]
         self.assertGreaterEqual(len(attempts), 2)
@@ -209,6 +260,12 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
             (self.output / f"client-{index}.json").write_text(json.dumps(client.events, ensure_ascii=False), encoding="utf-8")
             try:
                 await client.close()
+                if self.restart_all_clients:
+                    user = ("alice", "bob")[index]
+                    cache = next((self.root / f"state-{user}").glob("*.sqlite"))
+                    with closing(sqlite3.connect(cache)) as db, closing(sqlite3.connect(
+                            self.output / f"final-{user}.sqlite")) as copy:
+                        db.backup(copy)
             except Exception as error:
                 errors.append(error)
         for server in self.servers:
@@ -219,6 +276,7 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         (self.output / "lifecycle.json").write_text(json.dumps([
             dict(pid=server.process.pid, port=server.port, exitCode=server.process.returncode,
                  hardKilled=server.hard_killed) for server in self.servers], indent=2), encoding="utf-8")
+        (self.output / "joint-crashes.json").write_text(json.dumps(self.joint_crashes, indent=2), encoding="utf-8")
         if self.db_path.exists():
             with closing(sqlite3.connect(self.db_path)) as db, closing(sqlite3.connect(self.output / "final-server.sqlite")) as copy:
                 db.backup(copy)
@@ -245,7 +303,7 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
                               since=self.marks[0], timeout=18)
         await self.check_new_sessions()
         await self.check_sync()
-        self.assert_replayed("sync_applied", checkpoint["requestId"])
+        await self.assert_replayed("sync_applied", checkpoint["requestId"])
         after = self.rows("SELECT * FROM message_deliveries WHERE user_id='bob' AND server_msg_id=?", (message,))[0]
         self.assertEqual("delivered", after["status"])
         if committed:
@@ -267,7 +325,7 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         await self.start_server()
         await self.alice.wait("message-sends", lambda item: not item["items"], since=self.marks[0], timeout=18)
         await self.bob.wait("message", lambda item: item["clientMsgId"] == "committed-message", since=self.marks[1], timeout=18)
-        self.assert_replayed("send_message", checkpoint["requestId"])
+        await self.assert_replayed("send_message", checkpoint["requestId"])
         self.assertEqual(1, self.scalar("SELECT COUNT(*) FROM messages"))
         self.assertEqual(2, self.scalar("SELECT COUNT(*) FROM sync_events WHERE event_type='message'"))
         await self.check_new_sessions()
@@ -285,7 +343,7 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         await self.start_server()
         await self.alice.wait("control-writes", lambda item: not item["items"], since=self.marks[0], timeout=18)
         await self.bob.wait("conversation", lambda item: item["title"] == "after", since=self.marks[1], timeout=18)
-        self.assert_replayed("rename_conversation", checkpoint["requestId"])
+        await self.assert_replayed("rename_conversation", checkpoint["requestId"])
         self.assertEqual(before + 2, self.scalar("SELECT COUNT(*) FROM sync_events"))
         self.assertEqual(1, self.scalar("SELECT COUNT(*) FROM control_write_results WHERE request_id=?", (checkpoint["requestId"],)))
         await self.check_new_sessions()
@@ -318,7 +376,7 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, self.scalar("SELECT COUNT(*) FROM file_transfers"))
         self.assertEqual("completed", self.scalar("SELECT status FROM file_transfers"))
         self.assertEqual(1, self.scalar("SELECT COUNT(*) FROM messages"))
-        self.assert_replayed("file_init", row["request_id"])
+        await self.assert_replayed("file_init", row["request_id"])
         resumed = next(item for item in self.server.events if item["event"] == "file-init")
         self.assertEqual(row["received_bytes"], resumed["offset"])
         await self.check_new_sessions()
@@ -341,7 +399,7 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, self.scalar("SELECT COUNT(*) FROM messages"))
         await self.start_server()
         await self.alice.wait("file-tasks", lambda item: not item["items"], since=self.marks[0], timeout=20)
-        self.assert_replayed("file_finish", checkpoint["requestId"])
+        await self.assert_replayed("file_finish", checkpoint["requestId"])
         self.assertEqual("completed", self.scalar("SELECT status FROM file_transfers"))
         self.assertEqual(1, self.scalar("SELECT COUNT(*) FROM messages"))
         self.assertEqual(2, self.scalar("SELECT COUNT(*) FROM sync_events WHERE event_type='message'"))
@@ -363,7 +421,7 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("cancelled", self.scalar("SELECT status FROM file_transfers"))
         await self.start_server()
         await self.alice.wait("file-tasks", lambda item: not item["items"], since=self.marks[0], timeout=20)
-        self.assert_replayed("file_cancel", checkpoint["requestId"])
+        await self.assert_replayed("file_cancel", checkpoint["requestId"])
         self.assertEqual(0, self.scalar("SELECT COUNT(*) FROM messages"))
         self.assertEqual(1, self.scalar("SELECT COUNT(*) FROM file_cancellations"))
         await self.check_sync()
@@ -388,7 +446,7 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         await self.start_server()
         await self.bob.wait("file-tasks", lambda item: not item["items"], since=self.marks[1], timeout=20)
         self.assertEqual(payload, target.read_bytes())
-        attempts = self.assert_replayed("file_init", row["request_id"], same_body=False)
+        attempts = await self.assert_replayed("file_init", row["request_id"], same_body=False)
         bodies = [file_pb2.FileInit.FromString(bytes.fromhex(item["body"])) for item in attempts]
         for body in bodies:
             self.assertEqual((self.conversation, row["client_file_id"], file_id, 2),
@@ -412,7 +470,7 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         await self.start_server()
         await self.alice.wait("message-sends", lambda item: not item["items"], since=self.marks[0], timeout=18)
         await self.bob.wait("message", lambda item: item["clientMsgId"] == "uncommitted", since=self.marks[1], timeout=18)
-        self.assert_replayed("send_message", checkpoint["requestId"])
+        await self.assert_replayed("send_message", checkpoint["requestId"])
         self.assertEqual(1, self.scalar("SELECT COUNT(*) FROM messages"))
         self.assertEqual(before + 2, self.scalar("SELECT COUNT(*) FROM sync_events"))
         await self.check_sync()
@@ -453,7 +511,7 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         await self.bob.wait("control-writes", lambda item: not item["items"], since=self.marks[1], timeout=18)
         await self.alice.wait("update", lambda item: item["type"] == "receipt" and item["readerId"] == "bob",
                               since=self.marks[0], timeout=18)
-        self.assert_replayed("receipt", checkpoint["requestId"])
+        await self.assert_replayed("receipt", checkpoint["requestId"])
         self.assertEqual(2, self.scalar("SELECT COUNT(*) FROM sync_events WHERE event_type='receipt'"))
         await self.alice.wait("update", lambda item: item["type"] == "readCount" and
             item["messageId"] == message["id"] and item["unreadCount"] == 0, since=self.marks[0])
@@ -467,7 +525,7 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         await self.alice.wait("control-writes", lambda item: not item["items"], since=self.marks[0], timeout=18)
         await self.bob.wait("update", lambda item: item["type"] == "recall" and item["messageId"] == message["id"],
                             since=self.marks[1], timeout=18)
-        self.assert_replayed("recall", checkpoint["requestId"])
+        await self.assert_replayed("recall", checkpoint["requestId"])
         self.assertEqual(2, self.scalar("SELECT COUNT(*) FROM sync_events WHERE event_type='recall'"))
         await self.check_sync()
         for user in ("alice", "bob"):
@@ -494,9 +552,49 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         await self.start_server()
         await self.alice.wait("update", lambda item: item["type"] == "readCount" and
             item["messageId"] == message["id"] and item["unreadCount"] == 0, since=self.marks[0], timeout=18)
-        self.assert_replayed("receipt", checkpoint["requestId"])
+        await self.assert_replayed("receipt", checkpoint["requestId"])
         self.assertEqual(2, self.scalar("SELECT COUNT(*) FROM sync_events WHERE event_type='read_count_updated'"))
         await self.check_sync()
+
+    async def test_joint_crash_message_before_commit(self):
+        self.restart_all_clients = True
+        await self.test_message_uncommitted_transaction_is_rolled_back()
+
+    async def test_joint_crash_message_after_commit(self):
+        self.restart_all_clients = True
+        await self.test_message_commit_survives_crash_before_ack_and_push()
+
+    async def test_joint_crash_upload_uncommitted_tail(self):
+        self.restart_all_clients = True
+        await self.test_upload_uncommitted_disk_tail_is_not_counted_after_crash()
+
+    async def test_joint_crash_upload_committed_progress(self):
+        self.restart_all_clients = True
+        await self.test_upload_committed_progress_resumes_after_crash()
+
+    async def test_joint_crash_partial_download(self):
+        self.restart_all_clients = True
+        await self.test_partial_download_survives_server_process_restart()
+
+    async def test_joint_crash_completion_before_commit(self):
+        self.restart_all_clients = True
+        await self.test_file_completion_transaction_rolls_back_and_retries()
+
+    async def test_joint_crash_completion_after_commit(self):
+        self.restart_all_clients = True
+        await self.test_file_completion_commit_survives_lost_confirmation()
+
+    async def test_joint_crash_control_before_commit(self):
+        self.restart_all_clients = True
+        await self.test_control_transaction_rolls_back_after_process_kill()
+
+    async def test_joint_crash_control_after_commit(self):
+        self.restart_all_clients = True
+        await self.test_control_commit_and_result_survive_lost_ack()
+
+    async def test_joint_crash_receipt_and_recall(self):
+        self.restart_all_clients = True
+        await self.test_receipt_and_recall_commits_survive_lost_confirmations()
 
     def burn_delivery(self, message, user):
         return self.rows("SELECT * FROM message_deliveries WHERE server_msg_id=? AND user_id=?",
