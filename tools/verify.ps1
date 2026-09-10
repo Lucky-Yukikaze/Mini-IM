@@ -3,7 +3,7 @@ param(
     [string]$QtRoot = $env:QT_DIR,
     [string]$VcpkgRoot = $env:VCPKG_ROOT,
     [string]$VenvPath = '.venv',
-    [string]$BuildDirectory = 'build/client',
+    [string]$BuildDirectory = 'build/client-manifest',
     [switch]$Integration
 )
 $ErrorActionPreference = 'Stop'
@@ -15,6 +15,7 @@ Push-Location $MiniImRoot
 try {
     Invoke-MiniImCommand $interpreter @('-m', 'unittest', 'discover', 'server/tests', '-v')
     Invoke-MiniImCommand 'npm.cmd' @('--prefix', 'web', 'test')
+    Invoke-MiniImCommand $interpreter @('tools/test_desktop_fixture.py')
     & (Join-Path $PSScriptRoot 'test_dev_scripts.ps1') -VenvPath $VenvPath
     if ($Integration) {
         $driver = Join-Path (Get-MiniImPath $BuildDirectory) 'Release/mini_im_native_driver.exe'

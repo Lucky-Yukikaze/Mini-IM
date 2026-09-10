@@ -203,13 +203,18 @@ class DesktopFixture:
             self.client_log.close()
 
     def snapshot(self):
-        artifacts = {}
+        artifacts, artifact_errors = {}, {}
         for path in (self.root / "desktop files").glob("*"):
             if path.is_file():
-                content = path.read_bytes()
+                try:
+                    content = path.read_bytes()
+                except (FileNotFoundError, PermissionError) as error:
+                    # Qt may hold or rename its publication file during a snapshot.
+                    artifact_errors[path.name] = type(error).__name__
+                    continue
                 artifacts[path.name] = dict(size=len(content), sha256=hashlib.sha256(content).hexdigest())
         state = dict(attempts=self.attempts, fileCancelAttempts=self.file_cancel_attempts,
-            fileAttempts=self.file_attempts, clientExits=self.client_exits, artifacts=artifacts,
+            fileAttempts=self.file_attempts, clientExits=self.client_exits, artifacts=artifacts, artifactErrors=artifact_errors,
             transfers=[dict(row) for row in self.db.execute_fetchall("SELECT * FROM file_transfers")],
             fileTasks={},
             cancellations=[dict(row) for row in self.db.execute_fetchall("SELECT * FROM file_cancellations")],
@@ -341,7 +346,7 @@ async def run(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--client", type=Path, default=ROOT / "build/client_qt611/Release/mini_im_client.exe")
+    parser.add_argument("--client", type=Path, default=ROOT / "build/client-manifest/Release/mini_im_client.exe")
     parser.add_argument("--qt-root", type=Path, required=True, help="Qt kit directory containing plugins/platforms")
     parser.add_argument("--output", type=Path, default=ROOT / "tmp/desktop-integration")
     parser.add_argument("--timeout", type=int, default=900, help="maximum fixture lifetime in seconds")

@@ -1,6 +1,7 @@
 # Local dependencies and build outputs
 /thirdparty_install/
 /build/
+/client/vcpkg_installed/
 /web/node_modules/
 /web/dist/
 /.venv/

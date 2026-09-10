@@ -2003,7 +2003,7 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--client", type=Path, default=ROOT / "build/client_qt611/Release/mini_im_native_driver.exe")
+    parser.add_argument("--client", type=Path, default=ROOT / "build/client-manifest/Release/mini_im_native_driver.exe")
     parser.add_argument("--output", type=Path, default=ROOT / "tmp/native-integration")
     parser.add_argument("--test", action="append", help="run one named test method; may be repeated")
     args = parser.parse_args()

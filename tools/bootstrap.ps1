@@ -3,7 +3,7 @@ param(
     [string]$QtRoot = $env:QT_DIR,
     [string]$VcpkgRoot = $env:VCPKG_ROOT,
     [string]$VenvPath = '.venv',
-    [string]$BuildDirectory = 'build/client',
+    [string]$BuildDirectory = 'build/client-manifest',
     [string]$Python = 'python',
     [switch]$SkipInstall
 )
@@ -27,7 +27,10 @@ Invoke-MiniImCommand 'npm.cmd' @('--prefix', (Join-Path $MiniImRoot 'web'), 'run
 if (-not $VcpkgRoot) { $VcpkgRoot = 'thirdparty_install/vcpkg' }
 $toolchain = Join-Path (Get-MiniImPath $VcpkgRoot) 'scripts/buildsystems/vcpkg.cmake'
 Invoke-MiniImCommand 'cmake' @('-S', (Join-Path $MiniImRoot 'client'), '-B', $build, '-G', 'Visual Studio 17 2022', '-A', 'x64',
-    "-DCMAKE_TOOLCHAIN_FILE=$toolchain", '-DVCPKG_TARGET_TRIPLET=x64-windows', "-DCMAKE_PREFIX_PATH=$(Get-MiniImPath $QtRoot)", '-DBUILD_TESTING=ON')
+    "-DCMAKE_TOOLCHAIN_FILE=$toolchain", '-DVCPKG_TARGET_TRIPLET=x64-windows',
+    '-DVCPKG_MANIFEST_MODE=ON', '-DVCPKG_MANIFEST_INSTALL=ON',
+    "-DVCPKG_MANIFEST_DIR=$(Join-Path $MiniImRoot 'client')", "-DVCPKG_INSTALLED_DIR=$(Join-Path $build 'vcpkg_installed')",
+    "-DCMAKE_PREFIX_PATH=$(Get-MiniImPath $QtRoot)", '-DBUILD_TESTING=ON')
 Invoke-MiniImCommand 'cmake' @('--build', $build, '--config', 'Release')
 $release = Join-Path $build 'Release'
 $instance = Select-String -LiteralPath (Join-Path $build 'CMakeCache.txt') -Pattern '^CMAKE_GENERATOR_INSTANCE:INTERNAL=(.+)$'

@@ -25,7 +25,9 @@ Web 依赖由 [package.json](../web/package.json) 声明、[package-lock.json](.
 更新依赖时一并提交声明和锁文件；使用 `npm --prefix ./web audit` 检查当前已知告警，
 再用 `npm --prefix ./web ci`、类型检查、页面测试、打包与受影响的桌面专项验收升级结果。
 审计结果只覆盖当次依赖及公告库，日期和结果记录在执行记录中。
-C++ 通过 vcpkg 查找 MsQuic 和 Protobuf；当前尚未固定 vcpkg 基线版本。
+C++ 依赖清单 = 由 [client/vcpkg.json](../client/vcpkg.json) 声明直接依赖及版本基线，配置时自动解析并安装所需包。
+vcpkg 基线 = 该工具源码仓库中记录整套包版本的固定提交；更新基线须重新验证客户端。
+当前清单以已验证的 MsQuic、Protobuf 组合为起点，版本及验收范围见执行记录。
 
 创建项目虚拟环境并安装 Python 与 Web 依赖：
 
@@ -35,12 +37,14 @@ python -m venv .venv
 npm --prefix ./web ci
 ~~~
 
-已有 vcpkg 工作目录时跳过克隆和引导：
+首次安装 vcpkg 时使用清单中的提交版本引导工具；已有可用 vcpkg 的工作目录可跳过以下步骤，
+清单仍按固定基线选择包。更新现有工具前检查其本地改动，不由构建脚本自动切换版本：
 
 ~~~powershell
 git clone https://github.com/microsoft/vcpkg ./thirdparty_install/vcpkg
+$dependencyManifest = Get-Content -Raw -Encoding UTF8 ./client/vcpkg.json | ConvertFrom-Json
+git -C ./thirdparty_install/vcpkg checkout --detach $dependencyManifest.'builtin-baseline'
 & ./thirdparty_install/vcpkg/bootstrap-vcpkg.bat
-& ./thirdparty_install/vcpkg/vcpkg.exe install msquic protobuf --triplet x64-windows
 ~~~
 
 依赖和 Qt 安装完成后，可使用统一入口；脚本从自身位置定位项目，参数中的相对路径均相对项目根目录。
@@ -48,16 +52,19 @@ git clone https://github.com/microsoft/vcpkg ./thirdparty_install/vcpkg
 ~~~powershell
 $env:QT_DIR = 'D:/Qt/6.11.0/msvc2022_64'
 & ./tools/check_env.ps1 -Prerequisites
-& ./tools/bootstrap.ps1 -BuildDirectory build/client
+& ./tools/bootstrap.ps1 -BuildDirectory build/client-manifest
 ~~~
 
-[环境检查](../tools/check_env.ps1) 的 `-Prerequisites` 检查系统 Python、Node/npm、CMake、Qt 模块和已安装的 C++ 包；
+[环境检查](../tools/check_env.ps1) 的 `-Prerequisites` 检查系统 Python、Node/npm、CMake、Qt 模块及可用 vcpkg 工具，无需预先安装 C++ 包；
 默认还检查 `.venv` 及协议生成依赖，`-RuntimeOnly` 仅检查服务和 Web 运行所需入口。
 缺失依赖或命令失败会抛出错误，使用 `pwsh -File` 调用时返回非零退出码。
 [安装构建入口](../tools/bootstrap.ps1) 在项目 `.venv` 安装固定 Python 直接依赖，用 `npm ci` 安装锁定 Web 依赖，
-生成协议、执行类型检查和打包，再配置 Visual Studio 2022/x64、构建 Release、部署 Qt 并执行组件测试。
+生成协议、执行类型检查和打包，再配置 Visual Studio 2022/x64，按清单安装 C++ 依赖、构建 Release、部署 Qt 并执行组件测试。
+默认构建目录为 `build/client-manifest`，依赖位于该目录的 `vcpkg_installed`，不复用工具目录中的全局安装树。
+旧构建目录若使用过非清单模式，应另选新目录；vcpkg 不支持直接切换既有目录的模式，脚本不会删除旧构建。
+网络或依赖安装失败会中止配置；已有二进制缓存可被 vcpkg 复用，不能据此宣称已验证无缓存源码安装。
 `-QtRoot` 或 `QT_DIR` 指定 Qt；`-VcpkgRoot` 或 `VCPKG_ROOT` 指定 vcpkg，默认 `thirdparty_install/vcpkg`。
-`-Python` 选择创建虚拟环境的解释器，`-VenvPath` 选择虚拟环境；`-SkipInstall` 要求依赖已经安装，不执行 pip 或 npm 安装。
+`-Python` 选择创建虚拟环境的解释器，`-VenvPath` 选择虚拟环境；`-SkipInstall` 要求 Python 与 Web 依赖已经安装，不执行 pip 或 npm 安装；CMake 仍检查并安装清单中的 C++ 依赖。
 入口不安装 Qt、Visual Studio 或 vcpkg，也不提前创建业务数据库；数据库由服务启动时初始化。
 
 ## 生成协议与构建
@@ -77,9 +84,9 @@ npm --prefix ./web run build
 ~~~powershell
 $env:QT_DIR = 'D:/Qt/6.11.0/msvc2022_64'
 $qtToolchain = Join-Path (Get-Location) 'thirdparty_install/vcpkg/scripts/buildsystems/vcpkg.cmake'
-cmake -S ./client -B ./build/client_qt611 -G "Visual Studio 17 2022" -A x64 "-DCMAKE_TOOLCHAIN_FILE=$qtToolchain" "-DVCPKG_TARGET_TRIPLET=x64-windows" "-DCMAKE_PREFIX_PATH=$env:QT_DIR" -DBUILD_TESTING=ON
-cmake --build ./build/client_qt611 --config Release --target mini_im_client mini_im_download_tests mini_im_upload_tests mini_im_state_tests mini_im_sync_tests mini_im_control_tests mini_im_native_driver
-& "$env:QT_DIR/bin/windeployqt.exe" --release --compiler-runtime --dir ./build/client_qt611/Release ./build/client_qt611/Release/mini_im_client.exe
+cmake -S ./client -B ./build/client-manifest -G "Visual Studio 17 2022" -A x64 "-DCMAKE_TOOLCHAIN_FILE=$qtToolchain" "-DVCPKG_TARGET_TRIPLET=x64-windows" "-DCMAKE_PREFIX_PATH=$env:QT_DIR" -DBUILD_TESTING=ON
+cmake --build ./build/client-manifest --config Release --target mini_im_client mini_im_download_tests mini_im_upload_tests mini_im_state_tests mini_im_sync_tests mini_im_control_tests mini_im_native_driver
+& "$env:QT_DIR/bin/windeployqt.exe" --release --compiler-runtime --dir ./build/client-manifest/Release ./build/client-manifest/Release/mini_im_client.exe
 ~~~
 
 `windeployqt` = 将 Qt 运行时和插件复制到程序目录的部署工具；
@@ -101,7 +108,7 @@ Qt 部署结果应包含 `Qt6Sql.dll` 和 `sqldrivers/qsqlite.dll`；缺少 SQLi
 默认开发入口监听 `127.0.0.1:4433`。在另一个终端启动已部署的客户端：
 
 ~~~powershell
-& ./build/client_qt611/Release/mini_im_client.exe
+& ./build/client-manifest/Release/mini_im_client.exe
 ~~~
 
 页面开发时，另开终端运行：
@@ -429,11 +436,12 @@ Qt 将明确完成拒绝保存为 `finishRejected`；用户点击重试时，在
 页面的 `build` 当前只做打包，不包含类型检查；统一验证入口会单独执行类型检查。
 
 ~~~powershell
-& ./tools/verify.ps1 -QtRoot 'D:/Qt/6.11.0/msvc2022_64' -BuildDirectory build/client
-& ./tools/verify.ps1 -QtRoot 'D:/Qt/6.11.0/msvc2022_64' -BuildDirectory build/client -Integration
+& ./tools/verify.ps1 -QtRoot 'D:/Qt/6.11.0/msvc2022_64' -BuildDirectory build/client-manifest
+& ./tools/verify.ps1 -QtRoot 'D:/Qt/6.11.0/msvc2022_64' -BuildDirectory build/client-manifest -Integration
 ~~~
 
-[统一验证](../tools/verify.ps1) 复用已有依赖，依次执行协议生成、类型检查、构建部署、组件测试、服务端与页面测试及开发脚本验收。
+[统一验证](../tools/verify.ps1) 复用已有 Python/Web 依赖，依次执行协议生成、类型检查、清单依赖检查与安装、
+构建部署、组件测试、服务端与页面测试、桌面快照回归及开发脚本验收。
 `-Integration` 继续运行真实原生网络与独立服务宕机全量，使用本次构建目录中的驱动；不会替代完整桌面交互或性能验收。
 [开发脚本验收](../tools/test_dev_scripts.ps1) 可独立运行，使用随机端口和 `tmp/dev-script-tests/` 隔离数据，
 检查路径引用、缺失环境、命令失败、重复启动、过期进程身份、停止释放端口及占用端口时的清理。
@@ -445,8 +453,8 @@ Push-Location ./web
 & ./node_modules/.bin/vue-tsc.cmd --noEmit
 npm run build
 Pop-Location
-cmake --build ./build/client_qt611 --config Release --target mini_im_client mini_im_download_tests mini_im_upload_tests mini_im_state_tests mini_im_sync_tests mini_im_control_tests mini_im_native_driver
-ctest --test-dir ./build/client_qt611 -C Release --output-on-failure
+cmake --build ./build/client-manifest --config Release --target mini_im_client mini_im_download_tests mini_im_upload_tests mini_im_state_tests mini_im_sync_tests mini_im_control_tests mini_im_native_driver
+ctest --test-dir ./build/client-manifest -C Release --output-on-failure
 ~~~
 
 服务端测试包含业务与存储入口、使用真实 aioquic 发送器与受控确认的下载调度检查，
@@ -460,7 +468,7 @@ ctest --test-dir ./build/client_qt611 -C Release --output-on-failure
 构建 `mini_im_native_driver` 后运行：
 
 ~~~powershell
-& ./.venv/Scripts/python.exe ./tools/test_native_flow.py --client ./build/client_qt611/Release/mini_im_native_driver.exe
+& ./.venv/Scripts/python.exe ./tools/test_native_flow.py --client ./build/client-manifest/Release/mini_im_native_driver.exe
 ~~~
 
 该入口通常自动启动两个使用桌面 Bridge 和原生库的 Qt 进程及临时 aioquic 服务端；多设备消息场景启动四个客户端。
@@ -495,7 +503,7 @@ ctest --test-dir ./build/client_qt611 -C Release --output-on-failure
 构建 `mini_im_native_driver` 后运行 [服务重启检查](../tools/test_server_restart.py)：
 
 ~~~powershell
-& ./.venv/Scripts/python.exe ./tools/test_server_restart.py --client ./build/client_qt611/Release/mini_im_native_driver.exe
+& ./.venv/Scripts/python.exe ./tools/test_server_restart.py --client ./build/client-manifest/Release/mini_im_native_driver.exe
 ~~~
 
 此入口先启动两个真实 Qt 原生客户端，焚毁场景另启动同用户的第二设备与新缓存设备，通过 [服务进程夹具](../tools/server_restart_fixture.py)
@@ -570,6 +578,9 @@ Playwright CLI JavaScript 入口；Playwright CLI = 通过命令行驱动浏览�
 检查须使用全新隔离环境；结果与日志保存在 `tmp/desktop-integration/<运行时间>/`，
 截图在 `output/playwright/<运行时间>/`，均被 Git 忽略。
 `ui-result.json` 的 `ok` 必须为 `true`，每个阶段和数据库断言均通过才可计为验收。
+快照中的 `artifactErrors` 记录正在被 Qt 占用或在枚举后消失的文件，暂不可读文件不生成大小或摘要证明；
+最终目标文件仍须通过实际字节校验。[快照回归](../tools/test_desktop_fixture.py) 覆盖 Windows 独占锁和文件消失，
+可用 `& ./.venv/Scripts/python.exe ./tools/test_desktop_fixture.py` 单独执行。
 文件专项使用另一个全新的夹具环境，在上述命令末尾追加 `--files-only`。
 该模式上传 2,056,192 字节的隔离文件，暂停部分内容接收后终止桌面进程，再从同一缓存登录恢复；
 下载也在临时文件已有数据时重启，并检查切换账号后的待处理任务隔离。

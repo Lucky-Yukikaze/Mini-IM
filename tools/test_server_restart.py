@@ -915,7 +915,7 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--client", type=Path, default=ROOT / "build/client_qt611/Release/mini_im_native_driver.exe")
+    parser.add_argument("--client", type=Path, default=ROOT / "build/client-manifest/Release/mini_im_native_driver.exe")
     parser.add_argument("--output", type=Path, default=ROOT / "tmp/server-restart")
     parser.add_argument("--test", action="append")
     args = parser.parse_args()

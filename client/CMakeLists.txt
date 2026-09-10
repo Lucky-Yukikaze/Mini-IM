@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.16)
 project(mini_im_client LANGUAGES CXX)
 
+if(DEFINED VCPKG_MANIFEST_MODE AND NOT VCPKG_MANIFEST_MODE)
+    message(FATAL_ERROR "Mini-IM requires vcpkg manifest mode. Configure in a new build directory; see docs/development.md.")
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)

@@ -30,9 +30,8 @@ if (-not $RuntimeOnly) {
     if (-not $VcpkgRoot) { $VcpkgRoot = 'thirdparty_install/vcpkg' }
     $VcpkgRoot = Get-MiniImPath $VcpkgRoot
     Assert-MiniImFile (Join-Path $VcpkgRoot 'scripts/buildsystems/vcpkg.cmake')
-    foreach ($package in @('msquic', 'protobuf')) {
-        Assert-MiniImFile (Join-Path $VcpkgRoot "installed/x64-windows/share/$package/$package-config.cmake")
-    }
+    Assert-MiniImFile (Join-Path $VcpkgRoot 'vcpkg.exe')
+    Assert-MiniImFile (Join-Path $MiniImRoot 'client/vcpkg.json')
 }
 foreach ($file in @('server/main.py', 'server/tools/generate_proto.py', 'web/package.json', 'client/CMakeLists.txt')) {
     Assert-MiniImFile (Join-Path $MiniImRoot $file)
