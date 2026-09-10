@@ -322,8 +322,12 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         await self.alice.command("message", conversation=self.conversation, intent="committed-message", text="survives server")
         checkpoint = await self.kill_at_checkpoint()
         self.assertEqual(1, self.scalar("SELECT COUNT(*) FROM messages"))
+        committed_ack = self.scalar("SELECT ack FROM control_write_results WHERE user_id='alice' AND request_id=?",
+                                    (checkpoint["requestId"],))
         await self.start_server()
         await self.alice.wait("message-sends", lambda item: not item["items"], since=self.marks[0], timeout=18)
+        replayed_ack = await self.server.wait("message-ack", lambda item: item["requestId"] == checkpoint["requestId"])
+        self.assertEqual(committed_ack.hex(), replayed_ack["payload"])
         await self.bob.wait("message", lambda item: item["clientMsgId"] == "committed-message", since=self.marks[1], timeout=18)
         await self.assert_replayed("send_message", checkpoint["requestId"])
         self.assertEqual(1, self.scalar("SELECT COUNT(*) FROM messages"))
@@ -467,6 +471,8 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         for table in ("messages", "message_deliveries", "message_read_counters"):
             self.assertEqual(0, self.scalar("SELECT COUNT(*) FROM " + table))
         self.assertEqual(before, self.scalar("SELECT COUNT(*) FROM sync_events"))
+        self.assertEqual(0, self.scalar("SELECT COUNT(*) FROM control_write_results WHERE request_id=?",
+                                        (checkpoint["requestId"],)))
         await self.start_server()
         await self.alice.wait("message-sends", lambda item: not item["items"], since=self.marks[0], timeout=18)
         await self.bob.wait("message", lambda item: item["clientMsgId"] == "uncommitted", since=self.marks[1], timeout=18)

@@ -5,7 +5,10 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from protocol.pb import common_pb2, conversation_pb2, message_pb2
+from protocol.pb import common_pb2, conversation_pb2, message_pb2, envelope_pb2
+from services.control.service import ControlWriteService
+from services.delivery.service import DeliveryService
+from storage.repo.control_write_repo import ControlWriteRepo
 from services.conversation.service import ConversationService
 from services.message.service import MessageService
 from storage.repo import ConversationRepo, MessageRepo, DeliveryRepo
@@ -40,6 +43,66 @@ class MessageIntentTest(unittest.TestCase):
     def counts(self):
         return tuple(self.db.execute_fetchone("SELECT COUNT(*) FROM " + table)[0]
                      for table in ("messages", "message_deliveries", "sync_events"))
+
+    def rename(self, request_id, title="renamed"):
+        service = ControlWriteService(ControlWriteRepo(self.db), ConversationService(ConversationRepo(self.db)),
+                                      DeliveryService(DeliveryRepo(self.db)))
+        envelope = envelope_pb2.Envelope(request_id=request_id)
+        envelope.rename_conversation.conversation_id = self.conversation
+        envelope.rename_conversation.title = title
+        return service.handle("alice", envelope)
+
+    def test_request_id_cannot_change_message_intent_or_operation(self):
+        original = self.send()
+        before = self.counts()
+        changed = message_pb2.SendMessage(); changed.CopyFrom(self.request); changed.client_msg_id = "other-intent"
+        self.assertEqual(409, self.send(changed).ack.code)
+        self.assertEqual(409, self.rename("first").ack.code)
+        self.assertEqual(before, self.counts())
+        self.db.close(); self.open()
+        self.assertEqual(original.ack.SerializeToString(), self.send().ack.SerializeToString())
+        self.assertEqual(409, self.rename("first").ack.code)
+        self.assertTrue(self.rename("control-first").ack.success)
+        self.assertEqual(409, self.send(request_id="control-first").ack.code)
+
+    def test_definitive_rejection_is_replayed_without_accepting_changed_body(self):
+        invalid = message_pb2.SendMessage(); invalid.CopyFrom(self.request); invalid.burn_ttl_sec = 1
+        rejection = self.send(invalid)
+        self.assertEqual(400, rejection.ack.code)
+        self.db.close(); self.open()
+        self.assertEqual(rejection.ack.SerializeToString(), self.send(invalid).ack.SerializeToString())
+        self.assertEqual(409, self.send().ack.code)
+        self.assertTrue(self.send(request_id="corrected-new-request").ack.success)
+
+    def test_legacy_message_request_reserves_id_before_first_replay(self):
+        original = self.send()
+        self.db.execute_write("DELETE FROM control_write_results")
+        self.db.close(); self.open()
+        self.assertEqual(409, self.rename("first").ack.code)
+        changed = message_pb2.SendMessage(); changed.CopyFrom(self.request); changed.client_msg_id = "new-intent"
+        self.assertEqual(409, self.send(changed).ack.code)
+        self.assertEqual(original.ack.entity_id, self.send().ack.entity_id)
+        self.assertEqual(1, self.counts()[0])
+
+    def test_legacy_duplicate_request_ids_are_not_silently_assigned(self):
+        self.assertTrue(self.send().ack.success)
+        self.db.execute_write("DELETE FROM control_write_results")
+        changed = message_pb2.SendMessage(); changed.CopyFrom(self.request); changed.client_msg_id = "legacy-collision"
+        MessageRepo(self.db).append_message("first", "alice", changed, ["alice", "bob"])
+        self.db.close(); self.open()
+        before = self.counts()
+        self.assertEqual(409, self.send().ack.code)
+        self.assertEqual(409, self.rename("first").ack.code)
+        self.assertEqual(before, self.counts())
+
+    def test_request_result_failure_rolls_back_message_and_events(self):
+        self.db.execute_write("CREATE TRIGGER fail_result BEFORE INSERT ON control_write_results BEGIN SELECT RAISE(ABORT,'result failure'); END")
+        before = self.counts()
+        with self.assertRaises(Exception):
+            self.send()
+        self.assertEqual(before, self.counts())
+        self.db.execute_write("DROP TRIGGER fail_result")
+        self.assertTrue(self.send().ack.success)
 
     def test_changed_content_type_or_burn_settings_reject_same_intent(self):
         self.assertTrue(self.send().ack.success)
@@ -96,6 +159,7 @@ class MessageIntentTest(unittest.TestCase):
     def test_legacy_intact_rows_migrate_without_resetting_events(self):
         self.assertTrue(self.send().ack.success)
         before = self.counts()
+        self.db.execute_write("DELETE FROM control_write_results")
         self.db.execute_write("ALTER TABLE messages DROP COLUMN intent_fingerprint")
         self.db.close(); self.open()
         self.assertTrue(self.send().ack.success)
@@ -110,6 +174,7 @@ class MessageIntentTest(unittest.TestCase):
         self.db.execute_write("UPDATE message_deliveries SET burn_at_ms=1")
         delivery = DeliveryRepo(self.db); delivery.collect_due_burn_sync_events(100)
         delivery.purge_burned_message_content(100)
+        self.db.execute_write("DELETE FROM control_write_results")
         self.db.execute_write("ALTER TABLE messages DROP COLUMN intent_fingerprint")
         self.db.close(); self.open()
         before = self.counts()
@@ -122,6 +187,7 @@ class MessageIntentTest(unittest.TestCase):
     def test_legacy_backfill_failure_rolls_back_column_and_data(self):
         self.assertTrue(self.send().ack.success)
         before = self.counts()
+        self.db.execute_write("DELETE FROM control_write_results")
         self.db.execute_write("ALTER TABLE messages DROP COLUMN intent_fingerprint")
         self.db.execute_write("CREATE TRIGGER reject_migration BEFORE UPDATE ON messages BEGIN SELECT RAISE(ABORT,'migration failure'); END")
         self.db.close()

@@ -147,6 +147,8 @@ async def main(args):
                     envelope.welcome.heartbeat_interval_sec = args.heartbeat
                 emit("welcome", user=envelope.welcome.user_id, session=envelope.welcome.session_id,
                      resumed=envelope.welcome.resumable)
+            if envelope.HasField("ack") and gate.requests.get(envelope.request_id) == "send_message":
+                emit("message-ack", requestId=envelope.request_id, payload=envelope.ack.SerializeToString().hex())
             if envelope.HasField("ack") and envelope.ack.success:
                 gate.check("before-ack", operation=gate.requests.get(envelope.request_id, ""),
                            request_id=envelope.request_id, entityId=envelope.ack.entity_id)

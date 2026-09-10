@@ -4,7 +4,7 @@ import hashlib
 from protocol.pb import common_pb2, message_pb2
 
 
-def MessageIntentFingerprint(request: message_pb2.SendMessage) -> bytes:
+def MessageIntentPayload(request: message_pb2.SendMessage) -> bytes:
     # Only business fields define identity; unknown protobuf fields are not interpreted.
     message_type = request.type or common_pb2.MSG_TEXT
     burn_mode = 0 if message_type == common_pb2.MSG_SYSTEM else request.burn_mode
@@ -12,7 +12,11 @@ def MessageIntentFingerprint(request: message_pb2.SendMessage) -> bytes:
         conversation_id=request.conversation_id, client_msg_id=request.client_msg_id,
         type=message_type, content=request.content, burn_mode=burn_mode,
         burn_ttl_sec=request.burn_ttl_sec if burn_mode else 0)
-    return hashlib.sha256(canonical.SerializeToString(deterministic=True)).digest()
+    return canonical.SerializeToString(deterministic=True)
+
+
+def MessageIntentFingerprint(request: message_pb2.SendMessage) -> bytes:
+    return hashlib.sha256(MessageIntentPayload(request)).digest()
 
 
 def MigrateMessageIntents(connection) -> None:

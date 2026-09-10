@@ -186,6 +186,53 @@ class ControlWriteNetworkTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
                 self.assertEqual(b"original", self.db.execute_fetchone("SELECT content FROM messages")[0])
 
+    async def test_message_request_id_cross_operation_conflicts_and_ack_replay(self):
+        request = message_pb2.SendMessage(conversation_id=self.conversation, client_msg_id="request-intent",
+            type=common_pb2.MSG_TEXT, content=b"request body")
+        async with self.peer() as (reader, send):
+            send("shared-request", send_message=request)
+            original = (await self.read(reader, "shared-request", "ack")).ack
+            self.assertTrue(original.success)
+        self.server.close()
+        await asyncio.sleep(0.05)
+        self.db.close()
+        await self.start_server()
+        async with self.peer(device="request-second-device") as (reader, send):
+            before = self.event_count()
+            changed = message_pb2.SendMessage(); changed.CopyFrom(request); changed.client_msg_id = "another-intent"
+            send("shared-request", send_message=changed)
+            self.assertEqual(409, (await self.read(reader, "shared-request", "ack")).ack.code)
+            rename = conversation_pb2.RenameConversation(conversation_id=self.conversation, title="changed")
+            send("shared-request", rename_conversation=rename)
+            self.assertEqual(409, (await self.read(reader, "shared-request", "ack")).ack.code)
+            send("shared-request", send_message=request)
+            self.assertEqual(original.SerializeToString(), (await self.read(reader, "shared-request", "ack")).ack.SerializeToString())
+            self.assertEqual(before, self.event_count())
+            send("control-owned", rename_conversation=rename)
+            self.assertTrue((await self.read(reader, "control-owned", "ack")).ack.success)
+            send("control-owned", send_message=request)
+            self.assertEqual(409, (await self.read(reader, "control-owned", "ack")).ack.code)
+            self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+
+    async def test_message_result_commit_failure_returns_retryable_error(self):
+        self.db.execute_write("CREATE TRIGGER fail_message_result BEFORE INSERT ON control_write_results "
+                              "WHEN NEW.operation='send_message' BEGIN SELECT RAISE(ABORT,'message result failure'); END")
+        async with self.peer() as (reader, send):
+            request = message_pb2.SendMessage(conversation_id=self.conversation, client_msg_id="retry-commit",
+                type=common_pb2.MSG_TEXT, content=b"atomic result")
+            before = self.event_count()
+            send("retry-commit", send_message=request)
+            self.assertEqual(503, (await self.read(reader, "retry-commit", "error")).error.code)
+            self.assertEqual(0, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+            self.assertEqual(0, self.db.execute_fetchone("SELECT COUNT(*) FROM control_write_results")[0])
+            self.assertEqual(before, self.event_count())
+            self.db.execute_write("DROP TRIGGER fail_message_result")
+            send("retry-commit", send_message=request)
+            ack = (await self.read(reader, "retry-commit", "ack")).ack
+            self.assertTrue(ack.success)
+            self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+            self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM control_write_results")[0])
+
     async def send_delivery_message(self):
         async with self.peer() as (reader, send):
             send("offline-message", send_message=message_pb2.SendMessage(

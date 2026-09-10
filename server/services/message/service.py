@@ -5,7 +5,8 @@ from dataclasses import dataclass
 
 from protocol.pb import common_pb2, message_pb2
 from storage.repo import ConversationRepo, MessageRepo, StoredSyncEvent
-from storage.repo.message_intent import MessageIntentFingerprint
+from storage.repo.message_intent import MessageIntentFingerprint, MessageIntentPayload
+from storage.repo.control_write_repo import ControlWriteRepo, ControlWriteResult
 
 
 @dataclass
@@ -28,6 +29,7 @@ class MessageService:
         burn_enabled: bool = True,
     ) -> None:
         self.m_message_repo = message_repo
+        self.m_requests = ControlWriteRepo(message_repo.m_db)
         self.m_conversation_repo = conversation_repo
         self.m_burn_enabled = bool(burn_enabled)
 
@@ -41,6 +43,19 @@ class MessageService:
         request_id: str,
         send_message: message_pb2.SendMessage,
     ) -> SendMessageResult:
+        applied = None
+
+        def apply() -> ControlWriteResult:
+            nonlocal applied
+            applied = self._apply_send_message(user_id, request_id, send_message)
+            return ControlWriteResult(applied.ack, applied.sync_events)
+
+        result = self.m_requests.execute(user_id, request_id, "send_message", MessageIntentPayload(send_message), apply)
+        push = applied.message_push if applied is not None and result.ack.success else None
+        return SendMessageResult(result.ack, push, result.sync_events)
+
+    def _apply_send_message(self, user_id: str, request_id: str,
+                            send_message: message_pb2.SendMessage) -> SendMessageResult:
         now_ms = self._now_ms()
         ack = message_pb2.Ack(
             request_id=request_id,

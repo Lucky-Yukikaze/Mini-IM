@@ -48,6 +48,13 @@ class ControlWriteRepo:
                         return self.reject(request_id, 409, "request id already belongs to a different write")
                     ack = message_pb2.Ack.FromString(bytes(previous["ack"]))
                     return ControlWriteResult(ack, [])
+                legacy = connection.execute(
+                    "SELECT intent_fingerprint FROM messages WHERE sender_id=? AND request_id=?",
+                    (user_id, request_id)).fetchall()
+                if legacy and (len(legacy) != 1 or operation != "send_message"
+                               or legacy[0]["intent_fingerprint"] is None
+                               or bytes(legacy[0]["intent_fingerprint"]) != fingerprint):
+                    return self.reject(request_id, 409, "legacy message request identity unavailable or conflicting")
                 result = apply()
                 if not result.ack.success and (result.ack.code in (401, 408, 429) or result.ack.code >= 500):
                     # Transient failure is retryable; retain neither changes nor an authoritative result.

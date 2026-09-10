@@ -385,11 +385,16 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
                 continue
 
             if envelope.HasField("send_message"):
-                result = self.m_message_service.handle_send_message(
-                    user_id=session.user_id,
-                    request_id=envelope.request_id,
-                    send_message=envelope.send_message,
-                )
+                try:
+                    result = self.m_message_service.handle_send_message(
+                        user_id=session.user_id,
+                        request_id=envelope.request_id,
+                        send_message=envelope.send_message,
+                    )
+                except sqlite3.Error as error:
+                    self._debug(f"message transaction failed: {error}")
+                    self._send_error(event.stream_id, envelope, 503, "message could not be committed")
+                    continue
                 ack_envelope = self._new_response_from_request(envelope)
                 ack_envelope.ack.CopyFrom(result.ack)
                 self._send(event.stream_id, ack_envelope)

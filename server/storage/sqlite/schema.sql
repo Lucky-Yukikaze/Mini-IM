@@ -89,6 +89,8 @@ CREATE TABLE IF NOT EXISTS messages (
   FOREIGN KEY (sender_id) REFERENCES users(user_id)
 );
 
+CREATE INDEX IF NOT EXISTS idx_messages_sender_request ON messages(sender_id, request_id);
+
 CREATE TABLE IF NOT EXISTS message_deliveries (
   server_msg_id TEXT NOT NULL,
   user_id TEXT NOT NULL,
