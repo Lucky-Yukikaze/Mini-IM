@@ -61,7 +61,7 @@ import { ref, watch } from 'vue';
 
 const props = defineProps<{
   disabled: boolean;
-  downloadFileIdPreset: string;
+  downloadPreset: { fileId: string } | null;
   sendFile: (path: string) => Promise<boolean>;
   downloadFile: (fileId: string, path: string) => Promise<boolean>;
   sendMessage: (text: string, burnMode: number, burnTtlSec: number) => Promise<boolean>;
@@ -79,10 +79,10 @@ const downloadFileId = ref('');
 const downloadSavePath = ref('');
 
 watch(
-  () => props.downloadFileIdPreset,
-  (fileId) => {
-    if (fileId) {
-      downloadFileId.value = fileId;
+  () => props.downloadPreset,
+  (preset) => {
+    if (preset) {
+      downloadFileId.value = preset.fileId;
       attachOpen.value = true;
     }
   }

@@ -511,6 +511,33 @@ class ControlWriteNetworkTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload, self.files.get_storage_path(file_id).read_bytes())
         self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
 
+    async def test_file_completion_can_overtake_upload_bytes_without_failing_intent(self):
+        payload = b"control stream can arrive before file stream"
+        request = self.shared_upload_request(payload)
+        async with self.peer(with_protocol=True) as (reader, send, protocol):
+            updated = await self.initialize_upload(reader, send, request)
+            writer = await self.upload_stream(protocol, updated.file_id, 0, payload[:8])
+            await self.until(lambda: self.files.get_transfer_by_file_id(updated.file_id).received_bytes == 8)
+            count = self.event_count()
+            finish = file_pb2.FileFinish(file_id=updated.file_id, success=True)
+            send("finish-before-bytes", file_finish=finish)
+            waiting = (await self.read(reader, "finish-before-bytes", "ack")).ack
+            self.assertFalse(waiting.success)
+            self.assertEqual(503, waiting.code)
+            self.assertEqual(count, self.event_count())
+            self.assertEqual(0, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+            writer.write(payload[8:])
+            writer.write_eof()
+            await self.until(lambda: self.files.get_transfer_by_file_id(updated.file_id).received_bytes == len(payload))
+            send("finish-before-bytes", file_finish=finish)
+            self.assertTrue((await self.read(reader, "finish-before-bytes", "ack")).ack.success)
+            self.assertEqual(payload, self.files.get_storage_path(updated.file_id).read_bytes())
+            count = self.event_count()
+            send("finish-before-bytes", file_finish=finish)
+            self.assertTrue((await self.read(reader, "finish-before-bytes", "ack")).ack.success)
+            self.assertEqual(count, self.event_count())
+            self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+
     async def test_duplicate_upload_stream_cannot_append_into_active_stream(self):
         payload = b"first halfsecond half"
         request = self.shared_upload_request(payload)

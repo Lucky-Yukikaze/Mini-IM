@@ -255,7 +255,8 @@ class FileService:
                     return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
             else:
                 if int(transfer.received_bytes) != int(transfer.file_size):
-                    ack.message = "status incomplete"
+                    ack.code = 503
+                    ack.message = "upload data is still arriving; retry completion"
                     return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
                 if not self._verify_file_sha256(transfer):
                     ack.code = 409

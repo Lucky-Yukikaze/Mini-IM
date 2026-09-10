@@ -381,7 +381,9 @@ export async function recallMessage(conversationId: string, messageId: string): 
 }
 
 export async function sendFile(conversationId: string, filePath: string, priority: number): Promise<boolean> {
+  if (runtimeWindow.qt?.webChannelTransport && !runtimeWindow.imBridge) return false;
   if (runtimeWindow.imBridge) {
+    if (typeof runtimeWindow.imBridge.sendFile !== 'function') return false;
     return new Promise((resolve) => runtimeWindow.imBridge!.sendFile(conversationId, filePath, priority, resolve));
   }
   bridgeEvents.emit('fileProgress', {
@@ -403,6 +405,7 @@ export async function downloadFile(
   priority: number
 ): Promise<boolean> {
   if (runtimeWindow.imBridge) {
+    if (typeof runtimeWindow.imBridge.downloadFile !== 'function') return false;
     return new Promise((resolve) => runtimeWindow.imBridge!.downloadFile(conversationId, sourceFileId, savePath, priority, resolve));
   }
   bridgeEvents.emit('errorRaised', { message: 'download is unavailable in web-debug mode' });
@@ -410,11 +413,11 @@ export async function downloadFile(
 }
 
 export async function retryFile(clientFileId: string): Promise<boolean> {
-  if (!runtimeWindow.imBridge) return false;
+  if (typeof runtimeWindow.imBridge?.retryFile !== 'function') return false;
   return new Promise((resolve) => runtimeWindow.imBridge!.retryFile(clientFileId, resolve));
 }
 
 export async function cancelFile(clientFileId: string): Promise<boolean> {
-  if (!runtimeWindow.imBridge) return false;
+  if (typeof runtimeWindow.imBridge?.cancelFile !== 'function') return false;
   return new Promise((resolve) => runtimeWindow.imBridge!.cancelFile(clientFileId, resolve));
 }

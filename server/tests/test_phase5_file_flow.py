@@ -103,52 +103,68 @@ class Phase5FileFlowTest(unittest.TestCase):
             self.assertEqual(file_id, content["fileId"])
             db.close()
 
-    def test_file_finish_should_reject_if_incomplete(self):
+    def test_file_finish_waits_for_remaining_bytes_and_retries_same_request(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "test.db"
             file_root = Path(tmp) / "files"
             db = MiniImSqliteDb(db_path)
-            db.init_schema()
+            try:
+                db.init_schema()
 
-            conversation_service, file_service, _ = self._build_services(db, file_root)
-            create_result = conversation_service.handle_create_conversation(
-                user_id="u-alice",
-                request_id="req-create",
-                create_conversation=conversation_pb2.CreateConversation(
-                    client_conv_id="cc-1",
-                    type=common_pb2.CONVERSATION_GROUP,
-                    member_ids=["u-bob"],
-                    title="group-1",
-                ),
-            )
-            conversation_id = create_result.ack.entity_id
-            payload = b"abc123"
-            sha256 = hashlib.sha256(payload).hexdigest()
+                conversation_service, file_service, _ = self._build_services(db, file_root)
+                create_result = conversation_service.handle_create_conversation(
+                    user_id="u-alice",
+                    request_id="req-create",
+                    create_conversation=conversation_pb2.CreateConversation(
+                        client_conv_id="cc-1",
+                        type=common_pb2.CONVERSATION_GROUP,
+                        member_ids=["u-bob"],
+                        title="group-1",
+                    ),
+                )
+                conversation_id = create_result.ack.entity_id
+                payload = b"abc123"
+                sha256 = hashlib.sha256(payload).hexdigest()
 
-            init_result = file_service.handle_file_init(
-                user_id="u-alice",
-                request_id="req-init",
-                file_init=file_pb2.FileInit(
-                    conversation_id=conversation_id,
-                    client_file_id="intent-1",
-                    file_name="x.bin",
-                    file_size=len(payload),
-                    sha256=sha256,
-                    direction=common_pb2.FILE_DIRECTION_UPLOAD,
-                    resume_offset=0,
-                    priority=0,
-                ),
-            )
-            file_id = init_result.ack.entity_id
-            file_service.append_file_chunk("u-alice", file_id, payload[:3])
-            finish_result = file_service.handle_file_finish(
-                user_id="u-alice",
-                request_id="req-finish",
-                file_finish=file_pb2.FileFinish(file_id=file_id, success=True),
-            )
-            self.assertFalse(finish_result.ack.success)
-            self.assertEqual(400, finish_result.ack.code)
-            db.close()
+                init_result = file_service.handle_file_init(
+                    user_id="u-alice",
+                    request_id="req-init",
+                    file_init=file_pb2.FileInit(
+                        conversation_id=conversation_id,
+                        client_file_id="intent-1",
+                        file_name="x.bin",
+                        file_size=len(payload),
+                        sha256=sha256,
+                        direction=common_pb2.FILE_DIRECTION_UPLOAD,
+                        resume_offset=0,
+                        priority=0,
+                    ),
+                )
+                file_id = init_result.ack.entity_id
+                file_service.append_file_chunk("u-alice", file_id, payload[:3])
+                finish_result = file_service.handle_file_finish(
+                    user_id="u-alice",
+                    request_id="req-finish",
+                    file_finish=file_pb2.FileFinish(file_id=file_id, success=True),
+                )
+                self.assertFalse(finish_result.ack.success)
+                self.assertEqual(503, finish_result.ack.code)
+                self.assertEqual([], finish_result.sync_events)
+                self.assertEqual(0, db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+                self.assertEqual(3, file_service.get_transfer_by_file_id(file_id).received_bytes)
+                file_service.append_file_chunk("u-alice", file_id, payload[3:])
+                finished = file_service.handle_file_finish("u-alice", "req-finish",
+                    file_pb2.FileFinish(file_id=file_id, success=True))
+                self.assertTrue(finished.ack.success)
+                self.assertEqual(payload, file_service.get_storage_path(file_id).read_bytes())
+                count = db.execute_fetchone("SELECT COUNT(*) FROM sync_events")[0]
+                repeated = file_service.handle_file_finish("u-alice", "req-finish",
+                    file_pb2.FileFinish(file_id=file_id, success=True))
+                self.assertTrue(repeated.ack.success)
+                self.assertEqual(count, db.execute_fetchone("SELECT COUNT(*) FROM sync_events")[0])
+                self.assertEqual(1, db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+            finally:
+                db.close()
 
     def test_same_intent_id_with_different_file_size_should_be_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

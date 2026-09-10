@@ -43,7 +43,7 @@
 
       <MessageComposer
         :disabled="!canSendToActiveConversation"
-        :download-file-id-preset="downloadFileIdPreset"
+        :download-preset="downloadPreset"
         :send-message="onSend"
         :send-file="onSendFile"
         :download-file="onDownloadFile"
@@ -207,7 +207,7 @@ const dialogMode = ref<'create' | 'join' | 'direct' | null>(null);
 const notice = ref('');
 const memberDraft = ref('');
 const renameTitle = ref('');
-const downloadFileIdPreset = ref('');
+const downloadPreset = ref<{ fileId: string } | null>(null);
 const pendingMessages: MessageItem[] = [];
 let messageFlushFrame = 0;
 let accountEpoch = 0;
@@ -531,7 +531,7 @@ function onRecall(conversationId: string, messageId: string): void {
 }
 
 function onFillDownload(fileId: string): void {
-  downloadFileIdPreset.value = fileId;
+  downloadPreset.value = { fileId };
 }
 
 async function onSendFile(filePath: string): Promise<boolean> {

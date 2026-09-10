@@ -14,7 +14,11 @@ const operations: [string, string, unknown[]][] = [
   ['joinConversation', 'joinConversation', ['group']],
   ['renameConversation', 'renameConversation', ['group', 'new title']],
   ['sendReceipt', 'sendReceipt', ['group', 3]],
-  ['recallMessage', 'recallMessage', ['group', 'message']]
+  ['recallMessage', 'recallMessage', ['group', 'message']],
+  ['sendFile', 'sendFile', ['group', 'source.bin', 0]],
+  ['downloadFile', 'downloadFile', ['group', 'source-id', 'target.bin', 0]],
+  ['retryFile', 'retryFile', ['intent']],
+  ['cancelFile', 'cancelFile', ['intent']]
 ];
 
 for (const [api, native, args] of operations) {
@@ -40,6 +44,7 @@ test('a missing method on an existing native bridge cannot fabricate success', a
   runtime.imBridge = {};
   assert.equal(await bridge.createDirectConversation('bob'), false);
   assert.equal(await bridge.addMembers('group', ['bob']), false);
+  for (const [api, , args] of operations.slice(-4)) assert.equal(await (bridge as Record<string, Function>)[api](...args), false);
 });
 
 test('native initialization failure cannot fall through to local demo events', async () => {

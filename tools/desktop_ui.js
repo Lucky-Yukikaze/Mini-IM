@@ -136,6 +136,61 @@ async page => {
     await button('标为已读').click();
   } else if (data.phase === 'settled') {
     await status.getByText('标记已读 · 等待确认', { exact: true }).waitFor({ state: 'hidden' });
+  } else if (data.phase === 'file-upload') {
+    if (!(await page.getByLabel('发送文件路径', { exact: true }).count())) await button('文件').click();
+    const input = page.getByLabel('发送文件路径', { exact: true });
+    await input.fill(data.transferSource);
+    await button('发送文件').click();
+    if (data.failed) {
+      await page.getByText('文件任务未保存，请检查路径', { exact: true }).waitFor();
+      check(await input.inputValue() === data.transferSource, 'upload path cleared before save');
+      check(await page.locator('.file-task-card').count() === 0, 'failed save created visible file task');
+    } else {
+      await page.locator('.file-task-card').filter({ hasText: '上传 · source.bin' }).waitFor();
+      check(await input.inputValue() === '', 'saved upload path was not cleared');
+    }
+  } else if (data.phase === 'file-pending') {
+    await page.locator('.file-task-card').filter({ hasText: data.direction + ' · ' + (data.direction === '上传' ? 'source.bin' : 'download.bin') }).waitFor();
+    if (data.image) await page.screenshot({ path: data.image });
+  } else if (data.phase === 'file-uploaded') {
+    await page.locator('.file-task-card').waitFor({ state: 'hidden' });
+    const row = page.locator('.message-row').filter({ hasText: 'source.bin' });
+    await row.getByRole('button', { name: '填入下载', exact: true }).waitFor();
+    check(await row.count() === 1, 'upload published duplicate messages');
+  } else if (data.phase === 'file-fill') {
+    await page.locator('.message-row').filter({ hasText: 'source.bin' })
+      .getByRole('button', { name: '填入下载', exact: true }).click();
+    const input = page.getByLabel('下载 file_id', { exact: true });
+    await input.waitFor();
+    check(await input.inputValue() === data.fileId, 'repeated fill did not restore file id');
+    await page.getByLabel('保存路径', { exact: true }).fill(data.transferTarget);
+  } else if (data.phase === 'file-download') {
+    await button('下载').click();
+    if (data.failed) {
+      await page.getByText('下载任务未保存，请检查输入', { exact: true }).waitFor();
+      check(await page.getByLabel('下载 file_id', { exact: true }).inputValue() === data.fileId,
+        'download source cleared before save');
+      check(await page.getByLabel('保存路径', { exact: true }).inputValue() === data.transferTarget,
+        'download path cleared before save');
+    } else {
+      await page.waitForFunction(() => document.querySelector('[placeholder="源文件 ID"]')?.value === '');
+      if (data.pending) await page.locator('.file-task-card').filter({ hasText: '下载 · download.bin' }).waitFor();
+    }
+  } else if (data.phase === 'file-failed') {
+    const task = page.locator('.file-task-card').filter({ hasText: '下载 · download.bin' });
+    await task.getByText('传输失败', { exact: true }).waitFor();
+    await task.getByRole('button', { name: '重试', exact: true }).waitFor();
+    if (data.image) await page.screenshot({ path: data.image });
+  } else if (data.phase === 'file-retry') {
+    await page.locator('.file-task-card').getByRole('button', { name: '重试', exact: true }).click();
+  } else if (data.phase === 'file-cancel-active') {
+    await page.locator('.file-task-card').getByRole('button', { name: '取消', exact: true }).click();
+    await page.locator('.file-task-card').waitFor({ state: 'hidden' });
+  } else if (data.phase === 'file-complete') {
+    await page.locator('.file-task-card').waitFor({ state: 'hidden' });
+    if (data.image) await page.screenshot({ path: data.image });
+  } else if (data.phase === 'file-isolated') {
+    check(await page.locator('.file-task-card').count() === 0, 'another user saw pending file task');
   } else if (data.phase === 'upload') {
     if (!(await page.getByLabel('发送文件路径', { exact: true }).count())) await button('文件').click();
     await page.getByLabel('发送文件路径', { exact: true }).fill(data.upload);

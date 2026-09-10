@@ -3,8 +3,10 @@
 Read context.json for endpoint, seeded group and local WebEngine debugging URL.
 Write {"id": "unique-command", "op": ...} to command.json and wait for the same
 id in response.json. Operations: snapshot, message(text), reject(code),
-drop-ack(count), cache-fault(enabled,user,device), file-init-reject(code),
-file-cancel-reject(code), confirm-bob, read-bob, restart-client, stop.
+drop-ack(count), cache-fault(enabled,user,device,table), file-init-reject(code),
+file-cancel-reject(code), confirm-bob, read-bob, read-cindy, restart-client, stop.
+File checks also use pause-upload(offset), pause-download(offset),
+prepare-download-target and corrupt-download-source(fileId,enabled).
 Only the private fixture databases are changed. No default development data is used.
 """
 from __future__ import annotations
@@ -29,6 +31,7 @@ sys.path.insert(0, str(ROOT / "server"))
 from aioquic.quic.configuration import QuicConfiguration
 from protocol.pb import common_pb2, conversation_pb2, message_pb2, sync_pb2
 from quic.endpoint import serve_quic
+from quic.download import STREAM_BUFFER_LIMIT
 from quic.server import FaultConfig, MiniImQuicProtocol, OnlineSessionHub, ensure_dev_cert
 from services.auth.service import AuthService
 from services.control.service import ControlWriteService
@@ -68,6 +71,10 @@ class DesktopFixture:
         self.drop_acks = 0
         self.file_init_reject = self.file_cancel_reject = 0
         self.file_cancel_attempts = []
+        self.file_attempts = []
+        self.client_exits = []
+        self.pause_upload_at = self.pause_download_at = 0
+        self.held_upload_chunks = []
         self.context = {}
         self.hub = OnlineSessionHub()
         self.repo = ConversationRepo(self.db)
@@ -100,7 +107,12 @@ class DesktopFixture:
                 if scenario.file_init_reject:
                     return FileServiceResult(message_pb2.Ack(request_id=request_id, success=False,
                         code=scenario.file_init_reject, message="injected file init rejection"), None, [])
-                return super().handle_file_init(user_id, request_id, file_init)
+                result = super().handle_file_init(user_id, request_id, file_init)
+                scenario.file_attempts.append(dict(user=user_id, requestId=request_id,
+                    intent=file_init.client_file_id, direction=file_init.direction, offset=file_init.resume_offset,
+                    source=file_init.source_file_id, fileId=result.ack.entity_id, success=result.ack.success,
+                    acceptedOffset=result.file_updated.transferred_bytes if result.file_updated else None))
+                return result
 
             def handle_file_cancel(self, user_id, request_id, request):
                 scenario.file_cancel_attempts.append(dict(user=user_id, requestId=request_id,
@@ -110,13 +122,27 @@ class DesktopFixture:
                         code=scenario.file_cancel_reject, message="injected file cancel rejection"), None, [])
                 return super().handle_file_cancel(user_id, request_id, request)
 
-        files = Files(FileRepo(self.db), self.repo, MessageRepo(self.db), self.root / "files", 900000)
+        files = self.files = Files(FileRepo(self.db), self.repo, MessageRepo(self.db), self.root / "files", 900000)
         auth = AuthService()
 
         class Protocol(MiniImQuicProtocol):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
                 scenario.protocols.append(self)
+                original_pending = self.m_download_sender.buffer.pending_bytes
+                def paused_pending(stream_id):
+                    job = self.m_download_sender.jobs.get(stream_id)
+                    if scenario.pause_download_at and job and job.offset >= scenario.pause_download_at:
+                        return STREAM_BUFFER_LIMIT
+                    return original_pending(stream_id)
+                self.m_download_sender.buffer.pending_bytes = paused_pending
+
+            def _handle_file_stream_data(self, stream_id, data, end_stream):
+                state = self.m_file_stream_states.get(stream_id)
+                if scenario.pause_upload_at and state and state.lease and state.lease.offset >= scenario.pause_upload_at:
+                    scenario.held_upload_chunks.append((self, stream_id, data, end_stream))
+                    return
+                super()._handle_file_stream_data(stream_id, data, end_stream)
 
             def _send(self, stream_id, envelope):
                 if envelope.HasField("ack") and "-control-" in envelope.request_id and scenario.drop_acks:
@@ -143,7 +169,13 @@ class DesktopFixture:
             debug_port = probe.getsockname()[1]
         upload = self.root / "desktop-upload.bin"
         upload.write_bytes(b"desktop file cancellation" * 4096)
-        self.context = dict(upload=str(upload), endpoint=f"quic://127.0.0.1:{self.port}", group=self.group,
+        transfer_dir = self.root / "desktop files"
+        transfer_dir.mkdir()
+        transfer_source = transfer_dir / "source.bin"
+        transfer_source.write_bytes(bytes(range(251)) * 8192)
+        transfer_target = transfer_dir / "download.bin"
+        transfer_target.write_bytes(b"keep original destination until verified")
+        self.context = dict(transferSource=str(transfer_source), transferTarget=str(transfer_target), upload=str(upload), endpoint=f"quic://127.0.0.1:{self.port}", group=self.group,
             debug=f"http://127.0.0.1:{debug_port}", root=str(self.root), output=str(self.output),
             state=str(self.root / "state"), users=["alice", "bob", "cindy"], device="desktop-device")
         await self.start_client()
@@ -165,11 +197,21 @@ class DesktopFixture:
         if self.client and self.client.returncode is None:
             self.client.terminate()
             await self.client.wait()
+            self.client_exits.append(dict(pid=self.client.pid, exitCode=self.client.returncode))
+        self.held_upload_chunks.clear()
         if self.client_log:
             self.client_log.close()
 
     def snapshot(self):
+        artifacts = {}
+        for path in (self.root / "desktop files").glob("*"):
+            if path.is_file():
+                content = path.read_bytes()
+                artifacts[path.name] = dict(size=len(content), sha256=hashlib.sha256(content).hexdigest())
         state = dict(attempts=self.attempts, fileCancelAttempts=self.file_cancel_attempts,
+            fileAttempts=self.file_attempts, clientExits=self.client_exits, artifacts=artifacts,
+            transfers=[dict(row) for row in self.db.execute_fetchall("SELECT * FROM file_transfers")],
+            fileTasks={},
             cancellations=[dict(row) for row in self.db.execute_fetchall("SELECT * FROM file_cancellations")],
             conversations=[dict(row) for row in self.db.execute_fetchall("SELECT * FROM conversations")],
             members=[dict(row) for row in self.db.execute_fetchall("SELECT * FROM conversation_members")],
@@ -181,6 +223,8 @@ class DesktopFixture:
                 cache.row_factory = sqlite3.Row
                 state["caches"][path.name] = [dict(row) for row in cache.execute(
                     "SELECT request_id,operation,status,code,error,attempts FROM control_outbox")]
+                state["fileTasks"][path.name] = [dict(row) for row in cache.execute(
+                    "SELECT id,init_request,finish_request,file_id,status FROM file_tasks")]
         return state
 
     async def command(self, data):
@@ -211,6 +255,26 @@ class DesktopFixture:
             seq = self.db.execute_fetchone("SELECT MAX(conversation_seq) FROM messages WHERE conversation_id=?", (self.group,))[0]
             result = DeliveryRepo(self.db).apply_receipt("bob" if op == "read-bob" else "cindy", self.group, seq)
             self.hub.fanout_sync_events(result.sync_events)
+        elif op == "prepare-download-target":
+            Path(self.context["transferTarget"]).write_bytes(b"keep original destination until verified")
+        elif op == "corrupt-download-source":
+            transfer = self.files.get_transfer_by_file_id(data["fileId"])
+            if transfer is None or transfer.conversation_id != self.group or transfer.direction != 1:
+                raise ValueError("fixture upload required")
+            source = Path(self.context["transferSource"]).read_bytes()
+            if data["enabled"]:
+                source = bytes([source[0] ^ 255]) + source[1:]
+            self.files.get_storage_path(data["fileId"]).write_bytes(source)
+        elif op == "pause-upload":
+            self.pause_upload_at = int(data["offset"])
+            if not self.pause_upload_at:
+                pending, self.held_upload_chunks = self.held_upload_chunks, []
+                for protocol, stream, chunk, ended in pending:
+                    protocol._handle_file_stream_data(stream, chunk, ended)
+        elif op == "pause-download":
+            self.pause_download_at = int(data["offset"])
+            for protocol in self.protocols:
+                protocol.m_download_sender.notify()
         elif op == "cache-fault":
             identity = json.dumps([f"127.0.0.1:{self.port}", data.get("user", "alice"),
                 data.get("device", "desktop-device")], separators=(",", ":"), ensure_ascii=False)
@@ -218,8 +282,11 @@ class DesktopFixture:
             if not path.is_file():
                 raise ValueError("connect the selected fixture account before injecting its cache fault")
             with closing(sqlite3.connect(path)) as cache, cache:
+                table = data.get("table", "control_outbox")
+                if table not in ("control_outbox", "file_tasks"):
+                    raise ValueError("unsupported fixture cache table")
                 if data["enabled"]:
-                    cache.execute("CREATE TRIGGER qa_reject_control BEFORE INSERT ON control_outbox "
+                    cache.execute(f"CREATE TRIGGER qa_reject_control BEFORE INSERT ON {table} "
                         "BEGIN SELECT RAISE(ABORT, 'desktop injected save failure'); END")
                 else:
                     cache.execute("DROP TRIGGER qa_reject_control")

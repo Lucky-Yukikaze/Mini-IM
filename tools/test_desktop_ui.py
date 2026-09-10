@@ -7,6 +7,7 @@ held briefly to check form waiting. Service/cache faults stay in fixture data.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -84,6 +85,124 @@ class DesktopCheck:
                 return state
             time.sleep(0.1)
         raise AssertionError("server state did not converge")
+
+    def attach_client(self):
+        deadline = time.monotonic() + 12
+        while True:
+            try:
+                with urlopen(self.context["debug"] + "/json", timeout=1) as response:
+                    if json.load(response):
+                        break
+            except (URLError, TimeoutError):
+                pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Qt WebEngine debugging endpoint did not start")
+            time.sleep(0.1)
+        self.call("attach", "--cdp", self.context["debug"])
+
+    def restart_client(self, user):
+        self.command("restart-client")
+        self.call("detach")
+        self.attach_client()
+        self.phase("login", user=user, title="Desktop QA")
+
+    def run_files(self):
+        self.attach_client()
+        self.phase("login", user="alice", title="Desktop QA")
+        self.command("cache-fault", enabled=True, table="file_tasks")
+        self.phase("file-upload", failed=True)
+        self.command("cache-fault", enabled=False, table="file_tasks")
+        self.command("pause-upload", offset=65536)
+        self.phase("file-upload")
+        def uploading(state):
+            return any(row["direction"] == 1 and 0 < row["received_bytes"] < row["file_size"]
+                for row in state["transfers"])
+        state = self.wait_state(uploading)
+        transfer = next(row for row in state["transfers"] if row["direction"] == 1)
+        self.restart_client("alice")
+        self.phase("file-pending", direction="上传", image=str(self.artifacts / "upload-restored.png"))
+        self.command("pause-upload", offset=0)
+        state = self.wait_state(lambda state: any(row["direction"] == 1 and row["status"] == "completed"
+            for row in state["transfers"]))
+        self.phase("file-uploaded")
+        uploads = [row for row in state["transfers"] if row["direction"] == 1]
+        assert len(uploads) == 1 and uploads[0]["client_file_id"] == transfer["client_file_id"]
+        assert uploads[0]["file_id"] == transfer["file_id"]
+        source = Path(self.context["transferSource"]).read_bytes()
+        assert (Path(self.context["root"]) / "files" / uploads[0]["storage_path"]).read_bytes() == source
+        attempts = [item for item in state["fileAttempts"] if item["intent"] == transfer["client_file_id"]]
+        assert len(attempts) >= 2 and len({item["requestId"] for item in attempts}) == 1
+        assert attempts[-1]["acceptedOffset"] >= transfer["received_bytes"] > 0
+        assert len(state["messages"]) == 1
+        file_id = uploads[0]["file_id"]
+        self.phase("login", user="bob", title="Desktop QA", switch=True)
+        self.phase("file-fill", fileId=file_id)
+        self.command("cache-fault", enabled=True, user="bob", table="file_tasks")
+        self.phase("file-download", fileId=file_id, failed=True)
+        self.command("cache-fault", enabled=False, user="bob", table="file_tasks")
+        self.command("pause-download", offset=65536)
+        self.phase("file-download", fileId=file_id, pending=True)
+        state = self.wait_state(lambda state: any(name.startswith("download.bin.miniim-") and item["size"] >= 65536
+            for name, item in state["artifacts"].items()))
+        partial = next(item["size"] for name, item in state["artifacts"].items() if name.startswith("download.bin.miniim-"))
+        target = Path(self.context["transferTarget"])
+        assert target.read_bytes() == b"keep original destination until verified"
+        task = next(row for row in state["transfers"] if row["direction"] == 2)
+        self.phase("login", user="alice", title="Desktop QA", switch=True)
+        self.phase("file-isolated")
+        self.restart_client("bob")
+        self.phase("file-pending", direction="下载", image=str(self.artifacts / "download-restored.png"))
+        state = self.wait_state(lambda state: len([item for item in state["fileAttempts"]
+            if item["intent"] == task["client_file_id"]]) >= 2)
+        attempts = [item for item in state["fileAttempts"] if item["intent"] == task["client_file_id"]]
+        assert attempts[-1]["offset"] == partial and len({item["requestId"] for item in attempts}) == 1
+        self.command("pause-download", offset=0)
+        state = self.wait_state(lambda state: any(row["file_id"] == task["file_id"] and row["status"] == "completed"
+            for row in state["transfers"]))
+        self.phase("file-complete", image=str(self.artifacts / "download-completed.png"))
+        assert target.read_bytes() == source
+        assert state["artifacts"]["download.bin"]["sha256"] == hashlib.sha256(source).hexdigest()
+        assert not list(target.parent.glob("download.bin.miniim-*.part"))
+        self.phase("file-fill", fileId=file_id)
+        self.phase("file-download", fileId=file_id)
+        self.wait_state(lambda state: len([row for row in state["transfers"]
+            if row["direction"] == 2 and row["status"] == "completed"]) == 2)
+        self.phase("file-complete")
+        self.phase("file-fill", fileId=file_id)
+        self.command("prepare-download-target")
+        self.command("corrupt-download-source", fileId=file_id, enabled=True)
+        self.phase("file-download", fileId=file_id)
+        self.phase("file-failed", image=str(self.artifacts / "download-failed.png"))
+        assert target.read_bytes() == b"keep original destination until verified"
+        state = self.command("snapshot")
+        failed = next(row for row in state["transfers"] if row["direction"] == 2 and row["status"] != "completed")
+        self.command("corrupt-download-source", fileId=file_id, enabled=False)
+        self.phase("file-retry")
+        state = self.wait_state(lambda state: any(row["file_id"] == failed["file_id"] and row["status"] == "completed"
+            for row in state["transfers"]))
+        self.phase("file-complete")
+        attempts = [item for item in state["fileAttempts"] if item["intent"] == failed["client_file_id"]]
+        assert len(attempts) >= 2 and attempts[-1]["offset"] == 0
+        assert len({item["requestId"] for item in attempts}) == 1
+        assert target.read_bytes() == source
+        self.command("pause-download", offset=65536)
+        self.phase("file-fill", fileId=file_id)
+        self.phase("file-download", fileId=file_id, pending=True)
+        state = self.wait_state(lambda state: any(name.startswith("download.bin.miniim-") and item["size"] >= 65536
+            for name, item in state["artifacts"].items()))
+        cancelling = next(row for row in state["transfers"] if row["direction"] == 2 and row["status"] != "completed")
+        self.phase("file-cancel-active")
+        self.command("pause-download", offset=0)
+        state = self.wait_state(lambda state: any(row["file_id"] == cancelling["file_id"] and row["status"] == "cancelled"
+            for row in state["transfers"]))
+        assert target.read_bytes() == source
+        self.restart_client("bob")
+        self.phase("file-complete")
+        state = self.command("snapshot")
+        assert len(state["transfers"]) == 5 and len(state["messages"]) == 1
+        assert any(row["file_id"] == cancelling["file_id"] and row["status"] == "cancelled" for row in state["transfers"])
+        assert target.read_bytes() == source
+        return state
 
     def read_seq(self, state):
         return next(row["last_read_seq"] for row in state["members"]
@@ -206,11 +325,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--context", type=Path, required=True)
     parser.add_argument("--playwright-cli", type=Path, required=True, help="installed Playwright CLI JavaScript entry")
+    parser.add_argument("--files-only", action="store_true", help="verify actual desktop file transfer and restart flows")
     args = parser.parse_args()
     check = DesktopCheck(args.context, args.playwright_cli)
     result = dict(ok=False, started=time.strftime("%Y-%m-%d %H:%M:%S"))
     try:
-        result["state"] = check.run()
+        result["state"] = check.run_files() if args.files_only else check.run()
         result["ok"] = True
     except Exception as error:
         result["error"] = str(error)
