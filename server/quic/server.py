@@ -9,7 +9,7 @@ from pathlib import Path
 
 from aioquic.asyncio import QuicConnectionProtocol
 from aioquic.quic.configuration import QuicConfiguration
-from aioquic.quic.events import ConnectionTerminated, StreamDataReceived, StreamReset
+from aioquic.quic.events import ConnectionTerminated, StopSendingReceived, StreamDataReceived, StreamReset
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -118,6 +118,7 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
         self.m_session_id = ""
         self.m_device_id = ""
         self.m_control_stream_id: int | None = None
+        self.m_control_closed = False
         self.m_control_stream_buffers: dict[int, bytearray] = {}
         self.m_file_stream_states: dict[int, FileStreamState] = {}
         self.m_file_storage_failed = False
@@ -323,13 +324,31 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
             if lease.offset != transfer.file_size:
                 uploads.release(lease)
 
+    def _close_control(self, reason: str) -> None:
+        self.m_control_closed = True
+        self.m_control_stream_buffers.clear()
+        self.m_download_sender.close()
+        self.m_online_hub.unregister(self.m_user_id, self)
+        self._quic.close(error_code=0x1003, reason_phrase=reason)
+        self.transmit()
+
     def quic_event_received(self, event):
         if isinstance(event, ConnectionTerminated):
+            self.m_control_closed = True
+            self.m_control_stream_buffers.clear()
             self.m_download_sender.close()
             if self.m_user_id:
                 self.m_online_hub.unregister(self.m_user_id, self)
             return
+        if self.m_control_closed:
+            return
+        if isinstance(event, StopSendingReceived) and event.stream_id == self.m_control_stream_id:
+            self._close_control("control_stream_stopped")
+            return
         if isinstance(event, StreamReset):
+            if event.stream_id == self.m_control_stream_id or (self.m_control_stream_id is None and event.stream_id % 4 == 0):
+                self._close_control("control_stream_reset")
+                return
             self.m_file_stream_states.pop(event.stream_id, None)
             self.m_rejected_file_streams.add(event.stream_id)
             self.m_online_hub.uploads.release_owner(self, event.stream_id)
@@ -337,7 +356,12 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
         if self.m_file_storage_failed or not isinstance(event, StreamDataReceived):
             return
 
-        if self.m_control_stream_id is not None and event.stream_id != self.m_control_stream_id:
+        if self.m_control_stream_id is None:
+            if event.stream_id % 4 != 0:
+                self._close_control("invalid_control_stream")
+                return
+            self.m_control_stream_id = event.stream_id
+        if event.stream_id != self.m_control_stream_id:
             self._handle_file_stream_data(event.stream_id, event.data, event.end_stream)
             return
 
@@ -350,9 +374,10 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
         try:
             envelopes = EnvelopeCodec.decode_frames(control_buffer)
         except Exception:
-            self.m_control_stream_buffers.pop(event.stream_id, None)
-            self._quic.close(error_code=0x1003, reason_phrase="invalid_control_frame")
-            self.transmit()
+            self._close_control("invalid_control_frame")
+            return
+        if event.end_stream and control_buffer:
+            self._close_control("incomplete_control_frame")
             return
 
         for envelope in envelopes:
@@ -373,8 +398,6 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
             self.m_user_id = session.user_id
             self.m_session_id = envelope.session_id
             self.m_device_id = session.device_id
-            if self.m_control_stream_id is None:
-                self.m_control_stream_id = event.stream_id
             self.m_online_hub.register(session.user_id, self)
 
             if envelope.HasField("heartbeat"):
@@ -546,6 +569,9 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
                 continue
 
             self._send_error(event.stream_id, envelope, 400, "unsupported envelope body")
+
+        if event.end_stream:
+            self._close_control("control_stream_closed")
 
 
 def ensure_dev_cert(cert_path: Path, key_path: Path) -> None:

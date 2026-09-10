@@ -13,7 +13,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from aioquic.asyncio import connect, QuicConnectionProtocol
-from aioquic.quic.events import StopSendingReceived
+from aioquic.quic.events import ConnectionTerminated, StopSendingReceived
 from aioquic.quic.configuration import QuicConfiguration
 from protocol.codec import EnvelopeCodec
 from protocol.pb import auth_pb2, common_pb2, conversation_pb2, envelope_pb2, file_pb2, message_pb2, sync_pb2
@@ -54,10 +54,13 @@ class ObservedPeer(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.stopped = {}
+        self.termination = None
 
     def quic_event_received(self, event):
         if isinstance(event, StopSendingReceived):
             self.stopped[event.stream_id] = event.error_code
+        if isinstance(event, ConnectionTerminated):
+            self.termination = event
         super().quic_event_received(event)
 
 
@@ -94,7 +97,13 @@ class ControlWriteNetworkTest(unittest.IsolatedAsyncioTestCase):
         dropped = self.drop_ack
         rejected = self.rejected_uploads = []
 
+        protocols = self.protocols = []
+
         class FaultProtocol(MiniImQuicProtocol):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                protocols.append(self)
+
             def _reject_file_stream(self, stream_id):
                 super()._reject_file_stream(stream_id)
                 rejected.append((self.m_device_id, stream_id))
@@ -154,9 +163,129 @@ class ControlWriteNetworkTest(unittest.IsolatedAsyncioTestCase):
                     version=1, request_id=request_id, channel=common_pb2.CHANNEL_CONTROL,
                     session_id=welcome.welcome.session_id, device_id=claimed_device if claimed_device is not None else device, **body)
                 writer.write(EnvelopeCodec.encode_frame(envelope))
-            yield (reader, send, protocol) if with_protocol else (reader, send)
-            writer.close()
+            try:
+                yield (reader, send, protocol) if with_protocol else (reader, send)
+            finally:
+                if protocol.termination is not None:
+                    # Raw FIN/reset injection bypasses the asyncio adapter's state.
+                    writer.transport._closing = True
+                else:
+                    writer.close()
 
+
+    async def test_fragmented_and_coalesced_control_requests_preserve_order(self):
+        async with self.peer(with_protocol=True) as (reader, send, protocol):
+            send("establish", heartbeat=auth_pb2.Heartbeat(ts_ms=1))
+            await self.read(reader, "establish", "heartbeat")
+            requests = [envelope_pb2.Envelope(version=1, request_id="split-" + str(i),
+                session_id=self.protocols[-1].m_session_id, device_id="first-device",
+                heartbeat=auth_pb2.Heartbeat(ts_ms=i)) for i in (2, 3)]
+            first, second = [EnvelopeCodec.encode_frame(item) for item in requests]
+            wire = first + second
+            begin = 0
+            for end in (1, 3, 4, 6, len(first) - 1, len(wire)):
+                protocol._quic.send_stream_data(0, wire[begin:end])
+                protocol.transmit()
+                await asyncio.sleep(0.01)
+                begin = end
+            replies = [await self.read(reader), await self.read(reader)]
+            self.assertEqual([item.request_id for item in requests], [item.request_id for item in replies])
+            self.assertEqual([2, 3], [item.heartbeat.ts_ms for item in replies])
+            self.assertIsNone(protocol.termination)
+
+    async def test_initial_unidirectional_stream_is_rejected(self):
+        config = QuicConfiguration(is_client=True, alpn_protocols=["mini-im"])
+        config.verify_mode = ssl.CERT_NONE
+        async with connect("127.0.0.1", self.port, configuration=config, create_protocol=ObservedPeer) as protocol:
+            stream_id = protocol._quic.get_next_available_stream_id(is_unidirectional=True)
+            hello = envelope_pb2.Envelope(version=1, request_id="uni-hello",
+                hello=auth_pb2.Hello(token="dev-token:alice", device_id="uni-device"))
+            protocol._quic.send_stream_data(stream_id, EnvelopeCodec.encode_frame(hello))
+            protocol.transmit()
+            await asyncio.wait_for(protocol.wait_closed(), 2)
+            self.assertEqual(0x1003, protocol.termination.error_code)
+            self.assertEqual("invalid_control_stream", protocol.termination.reason_phrase)
+            self.assertEqual({}, self.protocols[-1].m_control_stream_buffers)
+
+    async def test_control_fin_closes_connection_and_preserves_incomplete_write(self):
+        for suffix in (b"", b"\x00", b"\x00\x00\x00", struct.pack(">I", 128) + b"\x08"):
+            with self.subTest(suffix=suffix):
+                async with self.peer(with_protocol=True) as (reader, send, protocol):
+                    send("establish", heartbeat=auth_pb2.Heartbeat(ts_ms=1))
+                    await self.read(reader, "establish", "heartbeat")
+                    protocol._quic.send_stream_data(0, suffix, end_stream=True)
+                    protocol.transmit()
+                    await asyncio.wait_for(protocol.wait_closed(), 2)
+                    self.assertEqual(0x1003, protocol.termination.error_code)
+                    expected = "incomplete_control_frame" if suffix else "control_stream_closed"
+                    self.assertEqual(expected, protocol.termination.reason_phrase)
+                    self.assertEqual({}, self.protocols[-1].m_control_stream_buffers)
+                    self.assertNotIn(self.protocols[-1], self.protocols[-1].m_online_hub.m_protocols.get("alice", ()))
+                    self.assertEqual(0, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+
+    async def test_truncated_message_retries_original_request_on_new_connection(self):
+        body = message_pb2.SendMessage(conversation_id=self.conversation, client_msg_id="truncated-intent",
+            type=common_pb2.MSG_TEXT, content=b"only commit after complete framing")
+        before = self.event_count()
+        async with self.peer(with_protocol=True) as (reader, send, protocol):
+            send("establish", heartbeat=auth_pb2.Heartbeat(ts_ms=1))
+            await self.read(reader, "establish", "heartbeat")
+            envelope = envelope_pb2.Envelope(version=1, request_id="truncated-request",
+                session_id=self.protocols[-1].m_session_id, send_message=body)
+            protocol._quic.send_stream_data(0, EnvelopeCodec.encode_frame(envelope)[:-1], end_stream=True)
+            protocol.transmit()
+            await asyncio.wait_for(protocol.wait_closed(), 2)
+            self.assertEqual("incomplete_control_frame", protocol.termination.reason_phrase)
+        self.assertEqual(before, self.event_count())
+        self.assertEqual(0, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+        self.assertIsNone(self.db.execute_fetchone(
+            "SELECT 1 FROM control_write_results WHERE request_id='truncated-request'"))
+        async with self.peer() as (reader, send):
+            send("truncated-request", send_message=body)
+            first = (await self.read(reader, "truncated-request", "ack")).ack
+            self.assertTrue(first.success)
+            send("truncated-request", send_message=body)
+            replay = (await self.read(reader, "truncated-request", "ack")).ack
+            self.assertEqual(first.SerializeToString(), replay.SerializeToString())
+        self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+        self.assertEqual(body.content, self.db.execute_fetchone("SELECT content FROM messages")[0])
+
+    async def test_control_reset_closes_connection_before_and_after_authentication(self):
+        for authenticated in (False, True):
+            with self.subTest(authenticated=authenticated):
+                async with self.peer(with_protocol=True) as (reader, send, protocol):
+                    if authenticated:
+                        send("establish", heartbeat=auth_pb2.Heartbeat(ts_ms=1))
+                        await self.read(reader, "establish", "heartbeat")
+                    protocol._quic.reset_stream(0, error_code=7)
+                    protocol.transmit()
+                    await asyncio.wait_for(protocol.wait_closed(), 2)
+                    self.assertEqual(0x1003, protocol.termination.error_code)
+                    self.assertEqual("control_stream_reset", protocol.termination.reason_phrase)
+
+    async def test_control_stop_sending_closes_connection(self):
+        async with self.peer(with_protocol=True) as (reader, send, protocol):
+            send("establish", heartbeat=auth_pb2.Heartbeat(ts_ms=1))
+            await self.read(reader, "establish", "heartbeat")
+            protocol._quic.stop_stream(0, error_code=8)
+            protocol.transmit()
+            await asyncio.wait_for(protocol.wait_closed(), 2)
+            self.assertEqual(0x1003, protocol.termination.error_code)
+            self.assertEqual("control_stream_stopped", protocol.termination.reason_phrase)
+            self.assertEqual({}, self.protocols[-1].m_control_stream_buffers)
+            self.assertNotIn(self.protocols[-1], self.protocols[-1].m_online_hub.m_protocols.get("alice", ()))
+
+    async def test_invalid_control_frames_close_without_business_writes(self):
+        for data in (struct.pack(">I", 0), struct.pack(">I", EnvelopeCodec.MAX_FRAME_SIZE + 1),
+                     struct.pack(">I", 0xffffffff), struct.pack(">I", 1) + b"\xff"):
+            with self.subTest(data=data):
+                async with self.peer(with_protocol=True) as (reader, send, protocol):
+                    protocol._quic.send_stream_data(0, data)
+                    protocol.transmit()
+                    await asyncio.wait_for(protocol.wait_closed(), 2)
+                    self.assertEqual(0x1003, protocol.termination.error_code)
+                    self.assertEqual("invalid_control_frame", protocol.termination.reason_phrase)
+                    self.assertEqual(0, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
 
     async def test_message_intent_conflict_from_second_device_survives_server_reopen(self):
         request = message_pb2.SendMessage(conversation_id=self.conversation, client_msg_id="shared-intent",

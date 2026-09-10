@@ -389,14 +389,14 @@ void MiniImSessionManager::handleIncomingControlStreamData(const QByteArray& pay
         {
             AppendClientLog(QStringLiteral("control frame rejected: empty payload"));
             m_control_stream_buffer.clear();
-            emit errorRaised(QStringLiteral("invalid envelope frame"));
+            restartConnection(QStringLiteral("invalid envelope frame"));
             return;
         }
         if (payload_size > 16 * 1024 * 1024)
         {
             AppendClientLog(QStringLiteral("control frame rejected: payload too large size=%1").arg(payload_size));
             m_control_stream_buffer.clear();
-            emit errorRaised(QStringLiteral("invalid envelope frame"));
+            restartConnection(QStringLiteral("invalid envelope frame"));
             return;
         }
         if (m_control_stream_buffer.size() < static_cast<int>(frame_size))
@@ -850,7 +850,7 @@ void MiniImSessionManager::handleIncomingEnvelope(const QByteArray& payload)
     if (!envelope.ParseFromArray(payload.constData(), payload.size()))
     {
         AppendClientLog(QStringLiteral("handleIncomingEnvelope parse failed"));
-        emit errorRaised(QStringLiteral("invalid envelope payload"));
+        restartConnection(QStringLiteral("invalid envelope payload"));
         return;
     }
 

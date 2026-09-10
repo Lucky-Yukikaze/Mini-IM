@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT / "server"))
 from quic.endpoint import serve_quic
 from aioquic.quic.configuration import QuicConfiguration
 
+from protocol.codec import EnvelopeCodec
 from protocol.pb import common_pb2, message_pb2
 from quic.server import FaultConfig, MiniImQuicProtocol, OnlineSessionHub, ensure_dev_cert
 from services.auth.service import AuthService
@@ -1300,6 +1301,64 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         await self.alice.wait("message-sends", lambda item: not item["items"], since=mark)
         await self.bob.wait("message", lambda item: item["clientMsgId"] == "pending-alice")
         self.assert_single_message_intent("pending-alice", 2)
+
+    async def test_fragmented_coalesced_control_events_apply_once_in_order(self):
+        await self.synced(self.alice)
+        protocol = self.active_protocol("alice")
+        frames = []
+        intents = ["split-first", "split-second"]
+        mark = len(self.alice.events)
+        with patch.object(protocol, "_send", lambda stream, envelope: frames.append(EnvelopeCodec.encode_frame(envelope))):
+            for intent in intents:
+                result = protocol.m_message_service.handle_send_message("bob", intent, message_pb2.SendMessage(
+                    conversation_id=self.conversation, client_msg_id=intent, type=common_pb2.MSG_TEXT,
+                    content=("fragmented " + intent).encode()))
+                self.assertTrue(result.ack.success)
+                for event in result.sync_events:
+                    if event.user_id == "alice":
+                        protocol.send_sync_event(event)
+        self.assertEqual(2, len(frames))
+        wire = b"".join(frames)
+        begin = 0
+        for end in (1, 2, 3, 4, 7, len(frames[0]) - 1, len(wire)):
+            protocol._quic.send_stream_data(protocol.m_control_stream_id, wire[begin:end])
+            protocol.transmit()
+            await asyncio.sleep(0.02)
+            begin = end
+        await self.alice.wait("message", lambda item: item["clientMsgId"] == intents[-1], since=mark)
+        observed = [item["data"]["clientMsgId"] for item in self.alice.events[mark:]
+            if item["event"] == "message" and item["data"]["clientMsgId"] in intents]
+        self.assertEqual(intents, observed)
+        self.assertFalse(any(item["event"] == "connection" and item["data"]["state"] == "reconnecting"
+            for item in self.alice.events[mark:]))
+
+    async def check_invalid_control_frame_recovery(self, data, intent, end_stream=False):
+        self.rejected_message_intents[intent] = 503
+        mark = await self.alice.command("message", conversation=self.conversation, intent=intent, text="preserve intent")
+        await self.alice.wait("message-sends", lambda item: any(x["code"] == 503 for x in item["items"]), since=mark)
+        self.rejected_message_intents.clear()
+        protocol = self.active_protocol("alice")
+        mark = len(self.alice.events)
+        protocol._quic.send_stream_data(protocol.m_control_stream_id, data, end_stream=end_stream)
+        protocol.transmit()
+        await self.alice.wait("connection", lambda item: item["state"] == "reconnecting", since=mark, timeout=3)
+        await self.alice.wait("connection", lambda item: item["state"] == "connected", since=mark, timeout=8)
+        self.assertIsNot(protocol, self.active_protocol("alice"))
+        await self.alice.wait("message-sends", lambda item: not item["items"], since=mark)
+        await self.bob.wait("message", lambda item: item["clientMsgId"] == intent)
+        self.assert_single_message_intent(intent, 2)
+
+    async def test_empty_control_frame_reconnects_with_original_message(self):
+        await self.check_invalid_control_frame_recovery(b"\x00\x00\x00\x00", "empty-frame")
+
+    async def test_oversized_control_frame_reconnects_with_original_message(self):
+        await self.check_invalid_control_frame_recovery((16 * 1024 * 1024 + 1).to_bytes(4, "big"), "large-frame")
+
+    async def test_malformed_control_payload_reconnects_with_original_message(self):
+        await self.check_invalid_control_frame_recovery(b"\x00\x00\x00\x01\xff", "bad-payload")
+
+    async def test_truncated_control_stream_reconnects_with_original_message(self):
+        await self.check_invalid_control_frame_recovery(b"\x00\x00\x00\x20\x08", "truncated-frame", True)
 
     async def test_control_stream_reset_reconnects_before_next_message(self):
         protocol = self.active_protocol("alice")

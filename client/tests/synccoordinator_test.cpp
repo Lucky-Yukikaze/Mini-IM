@@ -40,6 +40,7 @@ struct Fixture
     QTemporaryDir root;
     MiniImStateStore store;
     QVector<im::envelope::Envelope> sent;
+    QVector<im::envelope::Envelope> confirmations;
     int requestCount = 0;
     int readyCount = 0;
     int appliedCount = 0;
@@ -59,6 +60,10 @@ struct Fixture
             im::envelope::Envelope request;
             Require(request.ParseFromString(payload), "valid serialized sync request");
             sent.append(request);
+            if (request.has_sync_applied())
+            {
+                confirmations.append(request);
+            }
             return true;
         })
     {
@@ -122,37 +127,46 @@ void CheckDurableConfirmationRetries()
 {
     Fixture fixture;
     fixture.reply(fixture.sent.first().request_id(), {Message(1), Message(3)}, true, 3);
-    WaitUntil([&]() { return fixture.sent.last().has_sync_applied(); });
-    const auto original = fixture.sent.last();
+    WaitUntil([&]() { return !fixture.confirmations.isEmpty(); });
+    const auto original = fixture.confirmations.last();
     const auto id = QString::fromStdString(original.request_id());
     Require(original.sync_applied().global_cursor() == 1, "confirm only committed continuous prefix");
     Require(fixture.store.pendingConfirmation().value("requestId") == id, "intent durable before sending");
-    const auto count = fixture.sent.size();
+    auto count = fixture.confirmations.size();
     fixture.sync.handleConfirmationResult(id, false, 503, {});
-    WaitUntil([&]() { return fixture.sent.size() > count && fixture.sent.last().has_sync_applied(); }, 6500);
-    Require(fixture.sent.last().SerializeAsString() == original.SerializeAsString(), "retry same identity and body");
+    // Delay event processing so confirmation and history retry become due together.
+    QThread::msleep(5500);
+    WaitUntil([&]() { return fixture.confirmations.size() > count; }, 1000);
+    Require(fixture.sent.last().has_sync_request(), "history retry follows confirmation in the same timer tick");
+    Require(fixture.confirmations.last().SerializeAsString() == original.SerializeAsString(), "retry same identity and body");
     fixture.sync.stop();
     fixture.store.close();
     Require(fixture.store.open(fixture.root.path(), "endpoint", "bob", "device"), "reopen durable state");
+    count = fixture.confirmations.size();
     fixture.sync.start();
-    WaitUntil([&]() { return fixture.sent.last().has_sync_applied(); });
-    Require(fixture.sent.last().request_id() == original.request_id(), "restart uses original request");
-    Require(fixture.sent.last().sync_applied().global_cursor() == 1, "restart does not widen pending intent");
+    WaitUntil([&]() { return fixture.confirmations.size() > count; });
+    Require(fixture.confirmations.last().request_id() == original.request_id(), "restart uses original request");
+    Require(fixture.confirmations.last().sync_applied().global_cursor() == 1, "restart does not widen pending intent");
     fixture.sql("CREATE TRIGGER reject_ack BEFORE DELETE ON metadata WHEN OLD.key='sync_confirmation' "
         "BEGIN SELECT RAISE(ABORT,'injected ack persistence failure'); END");
     fixture.sync.handleConfirmationResult(id, true, 0, "1");
     Require(fixture.failedCount == 1 && fixture.store.confirmedCursor() == 0, "ack save failure stops confirmation");
     Require(!fixture.store.pendingConfirmation().isEmpty(), "ack save failure remains recoverable");
     fixture.sql("DROP TRIGGER reject_ack");
+    count = fixture.confirmations.size();
     fixture.sync.start();
-    WaitUntil([&]() { return fixture.sent.last().has_sync_applied(); });
+    WaitUntil([&]() { return fixture.confirmations.size() > count; });
     fixture.sync.handleConfirmationResult(id, true, 0, "1");
     Require(fixture.store.confirmedCursor() == 1, "matching response settles original intent");
     Require(!fixture.sync.handleConfirmationResult(id, true, 0, "1"), "duplicate ack has no repeated effect");
+    count = fixture.confirmations.size();
     fixture.reply("", {Message(2)});
-    WaitUntil([&]() { return fixture.sent.last().has_sync_applied() && fixture.sent.last().sync_applied().global_cursor() == 3; });
-    Require(fixture.sent.last().request_id() != original.request_id(), "new prefix uses new identity");
-    fixture.sync.handleConfirmationResult(QString::fromStdString(fixture.sent.last().request_id()), true, 0, "99");
+    WaitUntil([&]()
+    {
+        return fixture.confirmations.size() > count && fixture.confirmations.last().sync_applied().global_cursor() == 3;
+    });
+    Require(fixture.confirmations.last().request_id() != original.request_id(), "new prefix uses new identity");
+    fixture.sync.handleConfirmationResult(QString::fromStdString(fixture.confirmations.last().request_id()), true, 0, "99");
     Require(fixture.failedCount == 2 && fixture.store.confirmedCursor() == 1, "wrong response cursor cannot settle intent");
 }
 
