@@ -196,6 +196,29 @@ async page => {
     await button('发送').click();
     await page.locator('.message-row').filter({ hasText: data.text }).waitFor();
     check(await page.getByPlaceholder('输入消息', { exact: true }).inputValue() === '', 'saved message draft retained');
+  } else if (data.phase === 'crash-submit-message') {
+    await page.getByPlaceholder('输入消息', { exact: true }).fill(data.text);
+    await button('发送').click();
+    await page.waitForFunction(() => document.querySelector('.composer textarea').value === '');
+  } else if (data.phase === 'crash-submit-rename') {
+    if (!(await page.getByPlaceholder('群名称', { exact: true }).count())) await button('成员').click();
+    await page.getByPlaceholder('群名称', { exact: true }).fill(data.title);
+    await button('改名').click();
+    await status.getByText('修改群名 · 等待确认', { exact: true }).waitFor();
+  } else if (data.phase === 'crash-recovered') {
+    await page.getByRole('heading', { name: data.title, exact: true, level: 2 }).waitFor();
+    if (data.text) {
+      const row = page.locator('.message-row').filter({ hasText: data.text });
+      await row.waitFor();
+      check(await row.count() === 1, 'recovery duplicated the message');
+    }
+    if (data.fileName) {
+      const row = page.locator('.message-row').filter({ hasText: data.fileName });
+      await row.getByRole('button', { name: '填入下载', exact: true }).waitFor();
+      check(await row.count() === 1, 'recovery duplicated the file message');
+    }
+    check(await page.locator('.file-task-card').count() === 0, 'file recovery remains pending');
+    if (data.image) await page.screenshot({ path: data.image });
   } else if (data.phase === 'file-complete') {
     await page.locator('.file-task-card').waitFor({ state: 'hidden' });
     if (data.image) await page.screenshot({ path: data.image });

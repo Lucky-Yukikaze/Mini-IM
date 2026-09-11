@@ -641,6 +641,31 @@ SHA-256 = 根据文件内容计算的固定摘要，此处配合逐字节比较�
 本检查仍使用夹具进程内的服务，只终止真实桌面客户端；桌面与独立服务共同退出须另行验收。
 本批证据与首轮失败见 [并发批次](refactoring-progress.md#桌面文件并发与下载任务名称--2026-09-11)。
 
+### 桌面与独立服务共同退出
+
+[共同退出检查](../tools/test_desktop_restart.py) 自动建立隔离环境、启动真实 Qt WebEngine 桌面和独立服务进程，
+通过相同 Playwright CLI 操作页面；无需先运行 `desktop_fixture.py`。
+服务复用 [生产进程故障夹具](../tools/server_restart_fixture.py)，在指定业务提交或文件写盘位置暂停，
+测试按服务自报身份直接终止实际服务，并同时终止桌面；两者退出码均须非零。
+
+~~~powershell
+& ./.venv/Scripts/python.exe ./tools/test_desktop_restart.py --qt-root 'D:/Qt/6.11.0/msvc2022_64' --playwright-cli 'C:/tools/playwright-core/lib/tools/cli-client/cli.js'
+~~~
+
+默认运行 9 项：消息及改名的提交前/确认发送前、文件完成的提交前/确认发送前、
+上传的未提交磁盘尾部/已提交进度，以及下载已有部分内容。
+可重复追加 `--test test_message_before_commit` 等方法名选择场景；`--client` 指定另一桌面构建，`--output` 指定证据父目录。
+默认客户端为 `build/client-manifest/Release/mini_im_client.exe`，命令中的 Qt 与 CLI 路径按本机替换。
+重启复用原数据目录、缓存和服务端口，实际服务及桌面进程号均须变化；核对请求和意图身份、业务结果、页面内容、文件字节及连续同步确认。
+已提交上传可从稳定的完成同步事件恢复，此时不要求桌面再次发送完成请求；原完成结果及事件内容必须保持一致。
+
+证据保存在 `tmp/desktop-restart/<运行时间>/<场景>/`：`lifecycle.json` 分别记录服务与启动器退出码，
+`joint-crashes.json` 记录中断点、两端退出与替换进程，另有两端重启前后数据库副本、`final-state.json`、文件摘要和页面阶段。
+截图保存在 `output/playwright/<运行时间>/<场景>/`；所有运行证据均被 Git 忽略，测试结束清理隔离运行目录。
+`results.json` 只有在全部选定场景通过后才标记成功。
+本批未覆盖桌面取消、已读、撤回和收件确认的共同退出，也不代表机器断电恢复或性能验收；
+现有结果见 [共同退出桌面批次](refactoring-progress.md#真实桌面与独立服务共同退出--2026-09-11)。
+
 ## 现有脚本与历史环境
 
 | 入口 | 当前使用边界 |
