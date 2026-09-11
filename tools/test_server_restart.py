@@ -21,6 +21,9 @@ import tempfile
 import time
 import unittest
 
+if sys.platform == "win32":
+    import _winapi
+
 from test_native_flow import NativeClient
 from aioquic.asyncio import connect
 from aioquic.quic.configuration import QuicConfiguration
@@ -36,6 +39,9 @@ class ServerProcess:
         self.events = []
         self.condition = asyncio.Condition()
         self.finished = False
+        self.pid = process.pid
+        self.service_handle = None
+        self.service_exit_code = None
         self.hard_killed = False
         self.reader = asyncio.create_task(self.read())
 
@@ -52,6 +58,11 @@ class ServerProcess:
         try:
             ready = await server.wait("ready", timeout=12)
             server.port = ready["port"]
+            server.pid = ready["pid"]
+            if sys.platform == "win32":
+                # Keep the actual interpreter identity, including when venv uses a launcher.
+                # PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE.
+                server.service_handle = _winapi.OpenProcess(0x001 | 0x1000 | 0x100000, False, server.pid)
             return server
         except BaseException:
             await server.close(kill=True)
@@ -88,30 +99,53 @@ class ServerProcess:
         await self.process.stdin.drain()
         await self.wait("armed", since=mark)
 
+    def service_running(self):
+        if self.service_handle is not None:
+            return _winapi.WaitForSingleObject(self.service_handle, 0) != _winapi.WAIT_OBJECT_0
+        return self.process.returncode is None
+
+    def terminate_service(self):
+        self.hard_killed = True
+        if self.service_handle is not None:
+            _winapi.TerminateProcess(self.service_handle, 1)
+        else:
+            self.process.kill()
+
+    async def wait_service(self):
+        if self.service_handle is not None:
+            result = await asyncio.to_thread(_winapi.WaitForSingleObject, self.service_handle, 5000)
+            if result != _winapi.WAIT_OBJECT_0:
+                raise TimeoutError("actual server process did not terminate")
+            self.service_exit_code = _winapi.GetExitCodeProcess(self.service_handle)
+        else:
+            self.service_exit_code = self.process.returncode
+
     async def close(self, kill=False):
         if self.log.closed:
             return
         try:
-            if self.process.returncode is None:
-                if kill:
-                    self.hard_killed = True
-                    self.process.kill()
-                else:
-                    self.process.stdin.write(b'{"op":"stop"}\n')
-                    await self.process.stdin.drain()
-                    self.process.stdin.close()
-                await asyncio.wait_for(self.process.wait(), 5)
-            if not kill and self.process.returncode != 0:
-                raise AssertionError(f"server exited with {self.process.returncode}")
+            if kill and self.service_running():
+                self.terminate_service()
+            elif self.process.returncode is None:
+                self.process.stdin.write(b'{"op":"stop"}\n')
+                await self.process.stdin.drain()
+                self.process.stdin.close()
+            await asyncio.wait_for(self.process.wait(), 5)
+            await self.wait_service()
+            if not kill and (self.process.returncode != 0 or self.service_exit_code != 0):
+                raise AssertionError(f"server exited with {self.service_exit_code}; launcher {self.process.returncode}")
         finally:
-            if self.process.returncode is None:
-                self.hard_killed = True
-                self.process.kill()
-                await self.process.wait()
+            if self.service_running():
+                self.terminate_service()
+                await asyncio.wait_for(self.process.wait(), 5)
+                await self.wait_service()
             self.process.stdin.close()
             try:
                 await self.reader
             finally:
+                if self.service_handle is not None:
+                    _winapi.CloseHandle(self.service_handle)
+                    self.service_handle = None
                 self.log.close()
                 self.evidence.close()
 
@@ -188,9 +222,27 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(int(initial["globalCursor"]), int(cursor[0]["value"]) if cursor else 0)
 
     def rows(self, sql, params=(), path=None):
-        with closing(sqlite3.connect(path or self.db_path, timeout=3)) as db:
-            db.row_factory = sqlite3.Row
-            return [dict(row) for row in db.execute(sql, params)]
+        target = Path(path or self.db_path)
+        try:
+            with closing(sqlite3.connect(target, timeout=3)) as db:
+                db.row_factory = sqlite3.Row
+                return [dict(row) for row in db.execute(sql, params)]
+        except sqlite3.Error as error:
+            files = []
+            for suffix in ("", "-wal", "-shm", "-journal"):
+                candidate = Path(str(target) + suffix)
+                try:
+                    info = candidate.stat()
+                    files.append(dict(path=str(candidate), size=info.st_size, modifiedNs=info.st_mtime_ns))
+                except OSError as stat_error:
+                    files.append(dict(path=str(candidate), error=type(stat_error).__name__))
+            record = dict(error=str(error), code=getattr(error, "sqlite_errorcode", None),
+                name=getattr(error, "sqlite_errorname", None), query=sql, files=files,
+                servers=[dict(pid=server.pid, exitCode=server.service_exit_code,
+                    launcherPid=server.process.pid, launcherExitCode=server.process.returncode) for server in self.servers])
+            with (self.output / "sqlite-errors.jsonl").open("a", encoding="utf-8") as log:
+                log.write(json.dumps(record) + "\n")
+            raise
 
     def scalar(self, sql, params=()):
         return next(iter(self.rows(sql, params)[0].values()))
@@ -226,10 +278,13 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         await self.server.close(kill=True)
         self.assertIsNotNone(self.server.process.returncode)
         self.assertNotEqual(0, self.server.process.returncode)
+        self.assertEqual(checkpoint["pid"], self.server.pid)
+        self.assertIsNotNone(self.server.service_exit_code)
+        self.assertNotEqual(0, self.server.service_exit_code)
         if self.restart_all_clients:
             self.assertEqual(2, len(self.clients))
             await asyncio.gather(*(client.crash() for client in self.clients))
-            record = dict(serverPid=self.server.process.pid, checkpoint=checkpoint, clients=[])
+            record = dict(serverPid=self.server.pid, checkpoint=checkpoint, clients=[])
             for user, client in zip(("alice", "bob"), self.clients):
                 self.assertNotEqual(0, client.process.returncode)
                 record["clients"].append(dict(user=user, pid=client.process.pid, exitCode=client.process.returncode))
@@ -280,7 +335,8 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
             except Exception as error:
                 errors.append(error)
         (self.output / "lifecycle.json").write_text(json.dumps([
-            dict(pid=server.process.pid, port=server.port, exitCode=server.process.returncode,
+            dict(pid=server.pid, launcherPid=server.process.pid, port=server.port,
+                 exitCode=server.service_exit_code, launcherExitCode=server.process.returncode,
                  hardKilled=server.hard_killed) for server in self.servers], indent=2), encoding="utf-8")
         (self.output / "joint-crashes.json").write_text(json.dumps(self.joint_crashes, indent=2), encoding="utf-8")
         if self.db_path.exists():

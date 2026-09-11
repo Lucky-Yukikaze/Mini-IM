@@ -467,6 +467,7 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
             except Exception as exc:
                 errors.append(exc)
         if self.server is not None:
+            await self.hub.writes.stop()
             self.server.close()
         for protocol in self.protocols:
             protocol.m_download_sender.close()

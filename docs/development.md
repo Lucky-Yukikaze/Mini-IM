@@ -215,6 +215,24 @@ Qt 遇到非法帧使用已有重连流程，已保存的待确认消息沿用�
 消息保存和页面检查见 [发送意图验证](refactoring-progress.md#消息发送意图与确认恢复--2026-09-07)，
 自动重连见 [连接恢复验证](refactoring-progress.md#自动重连与会话恢复--2026-09-07)。
 
+## 服务端业务写入入口
+
+[共享写队列](../server/storage/sqlite/write_queue.py) = 同一事件循环中按接收顺序执行完整业务操作的入口。
+所有连接通过同一个 `OnlineSessionHub.writes` 排队处理控制请求、文件流和连接事件；
+焚毁扫描也使用这个入口，启动建库及迁移在监听开始前完成。
+操作调用现有服务与仓储完成事务，事务提交后再发送确认或推送；队列不增加外层事务。
+任务必须同步完成，不能在事务中使用 `await`；单个任务失败会通知调用方，后续任务继续处理。
+
+`enqueue(operation)` 接受任务并返回可等待的结果；`submit(operation)` 等待结果且保护已接受任务免受调用者取消影响。
+`stop()` 停止接收并处理完已接受任务，随后服务关闭传输和数据库；停机排空期间的晚到请求不再接受。
+排队内容仅在内存中，进程宕机后依靠客户端保存的原请求与服务端持久结果恢复。
+文件流结束标记在收到事件时保存，避免排队期间 QUIC 库清理流后再次要求停止该流。
+
+队列尚无容量限制；数据库、文件写盘和摘要计算仍在事件循环中同步执行，未作吞吐或延迟改善承诺。
+验证见 [共享写入批次](refactoring-progress.md#服务端共享业务写入队列--2026-09-11)；
+[队列测试](../server/tests/test_write_queue.py) 与 [真实连接检查](../server/tests/test_control_write_network.py)
+均由下方 [服务端验证命令](#验证) 执行。
+
 ## 控制写入与重试边界
 
 服务端把建会话、增加/移除成员、加入/退出会话、改名、已读和撤回交给
@@ -530,7 +548,10 @@ ctest --test-dir ./build/client-manifest -C Release --output-on-failure
 
 输出位于 `tmp/server-restart/<运行时间>/`，`--output` 可指定父目录；
 每个场景保存服务进程日志、请求与中断位置、客户端事件、`lifecycle.json` 和最终数据库副本。
-`lifecycle.json` 记录进程编号、端口、退出码和是否被强制终止，`results.json` 汇总结果。
+`lifecycle.json` 的 `pid`、`exitCode` 记录实际服务，`launcherPid`、`launcherExitCode` 单独记录启动器，另含端口与是否强制终止。
+Windows 虚拟环境可能通过启动器创建 Python 子进程；测试从服务就绪事件取得真实进程号，保留其系统句柄，
+直接终止并等待该进程退出，再读取数据库。中断位置的服务进程号必须与终止对象一致，`results.json` 汇总结果。
+读库发生 SQLite 错误时，`sqlite-errors.jsonl` 保存扩展错误码、名称、数据库及日志文件状态与服务退出记录，随后继续抛出原错误。
 结束时关闭测试进程并清理临时运行目录；上述证据被 Git 忽略，不作为新环境复现前提。
 焚毁专项可追加 `--test test_burn_scan_rolls_back_before_server_commit --test test_burn_scan_commit_survives_lost_push`。
 驱动的 `message` 命令接受可选 `burnMode`、`burnTtlSec`，省略均为 0；专项通过真实接口发送 5 秒焚毁消息。

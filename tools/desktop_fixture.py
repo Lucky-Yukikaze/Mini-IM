@@ -305,6 +305,7 @@ class DesktopFixture:
     async def close(self):
         await self.stop_client()
         if self.server:
+            await self.hub.writes.stop()
             self.server.close()
         for protocol in self.protocols:
             protocol.m_download_sender.close()

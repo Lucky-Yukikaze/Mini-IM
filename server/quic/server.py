@@ -53,6 +53,7 @@ class FaultConfig:
 class OnlineSessionHub:
     def __init__(self, upload_idle_ms: int = 900000) -> None:
         self.uploads = UploadRegistry(upload_idle_ms)
+        self.writes = SqliteWriteQueue()
         self.m_protocols: dict[str, set["MiniImQuicProtocol"]] = {}
 
     def register(self, user_id: str, protocol: "MiniImQuicProtocol") -> None:
@@ -123,6 +124,7 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
         self.m_file_stream_states: dict[int, FileStreamState] = {}
         self.m_file_storage_failed = False
         self.m_rejected_file_streams: set[int] = set()
+        self.m_pending_receive_ends: set[int] = set()
         self.m_download_sender = DownloadScheduler(self)
 
     @staticmethod
@@ -244,8 +246,10 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
         self.m_rejected_file_streams.add(stream_id)
         self.m_file_stream_states.pop(stream_id, None)
         self.m_online_hub.uploads.release_owner(self, stream_id)
-        self._quic.stop_stream(stream_id, 0x1006)
-        self.transmit()
+        # aioquic may retire a finished stream before its queued event runs.
+        if stream_id not in self.m_pending_receive_ends:
+            self._quic.stop_stream(stream_id, 0x1006)
+            self.transmit()
 
     def _bind_upload_stream(self, stream_id: int, state: FileStreamState, end_stream: bool) -> bool:
         uploads = self.m_online_hub.uploads
@@ -333,6 +337,35 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
         self.transmit()
 
     def quic_event_received(self, event):
+        if not isinstance(event, (ConnectionTerminated, StreamReset, StopSendingReceived, StreamDataReceived)):
+            return
+        receive_ended = isinstance(event, StreamReset) or (
+            isinstance(event, StreamDataReceived) and event.end_stream)
+        if receive_ended:
+            self.m_pending_receive_ends.add(event.stream_id)
+
+        def process():
+            try:
+                self._process_quic_event(event)
+            finally:
+                if receive_ended:
+                    self.m_pending_receive_ends.discard(event.stream_id)
+
+        try:
+            result = self.m_online_hub.writes.enqueue(process)
+        except RuntimeError:
+            # Shutdown closes transport after accepted operations have drained.
+            return
+        result.add_done_callback(self._write_completed)
+
+    def _write_completed(self, result):
+        try:
+            result.result()
+        except (Exception, asyncio.CancelledError) as error:
+            self._debug(f"queued operation failed: {error}")
+            self._close_control("operation_failed")
+
+    def _process_quic_event(self, event):
         if isinstance(event, ConnectionTerminated):
             self.m_control_closed = True
             self.m_control_stream_buffers.clear()
@@ -622,10 +655,12 @@ async def run_burn_sweeper(
     safe_purge_batch_size = max(int(purge_batch_size), 1)
     while True:
         try:
-            events = delivery_repo.collect_due_burn_sync_events(safe_batch_size)
-            if events:
-                online_hub.fanout_sync_events(events)
-            delivery_repo.purge_burned_message_content(safe_purge_batch_size)
+            def sweep():
+                events = delivery_repo.collect_due_burn_sync_events(safe_batch_size)
+                if events:
+                    online_hub.fanout_sync_events(events)
+                delivery_repo.purge_burned_message_content(safe_purge_batch_size)
+            await online_hub.writes.submit(sweep)
         except Exception as exc:  # pragma: no cover
             print(f"mini-im burn sweeper error: {exc}")
         await asyncio.sleep(safe_interval_ms / 1000.0)
@@ -659,8 +694,6 @@ async def run_server(*, data_root: Path | None = None, port: int = 4433) -> None
 
     init_db(db_path)
     db = MiniImSqliteDb(db_path)
-    write_queue = SqliteWriteQueue(db)
-    await write_queue.start()
 
     configuration = QuicConfiguration(is_client=False, alpn_protocols=["mini-im"])
     configuration.load_cert_chain(str(cert_path), str(key_path))
@@ -727,6 +760,6 @@ async def run_server(*, data_root: Path | None = None, port: int = 4433) -> None
             burn_sweeper_task.cancel()
             with suppress(asyncio.CancelledError):
                 await burn_sweeper_task
+        await online_hub.writes.stop()
         server.close()
-        await write_queue.stop()
         db.close()

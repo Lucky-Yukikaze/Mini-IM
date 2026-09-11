@@ -1,9 +1,10 @@
 """Real QUIC checks for durable writes, replay and storage error replies."""
 import asyncio
 import hashlib
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from pathlib import Path
 import ssl
+import sqlite3
 import struct
 import sys
 import tempfile
@@ -93,6 +94,7 @@ class ControlWriteNetworkTest(unittest.IsolatedAsyncioTestCase):
         deliveries = DeliveryService(DeliveryRepo(self.db))
         files = self.files = FileService(FileRepo(self.db), conversations, messages, self.root / "files", 900000)
         auth, hub = AuthService(), OnlineSessionHub()
+        self.hub = hub
         self.uploads = hub.uploads
         dropped = self.drop_ack
         rejected = self.rejected_uploads = []
@@ -130,6 +132,7 @@ class ControlWriteNetworkTest(unittest.IsolatedAsyncioTestCase):
 
     async def cleanup(self):
         if self.server:
+            await self.hub.writes.stop()
             self.server.close()
         if self.db:
             self.db.close()
@@ -172,6 +175,87 @@ class ControlWriteNetworkTest(unittest.IsolatedAsyncioTestCase):
                 else:
                     writer.close()
 
+
+    async def test_connections_share_queue_and_ack_follows_visible_commit(self):
+        async with self.peer(device="one") as (first, send_first), self.peer(device="two") as (second, send_second):
+            # Drain login work before pausing the next worker at its entry.
+            await self.hub.writes.submit(lambda: None)
+            await asyncio.sleep(0)
+            entered, release = asyncio.Event(), asyncio.Event()
+            worker = self.hub.writes._worker_loop
+            observations = []
+            original_send = MiniImQuicProtocol._send
+
+            async def paused_worker():
+                entered.set()
+                await release.wait()
+                await worker()
+
+            def observe(protocol, stream_id, envelope):
+                if envelope.HasField("ack") and envelope.request_id in {"queue-one", "queue-two"}:
+                    self.assertFalse(self.db.m_connection.in_transaction)
+                    with closing(sqlite3.connect(self.root / "test.db")) as independent:
+                        rows = independent.execute("SELECT client_msg_id FROM messages ORDER BY conversation_seq").fetchall()
+                        observations.append((envelope.request_id, rows))
+                original_send(protocol, stream_id, envelope)
+
+            def request(intent):
+                return message_pb2.SendMessage(conversation_id=self.conversation,
+                    client_msg_id=intent, type=common_pb2.MSG_TEXT, content=intent.encode())
+
+            with patch.object(self.hub.writes, "_worker_loop", paused_worker), patch.object(
+                    MiniImQuicProtocol, "_send", observe):
+                try:
+                    send_first("queue-one", send_message=request("one"))
+                    await asyncio.wait_for(entered.wait(), 3)
+                    send_second("queue-two", send_message=request("two"))
+                    await self.until(lambda: len(self.hub.writes.m_queue) >= 2)
+                    self.assertEqual(0, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+                    self.assertEqual([], observations)
+                finally:
+                    release.set()
+                self.assertTrue((await self.read(first, "queue-one", "ack")).ack.success)
+                self.assertTrue((await self.read(second, "queue-two", "ack")).ack.success)
+            self.assertEqual([("queue-one", [("one",)]),
+                ("queue-two", [("one",), ("two",)])], observations)
+
+    async def test_shutdown_drains_accepted_request_before_closing_connection(self):
+        async with self.peer() as (reader, send):
+            await self.hub.writes.submit(lambda: None)
+            await asyncio.sleep(0)
+            entered, release = asyncio.Event(), asyncio.Event()
+            worker = self.hub.writes._worker_loop
+
+            async def paused_worker():
+                entered.set()
+                await release.wait()
+                await worker()
+
+            with patch.object(self.hub.writes, "_worker_loop", paused_worker):
+                stopper = None
+                try:
+                    send("accepted-stop", send_message=message_pb2.SendMessage(
+                        conversation_id=self.conversation, client_msg_id="accepted-stop",
+                        type=common_pb2.MSG_TEXT, content=b"must drain"))
+                    await asyncio.wait_for(entered.wait(), 3)
+                    stopper = asyncio.create_task(self.hub.writes.stop())
+                    await self.until(lambda: not self.hub.writes.m_accepting)
+                    # Real late input must not close the connection ahead of accepted work.
+                    late = asyncio.Event()
+                    enqueue = self.hub.writes.enqueue
+                    def observe_late(operation):
+                        late.set()
+                        return enqueue(operation)
+                    with patch.object(self.hub.writes, "enqueue", observe_late):
+                        send("late-stop", heartbeat=auth_pb2.Heartbeat())
+                        await asyncio.wait_for(late.wait(), 3)
+                    self.assertFalse(stopper.done())
+                finally:
+                    release.set()
+                    if stopper:
+                        await stopper
+                self.assertTrue((await self.read(reader, "accepted-stop", "ack")).ack.success)
+            self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
 
     async def test_fragmented_and_coalesced_control_requests_preserve_order(self):
         async with self.peer(with_protocol=True) as (reader, send, protocol):
