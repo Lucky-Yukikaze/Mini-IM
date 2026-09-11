@@ -46,11 +46,11 @@ class ServerProcess:
         self.reader = asyncio.create_task(self.read())
 
     @classmethod
-    async def start(cls, root, port, output, number, heartbeat):
+    async def start(cls, root, port, output, number, heartbeat, *, fixture=None):
         log = (output / f"server-{number}.log").open("wb")
         evidence = (output / f"server-{number}.jsonl").open("w", encoding="utf-8")
         env = {key: value for key, value in os.environ.items() if not key.startswith("MINIIM_")}
-        process = await asyncio.create_subprocess_exec(sys.executable, "-u", str(ROOT / "tools/server_restart_fixture.py"),
+        process = await asyncio.create_subprocess_exec(sys.executable, "-u", str(fixture or ROOT / "tools/server_restart_fixture.py"),
             "--root", str(root), "--port", str(port), "--heartbeat", str(heartbeat), stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE, stderr=log, env=env,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
