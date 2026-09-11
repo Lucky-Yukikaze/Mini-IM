@@ -268,9 +268,18 @@ class DesktopFixture:
             if transfer is None or transfer.conversation_id != self.group or transfer.direction != 1:
                 raise ValueError("fixture upload required")
             source = Path(self.context["transferSource"]).read_bytes()
-            if data["enabled"]:
-                source = bytes([source[0] ^ 255]) + source[1:]
-            self.files.get_storage_path(data["fileId"]).write_bytes(source)
+            path = self.files.get_storage_path(data["fileId"])
+            damage = data.get("damage", "digest") if data["enabled"] else "none"
+            if damage == "missing":
+                path.unlink()
+            else:
+                if damage == "digest":
+                    source = bytes([source[0] ^ 255]) + source[1:]
+                elif damage == "truncated":
+                    source = source[:-1]
+                elif damage != "none":
+                    raise ValueError("unknown source damage")
+                path.write_bytes(source)
         elif op == "pause-upload":
             self.pause_upload_at = int(data["offset"])
             if not self.pause_upload_at:

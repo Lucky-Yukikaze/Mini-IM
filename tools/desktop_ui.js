@@ -179,6 +179,7 @@ async page => {
   } else if (data.phase === 'file-failed') {
     const task = page.locator('.file-task-card').filter({ hasText: '下载 · download.bin' });
     await task.getByText('传输失败', { exact: true }).waitFor();
+    if (data.error) await task.getByText(data.error, { exact: true }).waitFor();
     await task.getByRole('button', { name: '重试', exact: true }).waitFor();
     if (data.image) await page.screenshot({ path: data.image });
   } else if (data.phase === 'file-retry') {

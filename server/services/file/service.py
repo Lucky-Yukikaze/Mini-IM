@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -137,6 +138,18 @@ class FileService:
             ack.code = 403
             ack.message = "sender is not a conversation member"
             return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
+
+        if is_download:
+            # Check only after membership, and never rewrite a published upload.
+            try:
+                source_stat = (self.m_file_root / source.storage_path).stat()
+                available = stat.S_ISREG(source_stat.st_mode) and source_stat.st_size == source.file_size
+            except FileNotFoundError:
+                available = False
+            if not available:
+                ack.code = 409
+                ack.message = "source file unavailable; restore the original file before retrying"
+                return FileServiceResult(ack=ack, file_updated=None, sync_events=[])
 
         member_ids = self.m_conversation_repo.list_member_ids(effective_conversation_id)
         file_id = self._make_file_id(user_id=user_id, client_file_id=file_init.client_file_id)

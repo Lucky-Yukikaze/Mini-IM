@@ -209,7 +209,14 @@ void MiniImFileCoordinator::onFileClosed(quint64 streamId, bool connectionShutdo
     {
         m_failed_file_downloads.insert(fileId);
         m_download_stream_states.remove(streamId);
-        emit errorRaised(QStringLiteral("download stream interrupted"));
+        if (connectionShutdown)
+        {
+            emit errorRaised(QStringLiteral("download stream interrupted"));
+        }
+        else
+        {
+            failFileTask(fileId, QStringLiteral("download stream interrupted"));
+        }
         return;
     }
     flushPendingDownloadBuffers(fileId);

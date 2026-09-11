@@ -129,6 +129,14 @@ class DownloadSchedulerTest(unittest.IsolatedAsyncioTestCase):
         await self.drain()
         self.assertFalse(self.sender.jobs)
 
+    async def test_truncated_source_resets_instead_of_sending_successful_eof(self):
+        self.path.write_bytes(self.payload[:65536])
+        self.sender.start("truncated", self.path, len(self.payload), 0)
+        await self.drain()
+        self.assertIn(3, self.quic.resets)
+        self.assertNotIn(3, self.quic.fin)
+        self.assertFalse(self.sender.jobs)
+
     async def test_peer_abort_stops_reading_and_releases_slot_after_reset_ack(self):
         self.sender.start("aborted", self.path, len(self.payload), 0)
         await self.until(lambda: self.sender.buffer.pending_bytes(3) == STREAM_BUFFER_LIMIT)

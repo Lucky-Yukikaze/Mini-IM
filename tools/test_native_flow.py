@@ -1164,7 +1164,9 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         initial = await restored.connect(self.endpoint, "alice", "device-alice-conflict")
         self.assertEqual(pending["requestId"], initial["messageSends"][0]["requestId"])
         mark = await restored.command("retry-message", conversation=self.conversation, intent="shared-message")
-        await restored.wait("message-sends", lambda data: any(item["code"] == 409 for item in data["items"]), since=mark)
+        await restored.wait("message-sends", lambda data: any(
+            item["requestId"] == pending["requestId"] and item["code"] == 409
+            and item["attempts"] > pending["attempts"] for item in data["items"]), since=mark)
         self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
         self.assertEqual(b"original", self.db.execute_fetchone("SELECT content FROM messages")[0])
         attempts = [item for item in self.message_attempts if item["requestId"] == pending["requestId"]]
@@ -1536,7 +1538,7 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         payload = b"verified native download" * 4096
         file_id = await self.upload(payload)
         stored = self.files.get_storage_path(file_id)
-        for content, error in ((payload[:-1], "incomplete"), (b"x" * len(payload), "sha256 mismatch")):
+        for content, error in ((payload[:-1], "source file unavailable"), (b"x" * len(payload), "sha256 mismatch")):
             with self.subTest(error=error):
                 stored.write_bytes(content)
                 target = self.root / "protected.bin"
@@ -1545,7 +1547,8 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
                 await self.bob.wait("error", lambda item: error in item["message"], since=mark)
                 self.assertEqual(b"previous content", target.read_bytes())
                 rows = self.db.execute_fetchall("SELECT status FROM file_transfers WHERE direction = ?", (common_pb2.FILE_DIRECTION_DOWNLOAD,))
-                self.assertTrue(rows)
+                if error == "sha256 mismatch":
+                    self.assertTrue(rows)
                 self.assertTrue(all(row["status"] != "completed" for row in rows))
         stored.write_bytes(payload)
         target = self.root / "recovered.bin"
@@ -1608,7 +1611,11 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         self.fault.file_drop_after_bytes = 0
         initial = await self.restart_alice()
         self.assertEqual(row["client_file_id"], initial["fileTasks"][0]["clientFileId"])
-        await self.alice.wait("file-tasks", lambda item: not item["items"])
+        started = time.monotonic()
+        await self.alice.wait("file-tasks", lambda item: not item["items"], timeout=60)
+        (self.output_dir / (self._testMethodName + "-recovery-timing.json")).write_text(json.dumps(dict(
+            bytes=len(payload), completionWaitSeconds=time.monotonic() - started, timeoutSeconds=60,
+            scope="functional recovery wait after client restart; not isolated throughput")), encoding="utf-8")
         restored, attempts = self.assert_single_file_intent("alice", 1)
         self.assertEqual(offset, attempts[1]["acceptedOffset"])
         self.assertEqual(payload, self.files.get_storage_path(restored["file_id"]).read_bytes())
@@ -1631,7 +1638,11 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         mark = await self.alice.command("upload", conversation=self.conversation, path=str(source))
         await self.alice.wait("connection", lambda item: item["state"] == "disconnected", since=mark)
         self.assertEqual("", self.upload_storage_fault)
-        await self.alice.wait("file-tasks", lambda item: not item["items"], since=mark)
+        started = time.monotonic()
+        await self.alice.wait("file-tasks", lambda item: not item["items"], since=mark, timeout=60)
+        (self.output_dir / (self._testMethodName + "-recovery-timing.json")).write_text(json.dumps(dict(
+            bytes=len(payload), completionWaitSeconds=time.monotonic() - started, timeoutSeconds=60,
+            scope="functional recovery wait after disconnect; not isolated throughput")), encoding="utf-8")
         row, attempts = self.assert_single_file_intent("alice", 1)
         self.assertEqual(0, attempts[1]["acceptedOffset"])
         self.assertEqual(payload, self.files.get_storage_path(row["file_id"]).read_bytes())
@@ -1908,6 +1919,66 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         await self.alice.connect(self.endpoint, "alice")
         await self.alice.wait("file-tasks", lambda item: not item["items"], since=mark)
         self.assertTrue(all(item == old for item in self.cancel_attempts))
+
+    async def test_missing_published_download_retries_original_task_after_restart(self):
+        payload = b"recover published bytes" * 8192
+        file_id = await self.upload(payload)
+        source = self.files.get_storage_path(file_id)
+        publication = self.files.m_file_repo.get_transfer_by_file_id(file_id)
+        source.unlink()
+        target = self.root / "missing-source.bin"
+        target.write_bytes(b"existing")
+        mark = await self.bob.command("download", conversation=self.conversation, source=file_id, path=str(target))
+        failed = await self.bob.wait("file-tasks",
+            lambda item: any(task["status"] == "failed" for task in item["items"]), since=mark)
+        task = next(task for task in failed["items"] if task["status"] == "failed")
+        self.assertEqual(b"existing", target.read_bytes())
+        self.assertIn("source file unavailable", task["error"])
+        await self.bob.crash()
+        initial = await self.restart_bob()
+        recovered = initial["fileTasks"][0]
+        for key in ("clientFileId", "requestId", "finishRequestId", "status"):
+            self.assertEqual(task[key], recovered[key])
+        source.write_bytes(payload)
+        mark = await self.bob.command("retry-file", intent=task["clientFileId"])
+        await self.bob.wait("file-tasks", lambda item: not item["items"], since=mark)
+        self.assertEqual(payload, target.read_bytes())
+        attempts = [item for item in self.file_attempts if item["user"] == "bob"]
+        self.assertGreaterEqual(len(attempts), 2)
+        self.assertEqual({task["requestId"]}, {item["requestId"] for item in attempts})
+        self.assertEqual({task["clientFileId"]}, {item["intent"] for item in attempts})
+        self.assertEqual(2, self.db.execute_fetchone("SELECT COUNT(*) FROM file_transfers")[0])
+        self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+        self.assertEqual(publication, self.files.m_file_repo.get_transfer_by_file_id(file_id))
+
+    async def test_published_source_truncated_during_download_can_retry(self):
+        payload = bytes(range(251)) * 4096
+        file_id = await self.upload(payload)
+        source = self.files.get_storage_path(file_id)
+        self.pause_download_at = 65536
+        target = self.root / "truncated-source.bin"
+        target.write_bytes(b"existing")
+        mark = await self.bob.command("download", conversation=self.conversation, source=file_id, path=str(target))
+        async with asyncio.timeout(5):
+            while not any(path.stat().st_size >= 65536 for path in self.root.glob("truncated-source.bin.miniim-*.part")):
+                await asyncio.sleep(0.01)
+        source.write_bytes(payload[:65536])
+        self.pause_download_at = 0
+        for protocol in self.protocols:
+            protocol.m_download_sender.notify()
+        failed = await self.bob.wait("file-tasks",
+            lambda item: any(task["status"] == "failed" for task in item["items"]), since=mark)
+        task = next(task for task in failed["items"] if task["status"] == "failed")
+        self.assertIn("interrupted", task["error"])
+        self.assertEqual(b"existing", target.read_bytes())
+        await self.alice.command("message", conversation=self.conversation, intent="after-file-reset", text="still connected")
+        await self.bob.wait("message", lambda item: item["clientMsgId"] == "after-file-reset", since=mark)
+        source.write_bytes(payload)
+        mark = await self.bob.command("retry-file", intent=task["clientFileId"])
+        await self.bob.wait("file-tasks", lambda item: not item["items"], since=mark)
+        self.assertEqual(payload, target.read_bytes())
+        _, attempts = self.assert_single_file_intent("bob", 2)
+        self.assertGreaterEqual(attempts[-1]["offset"], 65536)
 
     async def test_corrupt_download_can_retry_original_intent_from_zero(self):
         payload = b"verified retry" * 4096

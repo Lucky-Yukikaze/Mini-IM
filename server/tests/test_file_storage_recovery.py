@@ -148,6 +148,35 @@ class FileStorageRecoveryTest(unittest.TestCase):
         self.assertEqual(finished, self.repo.get_transfer_by_file_id(self.file_id))
         self.assertEqual(b"externally changed completed file", self.path.read_bytes())
 
+    def test_unavailable_published_file_retries_after_restore_without_changing_publication(self):
+        self.complete(0)
+        publication = self.repo.get_transfer_by_file_id(self.file_id)
+        download = file_pb2.FileInit(conversation_id=self.conversation, client_file_id="download",
+            source_file_id=self.file_id, direction=common_pb2.FILE_DIRECTION_DOWNLOAD)
+        event_count = self.db.execute_fetchone("SELECT COUNT(*) FROM sync_events")[0]
+        for content in (None, self.payload[:-1], self.payload + b"extra"):
+            with self.subTest(content=content):
+                if content is None:
+                    self.path.unlink()
+                else:
+                    self.path.write_bytes(content)
+                rejected = self.files.handle_file_init("bob", "download-init", download)
+                self.assertFalse(rejected.ack.success)
+                self.assertEqual(409, rejected.ack.code)
+                self.assertFalse(rejected.start_download)
+                self.assertEqual(publication, self.repo.get_transfer_by_file_id(self.file_id))
+                self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM file_transfers")[0])
+                self.assertEqual(event_count, self.db.execute_fetchone("SELECT COUNT(*) FROM sync_events")[0])
+        denied = self.files.handle_file_init("outsider", "download-init", download)
+        self.assertEqual(403, denied.ack.code)
+        self.path.write_bytes(self.payload)
+        restored = self.files.handle_file_init("bob", "download-init", download)
+        self.assertTrue(restored.ack.success)
+        repeated = self.files.handle_file_init("bob", "download-init", download)
+        self.assertEqual(restored.ack.entity_id, repeated.ack.entity_id)
+        self.assertEqual(publication, self.repo.get_transfer_by_file_id(self.file_id))
+        self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+
     def test_repair_failure_does_not_publish_progress_or_lose_retry(self):
         self.files.append_file_chunk("alice", self.file_id, self.payload[:16])
         self.path.write_bytes(self.payload[:5])

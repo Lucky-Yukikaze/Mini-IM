@@ -185,6 +185,30 @@ class DesktopCheck:
         assert len(attempts) >= 2 and attempts[-1]["offset"] == 0
         assert len({item["requestId"] for item in attempts}) == 1
         assert target.read_bytes() == source
+        for damage in ("missing", "truncated"):
+            self.phase("file-fill", fileId=file_id)
+            self.command("prepare-download-target")
+            self.command("corrupt-download-source", fileId=file_id, enabled=True, damage=damage)
+            self.phase("file-download", fileId=file_id)
+            failure = "source file unavailable; restore the original file before retrying"
+            self.phase("file-failed", error=failure, image=str(self.artifacts / (damage + "-failed.png")))
+            state = self.command("snapshot")
+            task = next(row for rows in state["fileTasks"].values() for row in rows if row["status"] == "failed")
+            assert target.read_bytes() == b"keep original destination until verified"
+            transfer_count = len(state["transfers"])
+            self.restart_client("bob")
+            self.phase("file-failed", error=failure)
+            restored = self.command("snapshot")
+            assert task in [row for rows in restored["fileTasks"].values() for row in rows]
+            assert len(restored["transfers"]) == transfer_count
+            self.command("corrupt-download-source", fileId=file_id, enabled=False)
+            self.phase("file-retry")
+            self.phase("file-complete", image=str(self.artifacts / (damage + "-recovered.png")))
+            state = self.command("snapshot")
+            attempts = [item for item in state["fileAttempts"] if item["intent"] == task["id"]]
+            assert len(attempts) >= 2 and {item["requestId"] for item in attempts} == {task["init_request"]}
+            assert len(state["transfers"]) == transfer_count + 1
+            assert target.read_bytes() == source
         self.command("pause-download", offset=65536)
         self.phase("file-fill", fileId=file_id)
         self.phase("file-download", fileId=file_id, pending=True)
@@ -199,7 +223,7 @@ class DesktopCheck:
         self.restart_client("bob")
         self.phase("file-complete")
         state = self.command("snapshot")
-        assert len(state["transfers"]) == 5 and len(state["messages"]) == 1
+        assert len(state["transfers"]) == 7 and len(state["messages"]) == 1
         assert any(row["file_id"] == cancelling["file_id"] and row["status"] == "cancelled" for row in state["transfers"])
         assert target.read_bytes() == source
         return state

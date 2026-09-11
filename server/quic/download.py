@@ -129,6 +129,8 @@ class DownloadScheduler:
                             continue
                         if self.buffer.reset_requested(job.stream_id) or self.buffer.finished(job.stream_id):
                             continue
+                        if not chunk and job.offset != job.size:
+                            raise OSError("download source ended before declared size")
                         if job.offset + len(chunk) > job.size:
                             raise OSError("download source exceeds declared size")
                         self.protocol._quic.send_stream_data(job.stream_id, chunk, end_stream=not chunk)
