@@ -431,7 +431,7 @@ Qt 将明确完成拒绝保存为 `finishRejected`；用户点击重试时，在
 上传每批数据须完整写入、刷新文件缓冲并调用 `fsync`，随后提交进度；短写继续写，零写入或存储错误不推进数据库位置。
 上传流存储失败会关闭该连接，客户端保留原意图重连；初始化、完成阶段存储异常返回 503，允许原请求重试。
 大小或摘要校验失败的未完成上传标记为 `failed_integrity`，位置归 0，待用户重试原任务时重新传输；
-已发布文件不因续传被截断或回退，发布后的文件丢失与损坏仍需独立处理。
+已发布文件不因续传被截断或回退，发布后的文件丢失与损坏使用下方离线维护入口处理。
 恢复路径已验证客户端进程终止、服务端文件截短/丢失、未提交尾部和注入的写盘/数据库失败；
 同意图双设备竞争与接管已纳入真实 QUIC 和 Qt 回归；独立服务进程恢复见下方专项入口，机器断电与多设备完整业务流程仍需另行验收。
 原意图恢复见 [文件恢复批次](refactoring-progress.md#文件任务持久恢复--2026-09-07)，
@@ -439,6 +439,48 @@ Qt 将明确完成拒绝保存为 `finishRejected`；用户点击重试时，在
 磁盘与进度恢复见 [文件存储恢复批次](refactoring-progress.md#文件续传与存储故障恢复--2026-09-08)，
 取消确认见 [文件取消批次](refactoring-progress.md#文件取消确认与跨重启恢复--2026-09-09)，
 连接占用及跨设备接管见 [上传接管批次](refactoring-progress.md#上传连接占用与多设备接管--2026-09-09)。
+
+### 离线文件检查、恢复与清理
+
+[维护入口](../tools/maintain_files.py) 使用已有数据库及文件目录，数据库只读，不执行初始化或迁移。
+先停止服务；使用开发脚本启动的服务可通过 `tools/dev_stop.ps1` 停止。
+`--data-root` 默认 `server`，文件目录依次使用 `--file-root`、`MINIIM_FILE_ROOT`、`DATA_ROOT/storage/files`，必须与服务实际配置一致。
+全局目录参数写在 `inspect`、`restore`、`clean-cancelled` 子命令之前；下例文件 ID、备份路径和 7 天保留期均按实际需要替换。
+
+~~~powershell
+# 已发布文件核对大小与 SHA-256，未完成上传只报告现存字节。
+& ./.venv/Scripts/python.exe ./tools/maintain_files.py --data-root ./server inspect
+# 从检查结果选择 fileId；先验证替换内容和目标，默认预览不替换。
+$repairFileId = '替换为实际文件ID'
+$repairSource = 'D:/backups/original.bin'
+& ./.venv/Scripts/python.exe ./tools/maintain_files.py --data-root ./server restore --file-id $repairFileId --source $repairSource
+& ./.venv/Scripts/python.exe ./tools/maintain_files.py --data-root ./server restore --file-id $repairFileId --source $repairSource --apply
+# 预览达到所选保留期的已取消上传；确认结果后显式执行。
+& ./.venv/Scripts/python.exe ./tools/maintain_files.py --data-root ./server clean-cancelled --older-than-days 7
+& ./.venv/Scripts/python.exe ./tools/maintain_files.py --data-root ./server clean-cancelled --older-than-days 7 --apply
+~~~
+
+维护和服务共用 [存储锁](../server/storage/access.py)，分别占用解析后的数据目录与文件目录。
+同目录的第二个服务、在线维护及维护期间启动服务都会被拒绝；退出或被终止后自动释放。
+`.miniim-storage.lock` 是持久锁文件 = 文件保留但占用随进程释放；它被 Git 忽略，不能通过删除文件解锁。
+工具会创建所需的目录和锁文件，预览不改动业务记录或文件正文。
+旧版服务和直接构造业务对象的脚本没有该锁，运行维护前也须停止；锁不能阻止外部编辑器或其他程序直接写文件。
+
+`restore` 只恢复已完成上传；原始副本及临时复制文件都必须满足原大小与摘要。
+临时文件位于目标同目录，写盘后再次校验，再替换目标；目标本来正确时返回 `already-valid`。
+校验或写盘失败保留原目标，不创建新消息或新文件任务；重新启动服务后，页面对原失败任务点击重试即可。
+异常退出可能留下 `.miniim-restore-*` 临时文件，本入口不自动删除这些文件；尚未验证替换边界的机器断电恢复。
+
+清理只处理方向为上传、状态为 `cancelled` 且有匹配取消记录的文件。
+取消时间与任务更新时间均须早于或等于当前时间减去所选天数，1 天按 86,400,000 毫秒计算；0 表示不额外保留，负数拒绝。
+消息、附件、其他传输来源或共享路径任一引用存在就保留；数据库中的取消、任务、请求和同步记录始终保留，迟到重试仍被拒绝。
+重复清理已不存在的文件返回 `already-absent`；单文件删除失败记为 `error` 并继续处理后续候选。
+活动及失败上传、已发布文件、未登记文件、客户端下载片段保持原样；这些数据的自动清理需另行定义保留策略。
+维护拒绝越界、链接及非普通文件路径，不跟随数据库路径删除目录。
+
+命令以 JSON 输出结果：正常结果返回退出码 0；初始化、参数值或占用错误返回 1；检查发现缺失/损坏或逐文件处理出错返回 2。
+未加 `--apply` 的恢复和清理只输出候选，不代表已经执行；解析器拒绝的命令语法错误使用其标准错误输出。
+验证记录见 [离线维护批次](refactoring-progress.md#离线文件维护与保留策略--2026-09-12)。
 
 ## 配置与排查
 
@@ -623,7 +665,7 @@ Playwright CLI JavaScript 入口；Playwright CLI = 通过命令行驱动浏览�
 脚本比对上传存储文件、源文件和下载目标的字节及 SHA-256，核对原意图、请求标识、续传偏移和单条文件消息。
 SHA-256 = 根据文件内容计算的固定摘要，此处配合逐字节比较检查内容一致。
 故障只作用于夹具数据：临时暂停文件流/下载调度、拒绝本地文件任务写入、改变隔离服务文件的一个字节，以及删除/截短后恢复该文件。
-失败及取消保留原目标；取消后的部分文件按当前策略保留，自动清理仍待实现。
+失败及取消保留原目标；客户端下载片段继续保留，服务端已取消上传可使用 [离线清理](#离线文件检查恢复与清理) 按指定保留期处理。
 `fileAttempts`、`fileTasks`、`transfers`、`artifacts` 与 `clientExits` 保存在结果中，记录各次实际调用和终止退出码。
 两种模式都要求独立的全新环境；使用同一个已执行过测试的夹具不算有效复现。
 本入口不覆盖同时运行的多设备、独立服务端进程宕机与其他平台；跨进程服务检查仍用前述独立入口。

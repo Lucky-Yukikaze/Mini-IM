@@ -12,6 +12,7 @@ __pycache__/
 *.py[cod]
 
 # Runtime data and development credentials
+.miniim-storage.lock
 /server/storage/files/
 /server/storage/sqlite/*.db
 /server/storage/sqlite/*.db-*

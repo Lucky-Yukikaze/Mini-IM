@@ -956,6 +956,72 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
     async def test_burn_scan_commit_survives_lost_push(self):
         await self.burn_crash("after-commit")
 
+    async def maintenance_command(self, *arguments, expected=0):
+        process = await asyncio.create_subprocess_exec(sys.executable, str(ROOT / "tools/maintain_files.py"),
+            "--data-root", str(self.data), *arguments, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE, env={key: value for key, value in os.environ.items() if not key.startswith("MINIIM_")},
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        stdout, stderr = await asyncio.wait_for(process.communicate(), 20)
+        self.assertEqual(expected, process.returncode, (stdout, stderr))
+        result = json.loads(stdout)
+        with (self.output / "maintenance.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(dict(arguments=list(arguments), exitCode=process.returncode, result=result)) + "\n")
+        return result
+
+    async def test_offline_file_restore_excludes_server_and_preserves_download(self):
+        from storage.access import storage_access
+        payload = b"verified offline repair" * 4096
+        replacement = self.root / "original.bin"
+        replacement.write_bytes(payload)
+        mark = await self.alice.command("upload", conversation=self.conversation, path=str(replacement))
+        await self.alice.wait("file-tasks", lambda item: not item["items"], since=mark)
+        row = self.rows("SELECT * FROM file_transfers")[0]
+        fid = row["file_id"]
+        files = self.data / "storage/files"
+        target = files / row["storage_path"]
+        denied = await self.maintenance_command("inspect", expected=1)
+        self.assertIn("storage is in use", denied["error"])
+        self.marks = [len(client.events) for client in self.clients]
+        await self.server.close()
+        self.assertEqual(0, self.server.service_exit_code)
+        target.write_bytes(b"damaged")
+        with storage_access(self.data, files):
+            denied = await self.maintenance_command("inspect", expected=1)
+            self.assertIn("storage is in use", denied["error"])
+            process = await asyncio.create_subprocess_exec(sys.executable, str(ROOT / "server/main.py"),
+                "--data-root", str(self.data), "--port", str(self.server.port),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                env={key: value for key, value in os.environ.items() if not key.startswith("MINIIM_")},
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            stdout, stderr = await asyncio.wait_for(process.communicate(), 15)
+            self.assertNotEqual(0, process.returncode)
+            self.assertIn(b"storage is in use", stderr)
+            (self.output / "server-maintenance-conflict.json").write_text(json.dumps(dict(
+                exitCode=process.returncode, stdout=stdout.decode(), stderr=stderr.decode())), encoding="utf-8")
+        report = await self.maintenance_command("inspect", "--file-id", fid, expected=2)
+        self.assertEqual("damaged", report["result"][0]["health"])
+        await self.maintenance_command("restore", "--file-id", fid, "--source", str(replacement))
+        self.assertEqual(b"damaged", target.read_bytes())
+        await self.maintenance_command("restore", "--file-id", fid, "--source", str(replacement), "--apply")
+        self.assertEqual(payload, target.read_bytes())
+        self.assertEqual(row, self.rows("SELECT * FROM file_transfers")[0])
+        await self.start_server()
+        await self.check_new_sessions()
+        downloaded = self.root / "download.bin"
+        mark = await self.bob.command("download", conversation=self.conversation, source=fid, path=str(downloaded))
+        await self.bob.wait("file-tasks", lambda item: not item["items"], since=mark)
+        self.assertEqual(payload, downloaded.read_bytes())
+        self.assertEqual(1, self.scalar("SELECT COUNT(*) FROM messages"))
+        self.assertEqual(row, self.rows("SELECT * FROM file_transfers WHERE direction=1")[0])
+        self.marks = [len(client.events) for client in self.clients]
+        await self.server.close(kill=True)
+        self.assertNotEqual(0, self.server.service_exit_code)
+        report = await self.maintenance_command("inspect", "--file-id", fid)
+        self.assertEqual("ok", report["result"][0]["health"])
+        await self.start_server()
+        await self.check_new_sessions()
+        await self.check_sync()
+
     async def test_idle_server_restart_uses_default_failure_detection(self):
         self.marks = [len(client.events) for client in self.clients]
         await self.server.close(kill=True)

@@ -675,11 +675,17 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 async def run_server(*, data_root: Path | None = None, port: int = 4433) -> None:
+    from storage.access import storage_access
     base_path = data_root if data_root is not None else Path(__file__).resolve().parents[1]
+    file_root = Path(os.getenv("MINIIM_FILE_ROOT", str(base_path / "storage" / "files")))
+    with storage_access(base_path, file_root):
+        await _run_server(base_path=base_path, file_root=file_root, port=port)
+
+
+async def _run_server(*, base_path: Path, file_root: Path, port: int) -> None:
     cert_path = base_path / "quic" / "dev_cert.pem"
     key_path = base_path / "quic" / "dev_key.pem"
     db_path = base_path / "storage" / "sqlite" / "miniim.db"
-    file_root = Path(os.getenv("MINIIM_FILE_ROOT", str(base_path / "storage" / "files")))
     file_stale_ms = int(os.getenv("MINIIM_FILE_STALE_MS", str(15 * 60 * 1000)))
     fault_drop_after_bytes = int(os.getenv("MINIIM_FAULT_FILE_DROP_AFTER_BYTES", "0"))
     fault_drop_probability = float(os.getenv("MINIIM_FAULT_FILE_DROP_PROBABILITY", "0"))
