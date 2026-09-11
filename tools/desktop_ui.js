@@ -200,6 +200,13 @@ async page => {
     await page.getByPlaceholder('输入消息', { exact: true }).fill(data.text);
     await button('发送').click();
     await page.waitForFunction(() => document.querySelector('.composer textarea').value === '');
+  } else if (data.phase === 'crash-submit-recall') {
+    await page.locator('.message-row').filter({ hasText: data.text })
+      .getByRole('button', { name: '撤回', exact: true }).click();
+    await status.getByText('撤回消息 · 等待确认', { exact: true }).waitFor();
+  } else if (data.phase === 'crash-submit-cancel') {
+    await page.locator('.file-task-card').getByRole('button', { name: '取消', exact: true }).click();
+    await page.locator('.file-task-card').getByText('取消待确认', { exact: true }).waitFor();
   } else if (data.phase === 'crash-submit-rename') {
     if (!(await page.getByPlaceholder('群名称', { exact: true }).count())) await button('成员').click();
     await page.getByPlaceholder('群名称', { exact: true }).fill(data.title);
@@ -207,6 +214,11 @@ async page => {
     await status.getByText('修改群名 · 等待确认', { exact: true }).waitFor();
   } else if (data.phase === 'crash-recovered') {
     await page.getByRole('heading', { name: data.title, exact: true, level: 2 }).waitFor();
+    if (data.recalled) {
+      await page.getByText('消息已撤回', { exact: true }).waitFor();
+      check(await page.locator('.message-row').filter({ hasText: data.recalled }).count() === 0,
+        'recalled body returned after recovery');
+    }
     if (data.text) {
       const row = page.locator('.message-row').filter({ hasText: data.text });
       await row.waitFor();

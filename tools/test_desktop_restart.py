@@ -22,7 +22,7 @@ import unittest
 from desktop_fixture import write_json
 from test_desktop_ui import DesktopCheck
 from test_server_restart import ServerProcess
-from protocol.pb import common_pb2, conversation_pb2, file_pb2, message_pb2
+from protocol.pb import common_pb2, conversation_pb2, file_pb2, message_pb2, sync_pb2
 from services.conversation.service import ConversationService
 from storage.repo import ConversationRepo
 from storage.sqlite.db import MiniImSqliteDb
@@ -124,7 +124,8 @@ class DesktopRestartTest(unittest.IsolatedAsyncioTestCase):
             summaries[table] = self.rows(f"SELECT status,COUNT(*) AS count FROM {table} GROUP BY status", path=self.cache(self.active_user))
             self.assertTrue(all(row["status"] in terminal for row in summaries[table]))
         artifacts = {}
-        for path in [self.source, self.target, *sorted((self.data / "storage/files").rglob("*"))]:
+        for path in [self.source, self.target, *sorted(self.root.glob("download.bin.miniim-*.part")),
+                     *sorted((self.data / "storage/files").rglob("*"))]:
             if path.is_file():
                 content = path.read_bytes()
                 artifacts[str(path.relative_to(self.root))] = dict(size=len(content), sha256=hashlib.sha256(content).hexdigest())
@@ -171,8 +172,8 @@ class DesktopRestartTest(unittest.IsolatedAsyncioTestCase):
         with closing(sqlite3.connect(source)) as db, closing(sqlite3.connect(self.output / target)) as destination:
             db.backup(destination)
 
-    async def crash(self, user="alice"):
-        checkpoint = await self.server.wait("checkpoint", timeout=25)
+    async def crash(self, user="alice", operation=None):
+        checkpoint = await self.server.wait("checkpoint", lambda event: operation is None or event["operation"] == operation, timeout=25)
         desktop_pid = self.desktop.pid
         await asyncio.gather(self.server.close(kill=True), self.stop_desktop())
         self.assertEqual(checkpoint["pid"], self.server.pid)
@@ -287,6 +288,174 @@ class DesktopRestartTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("ok", self.scalar("PRAGMA integrity_check"))
         self.assertEqual([], self.rows("PRAGMA foreign_key_check"))
         await self.ui("crash-recovered", title="Desktop QA", fileName="source.bin")
+
+    async def seed_message(self):
+        await self.ui("crash-submit-message", text="desktop state recovery")
+        await self.until(lambda: self.scalar("SELECT COUNT(*) FROM message_outbox WHERE status!='confirmed'", path=self.cache("alice")) == 0)
+        await self.until(lambda: self.synced("alice"))
+        return self.rows("SELECT * FROM messages")[0]
+
+    def request_result(self, request):
+        rows = self.rows("SELECT ack FROM control_write_results WHERE request_id=?", (request,))
+        self.assertLessEqual(len(rows), 1)
+        return rows[0]["ack"] if rows else None
+
+    async def receipt_or_recall_case(self, point, operation):
+        message = await self.seed_message()
+        await self.server.arm(point, operation)
+        user = "bob" if operation == "receipt" else "alice"
+        if user == "bob":
+            # Selecting the incoming conversation performs the real page's automatic read.
+            await self.ui("login", user=user, title="Desktop QA", switch=True)
+        else:
+            await self.ui("crash-submit-recall", text="desktop state recovery")
+        checkpoint = await self.crash(user, operation)
+        request = checkpoint["requestId"]
+        pending = self.rows("SELECT * FROM control_outbox WHERE request_id=?", (request,), self.cache(user))[0]
+        self.assertEqual("pending", pending["status"])
+        self.assertEqual(operation, pending["operation"])
+        committed = point == "before-ack"
+        original_result = self.request_result(request)
+        self.assertEqual(committed, original_result is not None)
+        if operation == "receipt":
+            self.assertEqual(int(committed), self.scalar("SELECT last_read_seq FROM conversation_members WHERE user_id='bob'"))
+        else:
+            self.assertEqual(int(committed), self.scalar("SELECT recalled FROM messages"))
+        await self.recover(user)
+        await self.replayed(operation, request)
+        await self.until(lambda: self.scalar("SELECT status FROM control_outbox WHERE request_id=?", (request,), self.cache(user)) == "confirmed")
+        after = self.rows("SELECT * FROM control_outbox WHERE request_id=?", (request,), self.cache(user))[0]
+        self.assertEqual(pending["payload"], after["payload"])
+        if committed:
+            self.assertEqual(original_result, self.request_result(request))
+        self.assertTrue(message_pb2.Ack.FromString(self.request_result(request)).success)
+        self.assertEqual(1, self.scalar("SELECT COUNT(*) FROM messages"))
+        await self.until(lambda: self.synced(user))
+        if operation == "receipt":
+            self.assertEqual(1, self.scalar("SELECT last_read_seq FROM conversation_members WHERE user_id='bob'"))
+            self.assertEqual("read", self.scalar("SELECT status FROM message_deliveries WHERE user_id='bob'"))
+            self.assertEqual(0, self.scalar("SELECT unread_count FROM message_read_counters"))
+            await self.ui("crash-recovered", title="Desktop QA", text="desktop state recovery")
+        else:
+            self.assertEqual(1, self.scalar("SELECT recalled FROM messages"))
+            self.assertEqual(message["server_msg_id"], self.scalar("SELECT server_msg_id FROM messages"))
+            await self.ui("crash-recovered", title="Desktop QA", recalled="desktop state recovery")
+
+    async def delivery_case(self, point):
+        message = await self.seed_message()
+        await self.server.arm(point, "sync_applied")
+        await self.ui("login", user="bob", title="Desktop QA", switch=True)
+        checkpoint = await self.crash("bob", "sync_applied")
+        request = checkpoint["requestId"]
+        metadata = {row["key"]: row["value"] for row in self.rows("SELECT key,value FROM metadata", path=self.cache("bob"))}
+        pending = json.loads(metadata["sync_confirmation"])
+        self.assertEqual(request, pending["requestId"])
+        self.assertGreater(int(pending["cursor"]), int(metadata.get("sync_confirmed_cursor", 0)))
+        self.assertLessEqual(int(pending["cursor"]), int(metadata["cursor"]))
+        original = next(event for event in self.server.events if event["event"] == "request" and event["requestId"] == request)
+        self.assertEqual(int(pending["cursor"]), sync_pb2.SyncApplied.FromString(bytes.fromhex(original["body"])).global_cursor)
+        before = self.rows("SELECT * FROM message_deliveries WHERE user_id='bob'")[0]
+        committed = point == "before-ack"
+        # Opening the conversation sends a read receipt before SyncApplied.
+        # Replaying a later delivery confirmation must preserve that read state.
+        self.assertEqual("read", before["status"])
+        self.assertIsNotNone(before["delivered_at_ms"])
+        self.assertIsNotNone(before["read_at_ms"])
+        self.assertEqual(1, self.scalar("SELECT last_read_seq FROM conversation_members WHERE user_id='bob'"))
+        applied = self.rows("SELECT global_cursor FROM sync_applied_cursors WHERE user_id='bob'")
+        self.assertEqual(int(pending["cursor"]) if committed else 0, applied[0]["global_cursor"] if applied else 0)
+        original_result = self.request_result(request)
+        self.assertEqual(committed, original_result is not None)
+        await self.recover("bob")
+        await self.replayed("sync_applied", request)
+        await self.until(lambda: self.synced("bob"))
+        acknowledgement = await self.server.wait("durable-ack", lambda event: event["requestId"] == request)
+        self.assertEqual(self.request_result(request).hex(), acknowledgement["payload"])
+        if committed:
+            self.assertEqual(original_result, self.request_result(request))
+        after = self.rows("SELECT * FROM message_deliveries WHERE user_id='bob'")[0]
+        self.assertEqual("read", after["status"])
+        self.assertEqual(before["delivered_at_ms"], after["delivered_at_ms"])
+        self.assertEqual(before["read_at_ms"], after["read_at_ms"])
+        self.assertEqual(1, self.scalar("SELECT last_read_seq FROM conversation_members WHERE user_id='bob'"))
+        self.assertEqual(0, self.scalar("SELECT unread_count FROM message_read_counters"))
+        self.assertGreaterEqual(self.scalar("SELECT global_cursor FROM sync_applied_cursors WHERE user_id='bob'"), int(pending["cursor"]))
+        self.assertEqual(message["server_msg_id"], after["server_msg_id"])
+        await self.until(lambda: self.scalar("SELECT COUNT(*) FROM control_outbox WHERE status!='confirmed'", path=self.cache("bob")) == 0)
+        await self.until(lambda: self.synced("bob"))
+        await self.ui("crash-recovered", title="Desktop QA", text="desktop state recovery")
+
+    async def cancel_case(self, point):
+        await self.ui("file-upload")
+        await self.until(lambda: self.scalar("SELECT COUNT(*) FROM file_transfers WHERE status='completed'") == 1)
+        await self.ui("file-complete")
+        source = self.scalar("SELECT file_id FROM file_transfers")
+        await self.ui("login", user="bob", title="Desktop QA", switch=True)
+        await self.until(lambda: self.synced("bob"))
+        await self.server.arm("download-read", "download", 262144)
+        await self.ui("file-fill", fileId=source)
+        await self.ui("file-download", fileId=source, pending=True)
+        await self.server.wait("checkpoint", lambda event: event["operation"] == "download")
+        await self.until(lambda: any(path.stat().st_size >= 65536 for path in self.root.glob("download.bin.miniim-*.part")))
+        # Only the file reader thread is held; control processing remains available.
+        await self.server.arm(point, "file_cancel")
+        await self.ui("crash-submit-cancel")
+        checkpoint = await self.crash("bob", "file_cancel")
+        task = self.rows("SELECT * FROM file_tasks", path=self.cache("bob"))[0]
+        self.assertEqual("cancelling", task["status"])
+        self.assertEqual(checkpoint["requestId"], task["cancel_request"])
+        committed = point == "before-ack"
+        before = self.rows("SELECT * FROM file_transfers WHERE direction=2")[0]
+        self.assertEqual(committed, before["status"] == "cancelled")
+        self.assertEqual(int(committed), self.scalar("SELECT COUNT(*) FROM file_cancellations"))
+        original_result = self.request_result(task["cancel_request"])
+        self.assertEqual(committed, original_result is not None)
+        parts = {path.name: path.read_bytes() for path in self.root.glob("download.bin.miniim-*.part")}
+        write_json(self.output / "cancel-checkpoint.json", dict(requestId=task["cancel_request"],
+            parts={name: dict(size=len(content), sha256=hashlib.sha256(content).hexdigest())
+                   for name, content in parts.items()}))
+        self.assertEqual(b"keep destination until verified", self.target.read_bytes())
+        await self.recover("bob")
+        await self.replayed("file_cancel", task["cancel_request"])
+        await self.until(lambda: self.scalar("SELECT status FROM file_tasks WHERE id=?", (task["id"],), self.cache("bob")) == "cancelled")
+        after = self.rows("SELECT * FROM file_tasks", path=self.cache("bob"))[0]
+        for key in ("id", "init_request", "finish_request", "cancel_request", "file_id"):
+            self.assertEqual(task[key], after[key])
+        self.assertFalse(any(event["event"] == "file-init" for event in self.server.events))
+        self.assertEqual(parts, {path.name: path.read_bytes() for path in self.root.glob("download.bin.miniim-*.part")})
+        self.assertEqual(b"keep destination until verified", self.target.read_bytes())
+        self.assertEqual(1, self.scalar("SELECT COUNT(*) FROM file_cancellations"))
+        self.assertEqual("cancelled", self.scalar("SELECT status FROM file_transfers WHERE direction=2"))
+        self.assertEqual(1, self.scalar("SELECT COUNT(*) FROM messages"))
+        if committed:
+            self.assertEqual(original_result, self.request_result(task["cancel_request"]))
+        self.assertTrue(message_pb2.Ack.FromString(self.request_result(task["cancel_request"])).success)
+        await self.until(lambda: self.synced("bob"))
+        await self.ui("crash-recovered", title="Desktop QA", fileName="source.bin")
+
+    async def test_cancel_before_commit(self):
+        await self.cancel_case("before-commit")
+
+    async def test_cancel_after_commit(self):
+        await self.cancel_case("before-ack")
+
+    async def test_receipt_before_commit(self):
+        await self.receipt_or_recall_case("before-commit", "receipt")
+
+    async def test_receipt_after_commit(self):
+        await self.receipt_or_recall_case("before-ack", "receipt")
+
+    async def test_recall_before_commit(self):
+        await self.receipt_or_recall_case("before-commit", "recall")
+
+    async def test_recall_after_commit(self):
+        await self.receipt_or_recall_case("before-ack", "recall")
+
+    async def test_delivery_before_commit(self):
+        await self.delivery_case("before-commit")
+
+    async def test_delivery_after_commit(self):
+        await self.delivery_case("before-ack")
 
     async def test_message_before_commit(self):
         await self.message_case("before-commit")
