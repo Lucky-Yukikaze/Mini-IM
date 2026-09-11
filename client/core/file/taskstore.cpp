@@ -138,6 +138,17 @@ QVariantList MiniImFileTaskStore::pending() const
     return result;
 }
 
+QVariantList MiniImFileTaskStore::all() const
+{
+    auto query = run(QStringLiteral("SELECT data FROM file_tasks ORDER BY rowid"));
+    QVariantList result;
+    while (query.next())
+    {
+        result.append(Decode(query.value(0)));
+    }
+    return result;
+}
+
 void MiniImFileTaskStore::update(const QString& id, const QVariantMap& changes)
 {
     auto value = task(id);

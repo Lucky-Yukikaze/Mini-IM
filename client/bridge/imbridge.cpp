@@ -203,6 +203,16 @@ bool ImBridge::retryFile(const QString& clientFileId)
     return m_session_manager.retryFile(clientFileId);
 }
 
+QVariantMap ImBridge::previewCancelledDownloads()
+{
+    return m_session_manager.previewCancelledDownloads();
+}
+
+QVariantMap ImBridge::cleanupCancelledDownloads(const QString& token)
+{
+    return m_session_manager.cleanupCancelledDownloads(token);
+}
+
 bool ImBridge::cancelFile(const QString& clientFileId)
 {
     return m_session_manager.cancelFile(clientFileId);

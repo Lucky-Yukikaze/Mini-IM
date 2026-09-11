@@ -142,7 +142,20 @@ int main(int argc, char** argv)
             while (peer->canReadLine())
             {
                 const QJsonObject command = QJsonDocument::fromJson(peer->readLine()).object();
-                const bool accepted = Dispatch(bridge, command);
+                const auto operation = command.value("op").toString();
+                bool accepted = true;
+                if (operation == "preview-file-cleanup")
+                {
+                    send(QStringLiteral("file-cleanup"), bridge.previewCancelledDownloads());
+                }
+                else if (operation == "apply-file-cleanup")
+                {
+                    send(QStringLiteral("file-cleanup"), bridge.cleanupCancelledDownloads(command.value("token").toString()));
+                }
+                else
+                {
+                    accepted = Dispatch(bridge, command);
+                }
                 send(QStringLiteral("result"), {{"id", command.value("id").toString()}, {"accepted", accepted}});
             }
         });

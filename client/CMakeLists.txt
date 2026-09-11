@@ -30,6 +30,8 @@ set(MINI_IM_PROTO_FILES
 add_library(mini_im_core STATIC
     core/logging.cpp
     core/logging.h
+    core/file/cleanup.cpp
+    core/file/cleanup.h
     core/file/coordinator.cpp
     core/file/coordinator.h
     core/quic/connection.cpp
@@ -111,7 +113,7 @@ if(BUILD_TESTING)
     add_executable(mini_im_control_tests tests/controlwrite_test.cpp)
     target_link_libraries(mini_im_control_tests PRIVATE mini_im_core)
     add_test(NAME control_write_recovery COMMAND mini_im_control_tests)
-    add_executable(mini_im_state_tests tests/statestore_test.cpp core/sync/statestore.cpp core/message/outbox.cpp core/file/taskstore.cpp core/session/writestore.cpp)
+    add_executable(mini_im_state_tests tests/statestore_test.cpp core/file/cleanup.cpp core/sync/statestore.cpp core/message/outbox.cpp core/file/taskstore.cpp core/session/writestore.cpp)
     target_include_directories(mini_im_state_tests PRIVATE .)
     target_link_libraries(mini_im_state_tests PRIVATE Qt6::Core Qt6::Sql)
     add_test(NAME state_persistence COMMAND mini_im_state_tests)

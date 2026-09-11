@@ -31,6 +31,8 @@ public:
         quint32 burn_ttl_sec);
     Q_INVOKABLE bool retryFile(const QString& clientFileId);
     Q_INVOKABLE bool cancelFile(const QString& clientFileId);
+    Q_INVOKABLE QVariantMap previewCancelledDownloads();
+    Q_INVOKABLE QVariantMap cleanupCancelledDownloads(const QString& token);
     Q_INVOKABLE bool retryMessage(const QString& conversationId, const QString& clientMsgId);
     Q_INVOKABLE bool createConversation(
         const QString& client_conv_id,

@@ -56,3 +56,26 @@ test('native initialization failure cannot fall through to local demo events', a
     delete runtime.qt;
   }
 });
+
+test('cleanup uses asynchronous native preview and the exact approval token', async () => {
+  let callback: ((value: unknown) => void) | undefined;
+  let received = '';
+  runtime.imBridge = {
+    previewCancelledDownloads(done: typeof callback) { callback = done; },
+    cleanupCancelledDownloads(token: string, done: typeof callback) { received = token; callback = done; }
+  };
+  const pending = bridge.previewCancelledDownloads();
+  let settled = false;
+  pending.then(() => { settled = true; });
+  await Promise.resolve();
+  assert.equal(settled, false);
+  callback!({ ok: true, token: 'preview-token', items: [] });
+  assert.equal((await pending).token, 'preview-token');
+  const applied = bridge.cleanupCancelledDownloads('preview-token');
+  assert.equal(received, 'preview-token');
+  callback!({ ok: false, error: 'expired' });
+  assert.deepEqual(await applied, { ok: false, error: 'expired' });
+  runtime.imBridge = {};
+  assert.equal((await bridge.previewCancelledDownloads()).ok, false);
+  assert.equal((await bridge.cleanupCancelledDownloads('old')).ok, false);
+});

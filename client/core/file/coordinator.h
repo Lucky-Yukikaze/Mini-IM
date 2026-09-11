@@ -3,6 +3,7 @@
 #define MINI_IM_CORE_FILE_COORDINATOR_H_
 
 #include "core/file/taskstore.h"
+#include "core/file/cleanup.h"
 #ifdef SendMessage
 #undef SendMessage
 #endif
@@ -45,6 +46,8 @@ public:
         const QString& requestId, bool success, int code, const QString& error, const QString& fileId);
     bool retryFile(const QString& clientFileId);
     bool cancelFile(const QString& clientFileId);
+    QVariantMap previewCancelledDownloads();
+    QVariantMap cleanupCancelledDownloads(const QString& token);
     void pumpFileTasks();
     void handleFileUpdated(const im::file::FileUpdated& updated);
 
@@ -61,6 +64,7 @@ private:
     void onFileClosed(quint64 streamId, bool connectionShutdown);
     void onUploadFinished(const QString& fileId, bool success, const QString& error);
     void publishFileTasks();
+    QVariantList cleanupTasks() const;
     void failFileTask(const QString& fileId, const QString& error);
     void startFileTask(const QVariantMap& task);
     bool sendFileInitRequest(
@@ -116,6 +120,7 @@ private:
         bool finished = false;
     };
 
+    MiniImFileCleanup m_cleanup;
     MiniImFileTaskStore& m_tasks;
     MiniImQuicConnection& m_transport;
     EnvelopeFactory m_envelopeFactory;

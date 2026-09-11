@@ -814,6 +814,16 @@ bool MiniImSessionManager::retryFile(const QString& clientFileId)
     return m_files.retryFile(clientFileId);
 }
 
+QVariantMap MiniImSessionManager::previewCancelledDownloads()
+{
+    return m_files.previewCancelledDownloads();
+}
+
+QVariantMap MiniImSessionManager::cleanupCancelledDownloads(const QString& token)
+{
+    return m_files.cleanupCancelledDownloads(token);
+}
+
 bool MiniImSessionManager::cancelFile(const QString& clientFileId)
 {
     return m_files.cancelFile(clientFileId);

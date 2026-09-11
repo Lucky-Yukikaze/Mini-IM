@@ -1,4 +1,7 @@
 #include "core/sync/statestore.h"
+#include "core/file/cleanup.h"
+#include <QFile>
+#include <QFileInfo>
 
 #include <QCoreApplication>
 #include <QSqlError>
@@ -567,6 +570,59 @@ void CheckMonotonicObjectVersions()
 }
 }
 
+void CheckCancelledDownloadCleanup()
+{
+    QTemporaryDir root;
+    const auto write = [](const QString& path, const QByteArray& bytes)
+    {
+        QFile file(path);
+        Require(file.open(QIODevice::WriteOnly), "cleanup fixture open failed");
+        Require(file.write(bytes) == bytes.size(), "cleanup fixture write failed");
+    };
+    const QString target = root.filePath("saved.bin");
+    const QString part = target + ".miniim-file-id.part";
+    write(target, "original destination");
+    write(part, "cancelled bytes");
+    QVariantMap task{{"clientFileId", "intent"}, {"fileId", "file-id"}, {"path", target},
+        {"fileName", "saved.bin"}, {"direction", 2}, {"status", "cancelled"}, {"cancelRequestId", "cancel"}};
+    MiniImFileCleanup cleanup;
+    for (const auto& status : {"pending", "transferring", "failed", "cancelling", "cancel_failed", "completed"})
+    {
+        auto active = task;
+        active.insert("status", status);
+        Require(cleanup.preview({active}).value("items").toList().isEmpty(), "recoverable task offered for cleanup");
+    }
+    const auto preview = cleanup.preview({task});
+    Require(preview.value("items").toList().size() == 1, "cancelled fragment missing from preview");
+    Require(QFileInfo::exists(part), "preview removed file");
+    auto changed = task;
+    changed.insert("status", "failed");
+    Require(!cleanup.apply(preview.value("token").toString(), {changed}).value("ok").toBool(), "changed task deleted");
+    Require(QFileInfo::exists(part), "changed task fragment removed");
+    auto fresh = cleanup.preview({task});
+    write(part, "external change with different length");
+    Require(!cleanup.apply(fresh.value("token").toString(), {task}).value("ok").toBool(), "changed file deleted");
+    fresh = cleanup.preview({task});
+    cleanup.reset();
+    Require(!cleanup.apply(fresh.value("token").toString(), {task}).value("ok").toBool(), "old account token accepted");
+    auto other = task;
+    other.insert("clientFileId", "other");
+    other.insert("path", part);
+    other.insert("status", "completed");
+    Require(cleanup.preview({task, other}).value("items").toList().isEmpty(), "formal target offered for removal");
+    other.insert("path", target);
+    other.insert("status", "pending");
+    Require(cleanup.preview({task, other}).value("items").toList().isEmpty(), "shared staging path offered for removal");
+    fresh = cleanup.preview({task});
+    const auto result = cleanup.apply(fresh.value("token").toString(), {task});
+    Require(result.value("ok").toBool() && result.value("removed").toInt() == 1, "cancelled fragment cleanup failed");
+    Require(!QFileInfo::exists(part), "cancelled fragment remains");
+    QFile saved(target);
+    Require(saved.open(QIODevice::ReadOnly) && saved.readAll() == "original destination", "formal destination changed");
+    Require(!cleanup.apply(fresh.value("token").toString(), {task}).value("ok").toBool(), "token reused");
+    Require(cleanup.preview({task}).value("items").toList().isEmpty(), "removed fragment reappeared");
+}
+
 int main(int argc, char* argv[])
 {
     QCoreApplication app(argc, argv);
@@ -580,6 +636,7 @@ int main(int argc, char* argv[])
         CheckReadSnapshotAndAccountIsolation();
         CheckMonotonicObjectVersions();
         CheckDurableFileTasks();
+        CheckCancelledDownloadCleanup();
         CheckFileCancellationRecovery();
         CheckOutboxIdentityRecoveryAndConfirmation();
         CheckOutboxFailureAndTerminalCleanup();

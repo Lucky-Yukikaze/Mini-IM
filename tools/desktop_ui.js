@@ -188,6 +188,25 @@ async page => {
     const task = data.fileName ? page.locator('.file-task-card').filter({ hasText: data.fileName }) : page.locator('.file-task-card');
     await task.getByRole('button', { name: '取消', exact: true }).click();
     await task.waitFor({ state: 'hidden' });
+  } else if (data.phase === 'file-cleanup-preview') {
+    await button('清理已取消下载').click();
+    const dialog = page.getByRole('dialog', { name: '清理已取消下载', exact: true });
+    await dialog.waitFor();
+    if (data.empty) {
+      await dialog.getByText('没有可清理的下载片段', { exact: true }).waitFor();
+      check(await dialog.getByRole('button', { name: '确认清理', exact: true }).isDisabled(), 'empty cleanup was enabled');
+    } else {
+      await dialog.getByText(data.path, { exact: true }).waitFor();
+      await dialog.getByRole('button', { name: '确认清理', exact: true }).waitFor();
+    }
+    if (data.image) await page.screenshot({ path: data.image });
+    if (data.close) await dialog.getByRole('button', { name: '关闭', exact: true }).click();
+  } else if (data.phase === 'file-cleanup-apply') {
+    const dialog = page.getByRole('dialog', { name: '清理已取消下载', exact: true });
+    await dialog.getByRole('button', { name: '确认清理', exact: true }).click();
+    await dialog.getByText('已清理 1 个临时文件', { exact: true }).waitFor();
+    if (data.image) await page.screenshot({ path: data.image });
+    await dialog.getByRole('button', { name: '关闭', exact: true }).click();
   } else if (data.phase === 'file-concurrent') {
     await page.waitForFunction(count => document.querySelectorAll('.file-task-card').length === count, data.count);
     for (const name of data.names) await page.locator('.file-task-card').filter({ hasText: name }).waitFor();

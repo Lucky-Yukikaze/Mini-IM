@@ -1819,6 +1819,9 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
             while not any(protocol.m_user_id == "bob" and any(job.offset >= 65536
                     for job in protocol.m_download_sender.jobs.values()) for protocol in self.protocols):
                 await asyncio.sleep(0.01)
+        async with asyncio.timeout(5):
+            while not any(path.stat().st_size >= 65536 for path in self.root.glob("cancelled.bin.miniim-*.part")):
+                await asyncio.sleep(0.01)
         mark = await self.bob.command("cancel-file", intent=task["items"][0]["clientFileId"])
         await self.bob.wait("file-tasks", lambda item: not item["items"], since=mark)
         await self.bob.crash()
@@ -1833,6 +1836,39 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         cancelled = self.db.execute_fetchone("SELECT * FROM file_cancellations WHERE owner_id='bob'")
         self.assertIsNotNone(cancelled)
         self.assertTrue(all(row["status"] == "cancelled" for row in rows))
+        part = next(self.root.glob("cancelled.bin.miniim-*.part"))
+        original = part.read_bytes()
+        mark = await self.bob.command("preview-file-cleanup")
+        preview = await self.bob.wait("file-cleanup", since=mark)
+        self.assertTrue(preview["ok"])
+        self.assertEqual(1, len(preview["items"]))
+        self.assertEqual(len(original), preview["items"][0]["bytes"])
+        self.assertEqual(original, part.read_bytes())
+        mark = await self.bob.command("disconnect")
+        await self.bob.wait("connection", lambda item: item["state"] == "disconnected", since=mark)
+        await self.bob.connect(self.endpoint, "alice")
+        mark = await self.bob.command("apply-file-cleanup", token=preview["token"])
+        self.assertFalse((await self.bob.wait("file-cleanup", since=mark))["ok"])
+        self.assertTrue(part.exists())
+        mark = await self.bob.command("disconnect")
+        await self.bob.wait("connection", lambda item: item["state"] == "disconnected", since=mark)
+        await self.bob.connect(self.endpoint, "bob")
+        mark = await self.bob.command("preview-file-cleanup")
+        preview = await self.bob.wait("file-cleanup", since=mark)
+        mark = await self.bob.command("apply-file-cleanup", token=preview["token"])
+        removed = await self.bob.wait("file-cleanup", since=mark)
+        self.assertTrue(removed["ok"])
+        self.assertEqual(1, removed["removed"])
+        self.assertFalse(part.exists())
+        self.assertEqual(b"keep", target.read_bytes())
+        self.assertEqual([dict(row) for row in rows], [dict(row) for row in self.db.execute_fetchall(
+            "SELECT * FROM file_transfers WHERE owner_id='bob'")])
+        await self.bob.crash()
+        self.assertEqual([], (await self.restart_bob())["fileTasks"])
+        mark = await self.bob.command("preview-file-cleanup")
+        self.assertEqual([], (await self.bob.wait("file-cleanup", since=mark))["items"])
+        self.assertEqual(attempts, len(self.file_attempts))
+        self.assertEqual(dict(cancelled), dict(self.db.execute_fetchone("SELECT * FROM file_cancellations WHERE owner_id='bob'")))
 
     async def _pending_uninitialized_upload(self):
         self.block_file_init = True

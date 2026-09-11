@@ -226,7 +226,25 @@ class DesktopCheck:
         assert len(state["transfers"]) == 7 and len(state["messages"]) == 1
         assert any(row["file_id"] == cancelling["file_id"] and row["status"] == "cancelled" for row in state["transfers"])
         assert target.read_bytes() == source
-        return state
+        parts = list(target.parent.glob("download.bin.miniim-*.part"))
+        assert len(parts) == 1
+        fragment = parts[0].read_bytes()
+        self.phase("file-cleanup-preview", path=parts[0].as_posix(), close=True,
+            image=str(self.artifacts / "cleanup-preview.png"))
+        assert parts[0].read_bytes() == fragment
+        self.phase("login", user="alice", title="Desktop QA", switch=True)
+        self.phase("file-cleanup-preview", empty=True, close=True)
+        assert parts[0].read_bytes() == fragment
+        self.phase("login", user="bob", title="Desktop QA", switch=True)
+        self.phase("file-cleanup-preview", path=parts[0].as_posix())
+        self.phase("file-cleanup-apply", image=str(self.artifacts / "cleanup-completed.png"))
+        assert not parts[0].exists() and target.read_bytes() == source
+        self.restart_client("bob")
+        self.phase("file-cleanup-preview", empty=True, close=True)
+        final = self.command("snapshot")
+        for key in ("transfers", "messages", "cancellations", "fileTasks", "fileAttempts"):
+            assert final[key] == state[key], key
+        return final
 
     def read_seq(self, state):
         return next(row["last_read_seq"] for row in state["members"]

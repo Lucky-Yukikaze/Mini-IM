@@ -1,6 +1,22 @@
 import type { ConversationItem, MessageItem } from '../types';
 import { bridgeEvents } from '../events/bridge-event-store';
 
+export interface FileCleanupItem {
+  clientFileId: string;
+  path: string;
+  fileName: string;
+  bytes: number;
+  removed?: boolean;
+  error?: string;
+}
+export interface FileCleanupResult {
+  ok: boolean;
+  token?: string;
+  items?: FileCleanupItem[];
+  removed?: number;
+  error?: string;
+}
+
 type SignalHandler = (payload: unknown) => void;
 
 interface QtSignal {
@@ -32,6 +48,8 @@ interface QtImBridge {
   downloadFile(conversationId: string, sourceFileId: string, savePath: string, priority: number, done: (accepted: boolean) => void): void;
   retryFile(clientFileId: string, done: (accepted: boolean) => void): void;
   cancelFile(clientFileId: string, done: (accepted: boolean) => void): void;
+  previewCancelledDownloads?(done: (result: FileCleanupResult) => void): void;
+  cleanupCancelledDownloads?(token: string, done: (result: FileCleanupResult) => void): void;
   connectionChanged?: QtSignal;
   initialStateLoaded?: QtSignal;
   messagePushed?: QtSignal;
@@ -420,4 +438,18 @@ export async function retryFile(clientFileId: string): Promise<boolean> {
 export async function cancelFile(clientFileId: string): Promise<boolean> {
   if (typeof runtimeWindow.imBridge?.cancelFile !== 'function') return false;
   return new Promise((resolve) => runtimeWindow.imBridge!.cancelFile(clientFileId, resolve));
+}
+
+export async function previewCancelledDownloads(): Promise<FileCleanupResult> {
+  if (typeof runtimeWindow.imBridge?.previewCancelledDownloads !== 'function') {
+    return { ok: false, error: '当前客户端不支持清理预览' };
+  }
+  return new Promise(resolve => runtimeWindow.imBridge!.previewCancelledDownloads!(resolve));
+}
+
+export async function cleanupCancelledDownloads(token: string): Promise<FileCleanupResult> {
+  if (typeof runtimeWindow.imBridge?.cleanupCancelledDownloads !== 'function') {
+    return { ok: false, error: '当前客户端不支持清理' };
+  }
+  return new Promise(resolve => runtimeWindow.imBridge!.cleanupCancelledDownloads!(token, resolve));
 }

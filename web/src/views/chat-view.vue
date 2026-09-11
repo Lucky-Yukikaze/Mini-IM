@@ -110,6 +110,8 @@
       </section>
       <section class="details-section">
         <div class="details-title">文件</div>
+        <button class="secondary-button" :disabled="session.connection.state !== 'connected'"
+          @click="cleanupOpen = true">清理已取消下载</button>
         <div class="file-progress-scroll">
           <div v-for="task in session.currentFileTasks" :key="task.clientFileId" class="file-task-card">
             <div>{{ task.direction === 1 ? '上传' : '下载' }} · {{ task.fileName }}</div>
@@ -132,6 +134,8 @@
       </section>
     </aside>
 
+    <FileCleanupDialog v-if="cleanupOpen && session.connection.state === 'connected'"
+      :key="session.currentUserId" @close="cleanupOpen = false" />
     <ConversationDialog
       v-if="dialogMode"
       :key="session.currentUserId + dialogMode"
@@ -183,6 +187,7 @@ import {
   sendReceipt
 } from '../api/bridge';
 import ConversationDialog from '../components/conversation-dialog.vue';
+import FileCleanupDialog from '../components/file-cleanup-dialog.vue';
 import ConversationList from '../components/conversation-list.vue';
 import DebugDrawer from '../components/debug-drawer.vue';
 import MessageComposer from '../components/message-composer.vue';
@@ -203,6 +208,8 @@ import type {
 
 const session = useSessionStore();
 const debugOpen = ref(false);
+const cleanupOpen = ref(false);
+watch(() => [session.currentUserId, session.connection.state], () => { cleanupOpen.value = false; });
 const dialogMode = ref<'create' | 'join' | 'direct' | null>(null);
 const notice = ref('');
 const memberDraft = ref('');

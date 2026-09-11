@@ -47,6 +47,8 @@ public:
     bool retryMessage(const QString& conversationId, const QString& clientMsgId);
     bool retryFile(const QString& clientFileId);
     bool cancelFile(const QString& clientFileId);
+    QVariantMap previewCancelledDownloads();
+    QVariantMap cleanupCancelledDownloads(const QString& token);
     bool createConversation(const QString& client_conv_id, const QString& title, const QVariantList& member_ids);
     bool createDirectConversation(const QString& client_conv_id, const QString& peer_user_id);
     bool addMembers(const QString& conversation_id, const QVariantList& member_ids);

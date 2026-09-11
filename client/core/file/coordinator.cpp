@@ -74,6 +74,7 @@ void MiniImFileCoordinator::start(const QVariantList& cachedFiles)
 
 void MiniImFileCoordinator::stop()
 {
+    m_cleanup.reset();
     m_running = false;
     m_syncReady = false;
     m_retryTimer.stop();
@@ -450,6 +451,47 @@ void MiniImFileCoordinator::handleFileResult(
         m_fileControlAttempts.remove(requestId);
     }
     publishFileTasks();
+}
+
+QVariantList MiniImFileCoordinator::cleanupTasks() const
+{
+    QVariantList result;
+    for (const auto& value : m_tasks.all())
+    {
+        auto task = value.toMap();
+        task.insert("cleanupBusy", m_activeFileTasks.contains(task.value("clientFileId").toString())
+            || m_pending_file_downloads.contains(task.value("fileId").toString()));
+        result.append(task);
+    }
+    return result;
+}
+
+QVariantMap MiniImFileCoordinator::previewCancelledDownloads()
+{
+    try
+    {
+        return m_running ? m_cleanup.preview(cleanupTasks())
+            : QVariantMap{{"ok", false}, {"error", "connect before previewing cleanup"}};
+    }
+    catch (const std::exception& error)
+    {
+        m_cleanup.reset();
+        return {{"ok", false}, {"error", QString::fromUtf8(error.what())}};
+    }
+}
+
+QVariantMap MiniImFileCoordinator::cleanupCancelledDownloads(const QString& token)
+{
+    try
+    {
+        return m_running ? m_cleanup.apply(token, cleanupTasks())
+            : QVariantMap{{"ok", false}, {"error", "cleanup preview expired; connect and preview again"}};
+    }
+    catch (const std::exception& error)
+    {
+        m_cleanup.reset();
+        return {{"ok", false}, {"error", QString::fromUtf8(error.what())}};
+    }
 }
 
 bool MiniImFileCoordinator::retryFile(const QString& clientFileId)

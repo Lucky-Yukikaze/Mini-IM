@@ -19,6 +19,7 @@ public:
     QVariantMap byFile(const QString& fileId) const;
     QVariantMap byRequest(const QString& requestId) const;
     QVariantList pending() const;
+    QVariantList all() const;
     void update(const QString& id, const QVariantMap& changes);
 
 private:
