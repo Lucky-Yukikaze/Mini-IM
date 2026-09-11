@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
 
 from aioquic.quic.configuration import QuicConfiguration
+from aioquic.quic.events import StreamDataReceived
 from protocol.pb import common_pb2, conversation_pb2, message_pb2, sync_pb2
 from quic.endpoint import serve_quic
 from quic.download import STREAM_BUFFER_LIMIT
@@ -275,7 +276,8 @@ class DesktopFixture:
             if not self.pause_upload_at:
                 pending, self.held_upload_chunks = self.held_upload_chunks, []
                 for protocol, stream, chunk, ended in pending:
-                    protocol._handle_file_stream_data(stream, chunk, ended)
+                    # Re-enter the real queue, preserving FIN bookkeeping and yielding between chunks.
+                    protocol.quic_event_received(StreamDataReceived(data=chunk, end_stream=ended, stream_id=stream))
         elif op == "pause-download":
             self.pause_download_at = int(data["offset"])
             for protocol in self.protocols:

@@ -146,7 +146,7 @@ async page => {
       check(await input.inputValue() === data.transferSource, 'upload path cleared before save');
       check(await page.locator('.file-task-card').count() === 0, 'failed save created visible file task');
     } else {
-      await page.locator('.file-task-card').filter({ hasText: '上传 · source.bin' }).waitFor();
+      await page.locator('.file-task-card').filter({ hasText: '上传 · ' + (data.fileName || 'source.bin') }).waitFor();
       check(await input.inputValue() === '', 'saved upload path was not cleared');
     }
   } else if (data.phase === 'file-pending') {
@@ -158,7 +158,7 @@ async page => {
     await row.getByRole('button', { name: '填入下载', exact: true }).waitFor();
     check(await row.count() === 1, 'upload published duplicate messages');
   } else if (data.phase === 'file-fill') {
-    await page.locator('.message-row').filter({ hasText: 'source.bin' })
+    await page.locator('.message-row').filter({ hasText: data.fileName || 'source.bin' })
       .getByRole('button', { name: '填入下载', exact: true }).click();
     const input = page.getByLabel('下载 file_id', { exact: true });
     await input.waitFor();
@@ -174,7 +174,7 @@ async page => {
         'download path cleared before save');
     } else {
       await page.waitForFunction(() => document.querySelector('[placeholder="源文件 ID"]')?.value === '');
-      if (data.pending) await page.locator('.file-task-card').filter({ hasText: '下载 · download.bin' }).waitFor();
+      if (data.pending) await page.locator('.file-task-card').filter({ hasText: '下载 · ' + (data.targetName || 'download.bin') }).waitFor();
     }
   } else if (data.phase === 'file-failed') {
     const task = page.locator('.file-task-card').filter({ hasText: '下载 · download.bin' });
@@ -184,8 +184,18 @@ async page => {
   } else if (data.phase === 'file-retry') {
     await page.locator('.file-task-card').getByRole('button', { name: '重试', exact: true }).click();
   } else if (data.phase === 'file-cancel-active') {
-    await page.locator('.file-task-card').getByRole('button', { name: '取消', exact: true }).click();
-    await page.locator('.file-task-card').waitFor({ state: 'hidden' });
+    const task = data.fileName ? page.locator('.file-task-card').filter({ hasText: data.fileName }) : page.locator('.file-task-card');
+    await task.getByRole('button', { name: '取消', exact: true }).click();
+    await task.waitFor({ state: 'hidden' });
+  } else if (data.phase === 'file-concurrent') {
+    await page.waitForFunction(count => document.querySelectorAll('.file-task-card').length === count, data.count);
+    for (const name of data.names) await page.locator('.file-task-card').filter({ hasText: name }).waitFor();
+    if (data.image) await page.screenshot({ path: data.image });
+  } else if (data.phase === 'send-during-files') {
+    await page.getByPlaceholder('输入消息', { exact: true }).fill(data.text);
+    await button('发送').click();
+    await page.locator('.message-row').filter({ hasText: data.text }).waitFor();
+    check(await page.getByPlaceholder('输入消息', { exact: true }).inputValue() === '', 'saved message draft retained');
   } else if (data.phase === 'file-complete') {
     await page.locator('.file-task-card').waitFor({ state: 'hidden' });
     if (data.image) await page.screenshot({ path: data.image });

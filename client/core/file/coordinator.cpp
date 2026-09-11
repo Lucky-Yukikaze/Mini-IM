@@ -329,7 +329,7 @@ bool MiniImFileCoordinator::downloadFile(
     {
         m_tasks.create({{"clientFileId", client_file_id}, {"requestId", request_id},
             {"finishRequestId", m_requestIdFactory(QStringLiteral("filefinish"))}, {"conversationId", conversation_id},
-            {"path", QFileInfo(normalized_save_path).absoluteFilePath()}, {"fileName", "download.bin"},
+            {"path", QFileInfo(normalized_save_path).absoluteFilePath()}, {"fileName", QFileInfo(normalized_save_path).fileName()},
             {"fileSize", 1}, {"sha256", "na"}, {"priority", priority}, {"direction", 2},
             {"sourceFileId", source_file_id}, {"metadataReady", false}, {"status", "pending"},
             {"fileId", ""}, {"error", ""}});

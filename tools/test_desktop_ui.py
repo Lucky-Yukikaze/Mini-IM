@@ -77,8 +77,8 @@ class DesktopCheck:
         self.results.append(dict(phase=name, **fields))
         print("PASS " + name, flush=True)
 
-    def wait_state(self, predicate):
-        deadline = time.monotonic() + 15
+    def wait_state(self, predicate, timeout=15):
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             state = self.command("snapshot")
             if predicate(state):
@@ -325,12 +325,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--context", type=Path, required=True)
     parser.add_argument("--playwright-cli", type=Path, required=True, help="installed Playwright CLI JavaScript entry")
-    parser.add_argument("--files-only", action="store_true", help="verify actual desktop file transfer and restart flows")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--files-only", action="store_true", help="verify actual desktop file transfer and restart flows")
+    mode.add_argument("--concurrent-files", action="store_true", help="verify mixed desktop file concurrency, cancellation and restart")
     args = parser.parse_args()
     check = DesktopCheck(args.context, args.playwright_cli)
     result = dict(ok=False, started=time.strftime("%Y-%m-%d %H:%M:%S"))
     try:
-        result["state"] = check.run_files() if args.files_only else check.run()
+        if args.concurrent_files:
+            from desktop_file_concurrency import run_concurrent_files
+            result["state"] = run_concurrent_files(check)
+        else:
+            result["state"] = check.run_files() if args.files_only else check.run()
         result["ok"] = True
     except Exception as error:
         result["error"] = str(error)
