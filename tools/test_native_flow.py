@@ -1288,6 +1288,23 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(item["id"], messages)
                 messages[item["id"]] = item
         self.assertEqual({item["id"] for item in sent}, set(messages))
+        forwards = {item["id"]: item for item in history["messages"]}
+        while history["hasNewer"]:
+            mark = await self.alice.command("history-page", conversation=self.conversation,
+                                            cursor=history["afterCursor"], direction="newer")
+            history = await self.alice.wait("history", since=mark)
+            self.assertTrue(history["ok"])
+            self.assertLessEqual(len(history["messages"]), 50)
+            for item in history["messages"]:
+                self.assertNotIn(item["id"], forwards)
+                forwards[item["id"]] = item
+        self.assertEqual(set(messages), set(forwards))
+        mark = await self.alice.command("history-page", conversation=self.conversation, cursor="", direction="latest")
+        latest = await self.alice.wait("history", since=mark)
+        self.assertEqual([item["id"] for item in initial["recentMessages"]], [item["id"] for item in latest["messages"]])
+        self.assertFalse(latest["hasNewer"])
+        mark = await self.alice.command("history-page", conversation=self.conversation, cursor="", direction="newer")
+        self.assertFalse((await self.alice.wait("history", since=mark))["ok"])
         self.assertTrue(messages[oldest["id"]]["recalled"])
         self.assertEqual("", messages[oldest["id"]]["text"])
         mark = await self.alice.command("receipt", conversation=self.conversation, seq=100)
@@ -1295,6 +1312,8 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         await self.alice.wait("sync", lambda item: item.get("unreadTotal") == 25)
         await self.alice.command("disconnect")
         mark = await self.alice.command("history", conversation=self.conversation, cursor="")
+        self.assertFalse((await self.alice.wait("history", since=mark))["ok"])
+        mark = await self.alice.command("history-page", conversation=self.conversation, cursor="", direction="latest")
         self.assertFalse((await self.alice.wait("history", since=mark))["ok"])
 
     async def test_queue_overload_resumes_original_upload_after_committed_progress(self):

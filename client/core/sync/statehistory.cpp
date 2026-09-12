@@ -17,11 +17,15 @@ const QString kUnread = QStringLiteral("kind='message' AND "
 
 QJsonArray ReadCursor(const QString& conversation, const QString& cursor)
 {
+    if (cursor.size() > 2048)
+    {
+        throw std::runtime_error("invalid history cursor");
+    }
     const auto document = QJsonDocument::fromJson(cursor.toUtf8());
     const auto value = document.array();
     bool valid = false;
     const auto sequence = value.size() == 3 ? value[1].toString().toULongLong(&valid) : 0;
-    if (cursor.size() > 2048 || !document.isArray() || value.size() != 3 || !valid
+    if (!document.isArray() || value.size() != 3 || !valid
         || sequence > static_cast<quint64>(std::numeric_limits<qint64>::max())
         || value[0].toString() != conversation || value[2].toString().isEmpty())
     {
@@ -114,7 +118,8 @@ quint64 MiniImStateStore::unreadAffected(const MiniImStateEvent& event) const
     return count.next() ? count.value(0).toULongLong() : 0;
 }
 
-QVariantMap MiniImStateStore::messagePage(const QString& conversation, const QString& before) const
+QVariantMap MiniImStateStore::messagePage(
+    const QString& conversation, const QString& boundary, const QString& direction) const
 {
     try
     {
@@ -122,21 +127,31 @@ QVariantMap MiniImStateStore::messagePage(const QString& conversation, const QSt
         {
             throw std::runtime_error("history requires a conversation");
         }
+        const bool newer = direction == QStringLiteral("newer");
+        if ((direction != "older" && direction != "latest" && !newer)
+            || (newer && boundary.isEmpty()) || (direction == "latest" && !boundary.isEmpty()))
+        {
+            throw std::runtime_error("invalid history direction or boundary");
+        }
         QString sql = QStringLiteral("SELECT id,") + kSequence
             + QStringLiteral(" FROM objects WHERE kind='message' AND conversation=?");
         QVariantList values{conversation};
-        if (!before.isEmpty())
+        if (!boundary.isEmpty())
         {
-            const auto cursor = ReadCursor(conversation, before);
-            sql += QStringLiteral(" AND (") + kSequence + QStringLiteral(",id)<(?,?)");
+            const auto cursor = ReadCursor(conversation, boundary);
+            sql += QStringLiteral(" AND ") + kSequence
+                + (newer ? QStringLiteral(">=? AND (") : QStringLiteral("<=? AND (")) + kSequence
+                + (newer ? QStringLiteral(",id)>(?,?)") : QStringLiteral(",id)<(?,?)"));
+            values.append(cursor[1].toString().toLongLong());
             values.append(cursor[1].toString().toLongLong());
             values.append(cursor[2].toString());
         }
-        sql += QStringLiteral(" ORDER BY ") + kSequence + QStringLiteral(" DESC,id DESC LIMIT ?");
+        sql += QStringLiteral(" ORDER BY ") + kSequence
+            + (newer ? QStringLiteral(" ASC,id ASC LIMIT ?") : QStringLiteral(" DESC,id DESC LIMIT ?"));
         values.append(kHistoryPageSize + 1);
         auto query = run(sql, values);
         QVariantList messages, deliveries, counts;
-        QString cursor;
+        QString cursor, firstVisited;
         bool more = false;
         while (query.next())
         {
@@ -154,7 +169,14 @@ QVariantMap MiniImStateStore::messagePage(const QString& conversation, const QSt
                 message.insert("unreadCount", count.value("unreadCount"));
                 counts.append(count);
             }
-            messages.prepend(message);
+            if (newer)
+            {
+                messages.append(message);
+            }
+            else
+            {
+                messages.prepend(message);
+            }
             auto delivered = run(QStringLiteral("SELECT id FROM objects WHERE kind='delivery' "
                 "AND json_extract(CAST(data AS TEXT),'$.messageId')=? ORDER BY position"), {id});
             while (delivered.next())
@@ -163,10 +185,36 @@ QVariantMap MiniImStateStore::messagePage(const QString& conversation, const QSt
             }
             cursor = QString::fromUtf8(QJsonDocument(QJsonArray{conversation,
                 query.value(1).toString(), id}).toJson(QJsonDocument::Compact));
+            if (firstVisited.isEmpty())
+            {
+                firstVisited = cursor;
+            }
         }
+        const auto before = messages.isEmpty() ? boundary : (newer ? firstVisited : cursor);
+        const auto after = messages.isEmpty() ? boundary : (newer ? cursor : firstVisited);
+        const auto hasBeyond = [&](const QString& edge, bool forward)
+        {
+            if (edge.isEmpty())
+            {
+                return false;
+            }
+            const auto key = ReadCursor(conversation, edge);
+            // Explicit sequence range and ordering select the existing history index;
+            // a tuple predicate alone can choose the general conversation index.
+            const auto sequence = key[1].toString().toLongLong();
+            auto exists = run(QStringLiteral("SELECT 1 FROM objects WHERE kind='message' AND conversation=? AND ")
+                + kSequence + (forward ? QStringLiteral(">=? AND (") : QStringLiteral("<=? AND ("))
+                + kSequence + (forward ? QStringLiteral(",id)>(?,?)") : QStringLiteral(",id)<(?,?)"))
+                + QStringLiteral(" ORDER BY ") + kSequence
+                + (forward ? QStringLiteral(" ASC,id ASC LIMIT 1") : QStringLiteral(" DESC,id DESC LIMIT 1")),
+                {conversation, sequence, sequence, key[2].toString()});
+            return exists.next();
+        };
         return {{"ok", true}, {"userId", m_user}, {"conversationId", conversation},
             {"messages", messages}, {"deliveries", deliveries}, {"readCounts", counts},
-            {"cursor", cursor}, {"hasMore", more}};
+            {"cursor", cursor}, {"hasMore", more}, {"beforeCursor", before}, {"afterCursor", after},
+            {"hasOlder", newer ? hasBeyond(before, false) : more},
+            {"hasNewer", newer ? more : hasBeyond(after, true)}};
     }
     catch (const std::exception& error)
     {

@@ -30,6 +30,36 @@ async page => {
     }
   } else if (data.phase === 'history-visible') {
     await page.locator('.message-row .bubble').filter({ hasText: data.text }).waitFor();
+  } else if (data.phase === 'history-directions') {
+    const result = await page.evaluate(async conversation => {
+      const read = (cursor, direction) => new Promise(resolve => window.imBridge.loadHistoryPage(conversation, cursor, direction, resolve));
+      const collect = (page, found) => {
+        if (!page.ok || page.messages.length > 50) throw new Error('invalid directional page');
+        for (const item of page.messages) {
+          if (found.has(item.id)) throw new Error('duplicate directional message');
+          found.add(item.id);
+        }
+      };
+      let current = await read('', 'latest');
+      const backwards = new Set();
+      while (true) {
+        collect(current, backwards);
+        if (!current.hasOlder) break;
+        current = await read(current.beforeCursor, 'older');
+      }
+      const forwards = new Set();
+      while (true) {
+        collect(current, forwards);
+        if (!current.hasNewer) break;
+        current = await read(current.afterCursor, 'newer');
+      }
+      const empty = await read(current.afterCursor, 'newer');
+      const invalid = await read('', 'newer');
+      return { backwards: [...backwards].sort(), forwards: [...forwards].sort(),
+        empty: empty.ok && empty.messages.length === 0 && !empty.hasNewer, rejected: !invalid.ok };
+    }, data.group);
+    check(result.backwards.length === 125 && JSON.stringify(result.backwards) === JSON.stringify(result.forwards), 'directional history lost messages');
+    check(result.empty && result.rejected, 'directional boundary handling failed');
   } else if (data.phase === 'history-top') {
     await page.locator('.message-viewport').evaluate(element => { element.scrollTop = 0; });
     await page.locator('.message-row .bubble').filter({ hasText: data.text }).waitFor();

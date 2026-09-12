@@ -149,6 +149,11 @@ int main(int argc, char** argv)
                     send(QStringLiteral("history"), bridge.loadHistory(command.value("conversation").toString(),
                         command.value("cursor").toString()));
                 }
+                else if (operation == "history-page")
+                {
+                    send(QStringLiteral("history"), bridge.loadHistoryPage(command.value("conversation").toString(),
+                        command.value("cursor").toString(), command.value("direction").toString()));
+                }
                 else if (operation == "preview-file-cleanup")
                 {
                     send(QStringLiteral("file-cleanup"), bridge.previewCancelledDownloads());

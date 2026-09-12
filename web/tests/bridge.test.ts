@@ -92,3 +92,19 @@ test('history waits for the native callback and preserves errors', async () => {
   finish!({ ok: false, error: 'read failed' });
   assert.deepEqual(await pending, { ok: false, error: 'read failed' });
 });
+
+test('directional history preserves boundary and waits for native completion', async () => {
+  let finish: ((page: unknown) => void) | undefined;
+  runtime.imBridge = { loadHistoryPage: (conversation: string, cursor: string, direction: string, done: typeof finish) => {
+    assert.equal(conversation, 'private'); assert.equal(cursor, 'boundary'); assert.equal(direction, 'newer'); finish = done;
+  } };
+  let settled = false;
+  const pending = bridge.loadHistoryPage('private', 'boundary', 'newer').then(page => { settled = true; return page; });
+  await Promise.resolve();
+  assert.equal(settled, false);
+  const result = { ok: true, messages: [], beforeCursor: 'boundary', afterCursor: 'boundary', hasOlder: true, hasNewer: false };
+  finish!(result);
+  assert.deepEqual(await pending, result);
+  runtime.imBridge = {};
+  assert.equal((await bridge.loadHistoryPage('private', '', 'latest')).ok, false);
+});

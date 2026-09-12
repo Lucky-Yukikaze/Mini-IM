@@ -189,6 +189,12 @@ QVariantMap ImBridge::loadHistory(const QString& conversation, const QString& be
     return m_session_manager.loadHistory(conversation, before);
 }
 
+QVariantMap ImBridge::loadHistoryPage(
+    const QString& conversation, const QString& cursor, const QString& direction)
+{
+    return m_session_manager.loadHistoryPage(conversation, cursor, direction);
+}
+
 bool ImBridge::downloadFile(
     const QString& conversation_id,
     const QString& source_file_id,

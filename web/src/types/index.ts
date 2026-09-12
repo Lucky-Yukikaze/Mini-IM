@@ -30,6 +30,7 @@ export interface ConnectionState {
 }
 
 export interface HistoryState { cursor: string; hasMore: boolean; }
+export type HistoryDirection = 'older' | 'newer' | 'latest';
 export interface HistoryPage {
   ok: boolean;
   error?: string;
@@ -40,6 +41,10 @@ export interface HistoryPage {
   readCounts?: ReadCountUpdate[];
   cursor?: string;
   hasMore?: boolean;
+  beforeCursor?: string;
+  afterCursor?: string;
+  hasOlder?: boolean;
+  hasNewer?: boolean;
 }
 
 export interface InitialStatePayload {

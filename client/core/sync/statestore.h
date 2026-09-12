@@ -41,7 +41,8 @@ public:
     quint64 cursor() const;
     bool hasGap() const;
     QVariantMap snapshot() const;
-    QVariantMap messagePage(const QString& conversation, const QString& before = QString()) const;
+    QVariantMap messagePage(const QString& conversation, const QString& boundary = QString(),
+        const QString& direction = QStringLiteral("older")) const;
     quint64 unreadTotal() const;
     QString errorString() const;
     QString databasePath() const;

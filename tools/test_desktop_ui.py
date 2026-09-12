@@ -121,6 +121,7 @@ class DesktopCheck:
         self.phase("history-visible", text="Desktop history 124")
         self.restart_client("alice")
         self.phase("history-top", text="Desktop history 075", more=True)
+        self.phase("history-directions")
         self.phase("history-load", count=50)
         self.phase("history-top", text="Desktop history 025", more=True)
         self.phase("history-load", count=25)

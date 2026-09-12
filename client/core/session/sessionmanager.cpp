@@ -809,6 +809,16 @@ QVariantMap MiniImSessionManager::loadHistory(const QString& conversation, const
     return m_stateStore.messagePage(conversation, before);
 }
 
+QVariantMap MiniImSessionManager::loadHistoryPage(
+    const QString& conversation, const QString& cursor, const QString& direction)
+{
+    if (!m_connected || m_transportStopping)
+    {
+        return {{"ok", false}, {"error", "connect before loading history"}};
+    }
+    return m_stateStore.messagePage(conversation, cursor, direction);
+}
+
 bool MiniImSessionManager::downloadFile(
     const QString& conversation_id,
     const QString& source_file_id,

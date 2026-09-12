@@ -684,6 +684,79 @@ void CheckIncrementalUnreadCommitAndRecovery()
     Require(store.unreadTotal() == 0, "maximum receipt differs after rebuild");
 }
 
+void CheckBidirectionalHistory()
+{
+    QTemporaryDir directory;
+    MiniImStateStore store;
+    Open(store, directory);
+    Require(store.messagePage("empty", "", "latest").value("messages").toList().isEmpty(), "empty history not empty");
+    QVector<MiniImStateEvent> events;
+    for (quint64 index = 1; index <= 125; ++index)
+    {
+        auto message = Message(index, QStringLiteral("direction-%1").arg(index, 3, 10, QChar('0')));
+        message.data.insert("seq", QVariant::fromValue((index + 1) / 2));
+        events.append(message);
+    }
+    Apply(store, events);
+    const auto unread = store.unreadTotal();
+    const auto position = store.cursor();
+    auto page = store.messagePage("conversation", "", "latest");
+    Require(page.value("hasOlder").toBool() && !page.value("hasNewer").toBool(), "latest boundaries wrong");
+    QSet<QString> backwards;
+    while (true)
+    {
+        Require(page.value("ok").toBool(), "backward page failed");
+        for (const auto& item : page.value("messages").toList())
+        {
+            const auto id = item.toMap().value("id").toString();
+            Require(!backwards.contains(id), "backward page duplicated an equal-sequence message");
+            backwards.insert(id);
+        }
+        if (!page.value("hasOlder").toBool()) break;
+        page = store.messagePage("conversation", page.value("beforeCursor").toString(), "older");
+    }
+    Require(backwards.size() == 125 && page.value("hasNewer").toBool(), "backward traversal lost history");
+    QSet<QString> forwards;
+    while (true)
+    {
+        Require(page.value("ok").toBool(), "forward page failed");
+        const auto list = page.value("messages").toList();
+        Require(list.size() <= 50, "forward page exceeds limit");
+        QString previous;
+        for (const auto& item : list)
+        {
+            const auto id = item.toMap().value("id").toString();
+            Require(!forwards.contains(id) && (previous.isEmpty() || previous < id), "forward page repeated or reordered");
+            forwards.insert(id);
+            previous = id;
+        }
+        if (!page.value("hasNewer").toBool()) break;
+        page = store.messagePage("conversation", page.value("afterCursor").toString(), "newer");
+    }
+    Require(forwards == backwards, "forward traversal lost history");
+    Require(store.cursor() == position && store.unreadTotal() == unread, "navigation changed sync or unread");
+    const auto boundary = page.value("afterCursor").toString();
+    const auto empty = store.messagePage("conversation", boundary, "newer");
+    Require(empty.value("messages").toList().isEmpty() && !empty.value("hasNewer").toBool()
+        && empty.value("hasOlder").toBool() && empty.value("beforeCursor") == boundary, "empty page lost boundary");
+    Require(!store.messagePage("conversation", "", "newer").value("ok").toBool(), "missing forward boundary accepted");
+    Require(!store.messagePage("conversation", boundary, "latest").value("ok").toBool(), "latest with boundary accepted");
+    Require(!store.messagePage("conversation", boundary, "invalid").value("ok").toBool(), "invalid direction accepted");
+    Require(!store.messagePage("other", boundary, "newer").value("ok").toBool(), "foreign boundary accepted");
+    Require(!store.messagePage("conversation", QString(2049, QChar('x')), "older").value("ok").toBool(), "oversized boundary accepted");
+    Apply(store, {Message(126, "newest"),
+        {127, "event-127", "burn", {{"messageId", "newest"}, {"conversationId", "conversation"}}}});
+    const auto added = store.messagePage("conversation", boundary, "newer");
+    const auto latest = added.value("messages").toList();
+    Require(latest.size() == 1 && latest.first().toMap().value("burned").toBool()
+        && latest.first().toMap().value("text").toString().isEmpty(), "forward page restored burned content");
+    Open(store, directory);
+    Require(store.messagePage("conversation", boundary, "newer").value("messages") == added.value("messages"),
+        "restart changed boundary results");
+    Open(store, directory, "other");
+    Require(store.messagePage("conversation", boundary, "newer").value("messages").toList().isEmpty(), "forward history leaked account");
+}
+
 void CheckPagedHistoryAndUnread()
 {
     QTemporaryDir directory;
@@ -749,6 +822,7 @@ int main(int argc, char* argv[])
     try
     {
         CheckIncrementalUnreadCommitAndRecovery();
+        CheckBidirectionalHistory();
         CheckPagedHistoryAndUnread();
         CheckAbsoluteReadCountsAndLegacyCache();
         CheckDeliveryAndConfirmationPersistence();

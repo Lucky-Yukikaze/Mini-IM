@@ -30,6 +30,7 @@ public:
         quint32 burn_mode,
         quint32 burn_ttl_sec);
     Q_INVOKABLE QVariantMap loadHistory(const QString& conversation, const QString& before);
+    Q_INVOKABLE QVariantMap loadHistoryPage(const QString& conversation, const QString& cursor, const QString& direction);
     Q_INVOKABLE bool retryFile(const QString& clientFileId);
     Q_INVOKABLE bool cancelFile(const QString& clientFileId);
     Q_INVOKABLE QVariantMap previewCancelledDownloads();
