@@ -917,6 +917,138 @@ class ControlWriteNetworkTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(count, self.event_count())
             self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
 
+    async def pending_upload(self, protocol, file_id, payload):
+        writer = await self.upload_stream(protocol, file_id, 0, payload)
+        stream_id = writer.get_extra_info("stream_id")
+        owner = next(item for item in self.protocols if item.m_device_id == "buffer-owner")
+        await self.until(lambda: stream_id in owner.m_file_stream_states
+            and len(owner.m_file_stream_states[stream_id].buffer) == len(payload))
+        self.assertEqual(0, self.files.get_transfer_by_file_id(file_id).received_bytes)
+        self.assertFalse(self.files.get_storage_path(file_id).exists())
+        return writer, owner
+
+    async def test_upload_batches_limit_commits_and_flush_without_fin(self):
+        payload = bytes(range(251)) * 800
+        sizes = []
+        original = self.files.append_file_chunk
+        def append(*args, **kwargs):
+            result = original(*args, **kwargs)
+            sizes.append(len(kwargs["chunk"]))
+            return result
+        with patch("quic.server.UPLOAD_COMMIT_DELAY", 0.2), patch.object(self.files, "append_file_chunk", append):
+            async with self.peer(device="buffer-owner", with_protocol=True) as (reader, send, protocol):
+                initialized = await self.initialize_upload(reader, send, self.shared_upload_request(payload))
+                writer, owner = await self.pending_upload(protocol, initialized.file_id, payload[:8192])
+                send("early-finish", file_finish=file_pb2.FileFinish(file_id=initialized.file_id, success=True))
+                self.assertEqual(503, (await self.read(reader, "early-finish", "ack")).ack.code)
+                await self.until(lambda: self.files.get_transfer_by_file_id(initialized.file_id).received_bytes == 8192)
+                self.assertEqual([8192], sizes)
+                writer.write(payload[8192:])
+                await self.finish_upload(reader, send, initialized.file_id, payload)
+                self.assertEqual(len(payload), sum(sizes))
+                self.assertTrue(all(0 < size <= 65536 for size in sizes))
+                self.assertLessEqual(len(sizes), 6)
+                writer.write_eof()
+                await self.until(lambda: not owner.m_file_stream_states)
+
+    async def test_cancel_discards_uncommitted_upload_and_timer(self):
+        payload = b"cancel buffered upload" * 1024
+        request = self.shared_upload_request(payload)
+        with patch("quic.server.UPLOAD_COMMIT_DELAY", 0.2):
+            async with self.peer(device="buffer-owner", with_protocol=True) as (reader, send, protocol):
+                initialized = await self.initialize_upload(reader, send, request)
+                writer, owner = await self.pending_upload(protocol, initialized.file_id, payload[:8192])
+                send("cancel-buffer", file_cancel=file_pb2.FileCancel(
+                    client_file_id=request.client_file_id, file_id=initialized.file_id))
+                self.assertTrue((await self.read(reader, "cancel-buffer", "ack")).ack.success)
+                await self.rejected_stream(protocol, writer)
+                await asyncio.sleep(0.25)
+                transfer = self.files.get_transfer_by_file_id(initialized.file_id)
+                self.assertEqual(("cancelled", 0), (transfer.status, transfer.received_bytes))
+                self.assertFalse(self.files.get_storage_path(initialized.file_id).exists())
+                self.assertFalse(owner.m_file_stream_states)
+                self.assertEqual(0, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+
+    async def test_queued_upload_flush_cannot_outlive_cancel(self):
+        payload = b"queued buffered upload" * 1024
+        request = self.shared_upload_request(payload)
+        with patch("quic.server.UPLOAD_COMMIT_DELAY", 0.2):
+            async with self.peer(device="buffer-owner", with_protocol=True) as (reader, send, protocol):
+                initialized = await self.initialize_upload(reader, send, request)
+                writer, owner = await self.pending_upload(protocol, initialized.file_id, payload[:8192])
+                await self.hub.writes.submit(lambda: None)
+                await asyncio.sleep(0)
+                entered, release = asyncio.Event(), asyncio.Event()
+                worker = self.hub.writes._worker_loop
+                async def paused():
+                    entered.set()
+                    await release.wait()
+                    await worker()
+                with patch.object(self.hub.writes, "_worker_loop", paused):
+                    barrier = self.hub.writes.enqueue(lambda: None)
+                    try:
+                        await entered.wait()
+                        send("queued-cancel", file_cancel=file_pb2.FileCancel(
+                            client_file_id=request.client_file_id, file_id=initialized.file_id))
+                        await self.until(lambda: len(self.hub.writes.m_queue) >= 2)
+                        await self.until(lambda: owner.m_file_stream_states[writer.stream_id].flush_queued)
+                        self.assertFalse(self.files.get_storage_path(initialized.file_id).exists())
+                    finally:
+                        release.set()
+                    await barrier
+                    self.assertTrue((await self.read(reader, "queued-cancel", "ack")).ack.success)
+                await self.hub.writes.submit(lambda: None)
+                self.assertFalse(owner.m_file_stream_states)
+                self.assertFalse(self.files.get_storage_path(initialized.file_id).exists())
+                self.assertEqual(0, self.files.get_transfer_by_file_id(initialized.file_id).received_bytes)
+
+    async def test_old_upload_timer_cannot_write_after_connection_takeover(self):
+        payload = b"new connection owns buffered upload" * 1024
+        request = self.shared_upload_request(payload)
+        with patch("quic.server.UPLOAD_COMMIT_DELAY", 0.2):
+            async with self.peer(device="buffer-owner", with_protocol=True) as (old, send_old, old_protocol):
+                initialized = await self.initialize_upload(old, send_old, request)
+                writer, owner = await self.pending_upload(old_protocol, initialized.file_id, b"stale buffered bytes")
+                async with self.peer(device="buffer-owner", with_protocol=True) as (new, send_new, new_protocol):
+                    resumed = await self.initialize_upload(new, send_new, request, "takeover")
+                    self.assertEqual(0, resumed.transferred_bytes)
+                    fresh = await self.upload_stream(new_protocol, resumed.file_id, 0, payload)
+                    fresh.write_eof()
+                    await self.finish_upload(new, send_new, resumed.file_id, payload)
+                    await self.rejected_stream(old_protocol, writer)
+                    self.assertFalse(owner.m_file_stream_states)
+                    self.assertEqual(payload, self.files.get_storage_path(resumed.file_id).read_bytes())
+
+    async def interrupted_buffer(self, reset):
+        payload = b"buffered bytes survive through original intent" * 1024
+        request = self.shared_upload_request(payload)
+        with patch("quic.server.UPLOAD_COMMIT_DELAY", 0.2):
+            async with self.peer(device="buffer-owner", with_protocol=True) as (reader, send, protocol):
+                initialized = await self.initialize_upload(reader, send, request)
+                writer, owner = await self.pending_upload(protocol, initialized.file_id, payload[:8192])
+                if reset:
+                    protocol._quic.reset_stream(writer.stream_id, 17)
+                    protocol.transmit()
+                else:
+                    protocol.close()
+                    await protocol.wait_closed()
+                await self.until(lambda: not owner.m_file_stream_states)
+                await asyncio.sleep(0.25)
+                self.assertEqual(0, self.files.get_transfer_by_file_id(initialized.file_id).received_bytes)
+                self.assertFalse(self.files.get_storage_path(initialized.file_id).exists())
+            async with self.peer(device="replacement", with_protocol=True) as (reader, send, protocol):
+                resumed = await self.initialize_upload(reader, send, request, "resume")
+                self.assertEqual((initialized.file_id, 0), (resumed.file_id, resumed.transferred_bytes))
+                writer = await self.upload_stream(protocol, resumed.file_id, 0, payload)
+                writer.write_eof()
+                await self.finish_upload(reader, send, resumed.file_id, payload)
+
+    async def test_reset_discards_uncommitted_buffer_before_resume(self):
+        await self.interrupted_buffer(reset=True)
+
+    async def test_disconnect_discards_uncommitted_buffer_before_resume(self):
+        await self.interrupted_buffer(reset=False)
+
     async def test_duplicate_upload_stream_cannot_append_into_active_stream(self):
         payload = b"first halfsecond half"
         request = self.shared_upload_request(payload)
@@ -1003,7 +1135,7 @@ class ControlWriteNetworkTest(unittest.IsolatedAsyncioTestCase):
             await self.until(lambda: self.files.get_transfer_by_file_id(updated.file_id).received_bytes == 8)
             send_new("cancel", file_cancel=file_pb2.FileCancel(client_file_id=request.client_file_id, file_id=updated.file_id))
             self.assertTrue((await self.read(new, "cancel", "ack")).ack.success)
-            writer.write(payload[8:])
+            # Cancellation now stops the live stream immediately, before another write.
             await self.rejected_stream(protocol, writer)
             self.assertEqual("cancelled", self.files.get_transfer_by_file_id(updated.file_id).status)
             self.assertEqual(payload[:8], self.files.get_storage_path(updated.file_id).read_bytes())

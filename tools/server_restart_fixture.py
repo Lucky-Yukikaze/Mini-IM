@@ -140,6 +140,13 @@ async def main(args):
             return super().apply_progress(file_id, received_bytes, member_ids)
 
     class Protocol(production.MiniImQuicProtocol):
+        def _handle_file_stream_data(self, stream_id, data, end_stream):
+            super()._handle_file_stream_data(stream_id, data, end_stream)
+            state = self.m_file_stream_states.get(stream_id)
+            if state is not None and state.lease is not None and state.buffer:
+                gate.check("file-buffered", operation="upload", position=len(state.buffer),
+                    committed=state.lease.offset, fileId=state.file_id)
+
         def _send(self, stream_id, envelope):
             if envelope.HasField("welcome"):
                 # Shorten only this isolated server's failure detection interval.

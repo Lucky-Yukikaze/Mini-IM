@@ -35,6 +35,8 @@ from storage.sqlite.write_queue import SqliteWriteQueue
 
 
 FILE_STREAM_HEADER_MAX = 512
+UPLOAD_COMMIT_BYTES = 65536
+UPLOAD_COMMIT_DELAY = 0.02
 
 
 @dataclass
@@ -42,6 +44,8 @@ class FileStreamState:
     buffer: bytearray = field(default_factory=bytearray)
     file_id: str = ""
     lease: UploadLease | None = None
+    flush_timer: asyncio.TimerHandle | None = None
+    flush_queued: bool = False
 
 
 @dataclass
@@ -69,6 +73,9 @@ class OnlineSessionHub:
             self.uploads.release(lease)
         for protocol in list(self.m_protocols.get(user_id, ())):
             protocol.m_download_sender.cancel(file_id)
+            for stream_id, state in list(protocol.m_file_stream_states.items()):
+                if state.file_id == file_id:
+                    protocol._reject_file_stream(stream_id)
 
     def unregister(self, user_id: str, protocol: "MiniImQuicProtocol") -> None:
         self.uploads.release_owner(protocol)
@@ -185,6 +192,8 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
         self.m_download_sender.notify()
 
     def close(self, error_code=0, reason_phrase="") -> None:
+        self.m_control_closed = True
+        self._clear_upload_streams()
         self.m_download_sender.close()
         super().close(error_code=error_code, reason_phrase=reason_phrase)
 
@@ -237,6 +246,8 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
         self._send(self.m_control_stream_id, envelope)
 
     def connection_lost(self, exc) -> None:
+        self.m_control_closed = True
+        self._clear_upload_streams()
         self.m_download_sender.close()
         if self.m_user_id:
             self.m_online_hub.unregister(self.m_user_id, self)
@@ -244,7 +255,7 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
 
     def _reject_file_stream(self, stream_id: int) -> None:
         self.m_rejected_file_streams.add(stream_id)
-        self.m_file_stream_states.pop(stream_id, None)
+        self._discard_upload_stream(stream_id)
         self.m_online_hub.uploads.release_owner(self, stream_id)
         # aioquic may retire a finished stream before its queued event runs.
         if stream_id not in self.m_pending_receive_ends:
@@ -274,62 +285,119 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
         state.file_id = file_id
         return True
 
-    def _handle_file_stream_data(self, stream_id: int, data: bytes, end_stream: bool) -> None:
-        if not self.m_user_id or stream_id in self.m_rejected_file_streams:
-            return
-        uploads = self.m_online_hub.uploads
-        state = self.m_file_stream_states.setdefault(stream_id, FileStreamState())
-        state.buffer.extend(data)
-        if state.lease is None and not self._bind_upload_stream(stream_id, state, end_stream):
-            return
+    def _discard_upload_stream(self, stream_id: int) -> None:
+        state = self.m_file_stream_states.pop(stream_id, None)
+        if state is not None and state.flush_timer is not None:
+            state.flush_timer.cancel()
 
+    def _clear_upload_streams(self) -> None:
+        for stream_id in list(self.m_file_stream_states):
+            self._discard_upload_stream(stream_id)
+
+    def _upload_transfer(self, stream_id: int, state: FileStreamState):
         lease = state.lease
         transfer = self.m_file_service.get_transfer_for_upload(self.m_user_id, state.file_id)
-        if (not uploads.current(lease) or transfer is None
+        if (lease is None or not self.m_online_hub.uploads.current(lease) or transfer is None
                 or transfer.direction != common_pb2.FILE_DIRECTION_UPLOAD
                 or transfer.status not in {"init", "uploading", "uploaded"}
                 or transfer.received_bytes != lease.offset):
             self._reject_file_stream(stream_id)
+            return None
+        return transfer
+
+    def _schedule_upload_flush(self, stream_id: int, state: FileStreamState) -> None:
+        if not state.buffer or state.flush_timer is not None or state.flush_queued:
+            return
+
+        def flush():
+            state.flush_queued = False
+            if (self.m_file_stream_states.get(stream_id) is state
+                    and not self.m_control_closed and not self.m_file_storage_failed):
+                self._flush_upload_buffer(stream_id, state, force=True)
+
+        def enqueue():
+            state.flush_timer = None
+            state.flush_queued = True
+            try:
+                result = self.m_online_hub.writes.enqueue(flush)
+            except RuntimeError:
+                # A stopped queue will not accept a new timer operation. The uncommitted
+                # tail remains recoverable from the original client's durable intent.
+                self._discard_upload_stream(stream_id)
+                return
+            result.add_done_callback(self._write_completed)
+
+        state.flush_timer = asyncio.get_running_loop().call_later(UPLOAD_COMMIT_DELAY, enqueue)
+
+    def _flush_upload_buffer(self, stream_id: int, state: FileStreamState, *, force: bool) -> bool:
+        if self._upload_transfer(stream_id, state) is None:
+            return False
+        if state.flush_timer is not None:
+            state.flush_timer.cancel()
+            state.flush_timer = None
+        while state.buffer and (force or len(state.buffer) >= UPLOAD_COMMIT_BYTES):
+            chunk = bytes(state.buffer[:UPLOAD_COMMIT_BYTES])
+            projected = state.lease.offset + len(chunk)
+            try:
+                updated, sync_events = self.m_file_service.append_file_chunk(
+                    user_id=self.m_user_id, file_id=state.file_id, chunk=chunk)
+            except (OSError, sqlite3.Error) as error:
+                self._debug(f"upload storage failed: {error}")
+                self.m_file_storage_failed = True
+                self._clear_upload_streams()
+                self.m_online_hub.uploads.release_owner(self)
+                self._quic.close(error_code=0x1004, reason_phrase="upload_storage_failed")
+                self.transmit()
+                return False
+            if updated is None or updated.transferred_bytes != projected:
+                self._reject_file_stream(stream_id)
+                return False
+            self.m_online_hub.uploads.advance(state.lease, projected)
+            del state.buffer[:len(chunk)]
+            self.m_online_hub.fanout_sync_events(sync_events)
+        self._schedule_upload_flush(stream_id, state)
+        return True
+
+    def _handle_file_stream_data(self, stream_id: int, data: bytes, end_stream: bool) -> None:
+        if not self.m_user_id or stream_id in self.m_rejected_file_streams:
+            return
+        state = self.m_file_stream_states.setdefault(stream_id, FileStreamState())
+        state.buffer.extend(data)
+        if state.lease is None and not self._bind_upload_stream(stream_id, state, end_stream):
+            return
+        transfer = self._upload_transfer(stream_id, state)
+        if transfer is None:
+            return
+        projected = state.lease.offset + len(state.buffer)
+        if projected > transfer.file_size:
+            self._reject_file_stream(stream_id)
             return
         if state.buffer:
-            projected = lease.offset + len(state.buffer)
-            if projected > transfer.file_size:
-                self._reject_file_stream(stream_id)
-                return
             if self.m_fault_config.file_drop_after_bytes > 0 and projected >= self.m_fault_config.file_drop_after_bytes:
                 self._quic.close(error_code=0x1001, reason_phrase="fault_injection_drop_after_bytes")
                 self.transmit()
-                self.m_file_stream_states.pop(stream_id, None)
+                self._discard_upload_stream(stream_id)
                 return
             if self.m_fault_config.file_drop_probability > 0.0 and random.random() < self.m_fault_config.file_drop_probability:
                 self._quic.close(error_code=0x1002, reason_phrase="fault_injection_random_drop")
                 self.transmit()
-                self.m_file_stream_states.pop(stream_id, None)
+                self._discard_upload_stream(stream_id)
                 return
-            try:
-                updated, sync_events = self.m_file_service.append_file_chunk(
-                    user_id=self.m_user_id, file_id=state.file_id, chunk=bytes(state.buffer))
-            except (OSError, sqlite3.Error) as error:
-                self._debug(f"upload storage failed: {error}")
-                self.m_file_storage_failed = True
-                self.m_file_stream_states.clear()
-                uploads.release_owner(self)
-                self._quic.close(error_code=0x1004, reason_phrase="upload_storage_failed")
-                self.transmit()
-                return
-            if updated is None or updated.transferred_bytes != projected:
-                self._reject_file_stream(stream_id)
-                return
-            uploads.advance(lease, projected)
-            state.buffer.clear()
-            self.m_online_hub.fanout_sync_events(sync_events)
+            # Receiving bytes keeps the owner alive but does not advance the durable offset.
+            self.m_online_hub.uploads.advance(state.lease, state.lease.offset)
+            if len(state.buffer) >= UPLOAD_COMMIT_BYTES or end_stream or projected == transfer.file_size:
+                if not self._flush_upload_buffer(stream_id, state, force=end_stream or projected == transfer.file_size):
+                    return
+            else:
+                self._schedule_upload_flush(stream_id, state)
         if end_stream:
-            self.m_file_stream_states.pop(stream_id, None)
-            if lease.offset != transfer.file_size:
-                uploads.release(lease)
+            self._discard_upload_stream(stream_id)
+            if state.lease.offset != transfer.file_size:
+                self.m_online_hub.uploads.release(state.lease)
 
     def _close_control(self, reason: str) -> None:
         self.m_control_closed = True
+        self._clear_upload_streams()
         self.m_control_stream_buffers.clear()
         self.m_download_sender.close()
         self.m_online_hub.unregister(self.m_user_id, self)
@@ -368,6 +436,7 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
     def _process_quic_event(self, event):
         if isinstance(event, ConnectionTerminated):
             self.m_control_closed = True
+            self._clear_upload_streams()
             self.m_control_stream_buffers.clear()
             self.m_download_sender.close()
             if self.m_user_id:
@@ -382,7 +451,7 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
             if event.stream_id == self.m_control_stream_id or (self.m_control_stream_id is None and event.stream_id % 4 == 0):
                 self._close_control("control_stream_reset")
                 return
-            self.m_file_stream_states.pop(event.stream_id, None)
+            self._discard_upload_stream(event.stream_id)
             self.m_rejected_file_streams.add(event.stream_id)
             self.m_online_hub.uploads.release_owner(self, event.stream_id)
             return

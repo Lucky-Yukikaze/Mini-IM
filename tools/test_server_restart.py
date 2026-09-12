@@ -443,12 +443,16 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         payload = bytes(range(251)) * 1024
         source = self.root / "upload.bin"
         source.write_bytes(payload)
-        await self.server.arm(point, "upload", position=65536)
+        await self.server.arm(point, "upload", position=4096 if point == "file-buffered" else 65536)
         await self.alice.command("upload", conversation=self.conversation, path=str(source))
         checkpoint = await self.kill_at_checkpoint()
         row = self.rows("SELECT * FROM file_transfers")[0]
         stored = self.data / "storage/files" / row["storage_path"]
-        if point == "file-flushed":
+        if point == "file-buffered":
+            self.assertEqual(stored.stat().st_size if stored.exists() else 0, row["received_bytes"])
+            self.assertEqual(checkpoint["committed"], row["received_bytes"])
+            self.assertGreaterEqual(checkpoint["position"], 4096)
+        elif point == "file-flushed":
             self.assertGreater(stored.stat().st_size, row["received_bytes"])
             self.assertEqual(checkpoint["committed"], row["received_bytes"])
         else:
@@ -465,6 +469,9 @@ class ServerRestartTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["received_bytes"], resumed["offset"])
         await self.check_new_sessions()
         await self.check_sync()
+
+    async def test_upload_uncommitted_memory_is_retransmitted_after_crash(self):
+        await self.upload_crash("file-buffered")
 
     async def test_upload_uncommitted_disk_tail_is_not_counted_after_crash(self):
         await self.upload_crash("file-flushed")
