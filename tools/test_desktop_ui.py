@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 import uuid
+from urllib.parse import unquote, urlsplit
 from urllib.error import URLError
 from urllib.request import urlopen
 
@@ -91,7 +92,13 @@ class DesktopCheck:
         while True:
             try:
                 with urlopen(self.context["debug"] + "/json", timeout=1) as response:
-                    if json.load(response):
+                    pages = json.load(response)
+                    if pages:
+                        if self.context.get('portablePage'):
+                            expected = Path(self.context['portablePage']).resolve().as_uri()
+                            if not any(unquote(urlsplit(page.get('url', ''))._replace(query='', fragment='').geturl())
+                                    == unquote(expected) for page in pages):
+                                raise AssertionError('Packaged client did not load its own web page: ' + repr(pages))
                         break
             except (URLError, TimeoutError):
                 pass

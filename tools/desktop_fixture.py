@@ -183,13 +183,22 @@ class DesktopFixture:
 
     async def start_client(self):
         env = dict(os.environ, MINIIM_DEBUG_LOG="0", MINIIM_STATE_ROOT=self.context["state"],
-            QTWEBENGINE_REMOTE_DEBUGGING=self.context["debug"].removeprefix("http://"), QT_QPA_PLATFORM="offscreen",
-            QT_QPA_PLATFORM_PLUGIN_PATH=str(self.args.qt_root / "plugins/platforms"))
+            QTWEBENGINE_REMOTE_DEBUGGING=self.context["debug"].removeprefix("http://"), QT_QPA_PLATFORM=self.args.platform,
+            QT_QPA_PLATFORM_PLUGIN_PATH=str(self.args.qt_root / "plugins/platforms") if self.args.qt_root else "")
+        if self.args.portable:
+            for key in list(env):
+                if key.startswith(('QT_', 'QML', 'QTWEBENGINE_')) or key in ('QTDIR', 'QT_DIR'):
+                    env.pop(key, None)
+            windows = Path(os.environ['SystemRoot'])
+            env['PATH'] = os.pathsep.join([str(windows / 'System32'), str(windows)])
+            env['QT_QPA_PLATFORM'] = self.args.platform
+            env['QTWEBENGINE_REMOTE_DEBUGGING'] = self.context['debug'].removeprefix('http://')
+            self.context['portablePage'] = str(self.args.client.parent / 'web/dist/index.html')
         env.pop("MINIIM_WEB_URL", None)
         env.pop("MINIIM_WEB_SMOKE_TEST", None)
         self.client_log = (self.output / "qt.log").open("ab")
         self.client = await asyncio.create_subprocess_exec(str(self.args.client), env=env,
-            stdout=self.client_log, stderr=self.client_log,
+            stdout=self.client_log, stderr=self.client_log, cwd=self.root if self.args.portable else None,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.context["pid"] = self.client.pid
         write_json(self.output / "context.json", self.context)
@@ -359,11 +368,17 @@ async def run(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--client", type=Path, default=ROOT / "build/client-manifest/Release/mini_im_client.exe")
-    parser.add_argument("--qt-root", type=Path, required=True, help="Qt kit directory containing plugins/platforms")
+    parser.add_argument("--qt-root", type=Path, help="Qt kit directory containing plugins/platforms")
+    parser.add_argument("--portable", action="store_true", help="use packaged runtime with only Windows directories on PATH")
+    parser.add_argument("--platform", choices=("offscreen", "windows"), default="offscreen")
     parser.add_argument("--output", type=Path, default=ROOT / "tmp/desktop-integration")
     parser.add_argument("--timeout", type=int, default=900, help="maximum fixture lifetime in seconds")
     args = parser.parse_args()
-    if not args.client.is_file() or not (args.qt_root / "plugins/platforms").is_dir() or args.timeout <= 0:
-        parser.error("provide a built desktop, installed Qt kit and positive timeout")
+    platform_plugins = args.client.parent / 'platforms' if args.portable else (
+        args.qt_root / 'plugins/platforms' if args.qt_root else Path('__missing_qt_kit__'))
+    if not args.client.is_file() or not platform_plugins.is_dir() or args.timeout <= 0:
+        parser.error("provide a built desktop, Qt kit or --portable package, and positive timeout")
+    if args.portable and not (args.client.parent / 'web/dist/index.html').is_file():
+        parser.error("portable package must contain web/dist/index.html")
     args.client = args.client.resolve()
     asyncio.run(run(args))

@@ -97,6 +97,38 @@ MsQuic、Protobuf 等非 Qt 依赖由所用依赖配置提供，运行前需保�
 Qt 部署结果应包含 `Qt6Sql.dll` 和 `sqldrivers/qsqlite.dll`；缺少 SQLite 驱动会使缓存打开失败。
 打包页面后，客户端可直接读取 `web/dist/index.html`。
 
+## Windows 独立桌面包
+
+[打包入口](../tools/package_desktop.ps1) 使用已配置的 Visual Studio 2022/x64 Release 构建目录与对应 Qt kit，
+先执行 Web 类型检查、页面构建和客户端构建，再创建独立发布目录。准备构建环境仍使用上方安装构建入口。
+`-QtRoot` 必须匹配 CMake 缓存；默认从 CMake 记录的 Visual Studio 目录查找 x64 C++ 可分发运行库，
+从 Windows SDK 注册表路径的 `Redist/D3D/x64` 查找 `dxcompiler.dll`、`dxil.dll`。
+SDK 非标准安装时用 `-WindowsSdkRoot` 指定包含 `Redist/D3D/x64` 的根目录。
+
+~~~powershell
+& ./tools/package_desktop.ps1 -QtRoot 'D:/Qt/6.11.0/msvc2022_64' -OutputDirectory build/packages/mini-im-release
+& ./build/packages/mini-im-release/mini_im_client.exe
+~~~
+
+默认输出 `build/packages/mini-im-<时间>/`；指定目录必须尚不存在，脚本不覆盖既有包，也不自动清理失败输出。
+包内包含桌面可执行文件、Qt 插件及 WebEngine 资源、应用依赖 DLL、C++ 运行库、图形编译库和 `web/dist`，
+不打包测试程序或服务端。`qt.conf` 使用包内相对路径；客户端优先加载自身目录的 `web/dist/index.html`，再查找开发目录。
+DLL = 程序运行时加载的共享库文件；运行无需额外配置本机 Qt、vcpkg 或编译器路径。
+`package-manifest.json` 记录源码提交、工作区状态、逐文件大小与 SHA-256；清单自身不计入其文件列表。
+发布目录可整体复制到含空格的新位置，从包内运行程序；连接服务端和开发认证约定见下节。
+
+独立包验收使用 [桌面夹具](../tools/desktop_fixture.py) 的 `--portable`：清理 Qt/QML 环境变量、
+把 `PATH` 限定为 Windows 目录及其 `System32`，并在隔离临时目录中启动客户端。
+`--platform windows` 使用 Windows 原生窗口，默认 `offscreen` 用于离屏交互检查；两者均要求加载包内页面。
+
+~~~powershell
+& ./.venv/Scripts/python.exe ./tools/desktop_fixture.py --portable --platform windows --client ./build/packages/mini-im-release/mini_im_client.exe
+~~~
+
+按 [真实桌面页面联调](#真实桌面页面联调) 的控制与文件入口使用生成的 `context.json`；无需 `--qt-root`。
+当前证据覆盖本机 Windows 11 独立目录、迁移目录、模块来源与真实页面交互；无 Qt/编译器的全新机器仍需单独验证。
+结果见 [独立桌面包批次](refactoring-progress.md#windows-独立桌面包与迁移验收--2026-09-12)。
+
 ## 运行与数据
 
 在一个终端启动服务端：

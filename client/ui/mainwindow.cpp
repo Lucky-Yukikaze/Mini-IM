@@ -170,10 +170,10 @@ bool MiniImMainWindow::tryLoadLocalWebDist()
 
     const QDir app_dir(QCoreApplication::applicationDirPath());
     const QStringList candidates = {
+        app_dir.filePath(QStringLiteral("web/dist/index.html")),
         app_dir.filePath(QStringLiteral("../../../web/dist/index.html")),
         app_dir.filePath(QStringLiteral("../../web/dist/index.html")),
         app_dir.filePath(QStringLiteral("../web/dist/index.html")),
-        app_dir.filePath(QStringLiteral("web/dist/index.html")),
     };
 
     for (const auto& candidate : candidates)
