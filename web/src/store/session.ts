@@ -79,33 +79,26 @@ function compareMessages(left: MessageItem, right: MessageItem): number {
   return left.seq - right.seq || left.createdAtMs - right.createdAtMs;
 }
 
-function upsertSortedMessage(list: MessageItem[], item: MessageItem): MessageItem {
-  const existingIndex = list.findIndex((existing) => existing.id === item.id);
-  const existing = list[existingIndex];
+// Structural changes replace the conversation array. Weak keys let replaced
+// snapshots and their lookup maps be collected without retaining account data.
+const messageLookups = new WeakMap<MessageItem[], Map<string, MessageItem>>();
+function messageLookup(messages: MessageItem[]): Map<string, MessageItem> {
+  let lookup = messageLookups.get(messages);
+  if (!lookup) {
+    lookup = new Map(messages.map(item => [item.id, item]));
+    messageLookups.set(messages, lookup);
+  }
+  return lookup;
+}
+
+function mergeMessage(existing: MessageItem | undefined, item: MessageItem): MessageItem {
   const nextItem = existing ? {
     ...existing,
     ...item,
     recalled: existing.recalled || item.recalled,
     burned: existing.burned || item.burned
   } : item;
-  if (nextItem.recalled || nextItem.burned) {
-    nextItem.text = '';
-  }
-  if (existingIndex >= 0) {
-    list.splice(existingIndex, 1);
-  }
-
-  let low = 0;
-  let high = list.length;
-  while (low < high) {
-    const mid = Math.floor((low + high) / 2);
-    if (compareMessages(list[mid], nextItem) <= 0) {
-      low = mid + 1;
-    } else {
-      high = mid;
-    }
-  }
-  list.splice(low, 0, nextItem);
+  if (nextItem.recalled || nextItem.burned) nextItem.text = '';
   return nextItem;
 }
 
@@ -286,6 +279,7 @@ export const useSessionStore = defineStore('session', {
     },
     pushMessages(rawItems: Partial<MessageItem>[]): void {
       const touchedConversationIds = new Set<string>();
+      const batches = new Map<string, Map<string, MessageItem>>();
       for (const rawItem of rawItems) {
         const item = ensureMessageDefaults(rawItem);
         const pending = this.pendingMessageStateByConversation[item.conversationId]?.[item.id];
@@ -296,14 +290,20 @@ export const useSessionStore = defineStore('session', {
         }
         const count = this.readCountsByConversation[item.conversationId]?.[item.id];
         const normalizedItem = count ? { ...item, unreadCount: count.unreadCount, readCountKnown: true } : item;
-        const list = this.messagesByConversation[item.conversationId] ?? [];
+        let messages = batches.get(item.conversationId);
+        if (!messages) {
+          messages = new Map(messageLookup(this.messagesByConversation[item.conversationId] ?? []));
+          batches.set(item.conversationId, messages);
+        }
         const progress = this.readProgressByConversation[item.conversationId];
-        const existing = list.find((entry) => entry.id === normalizedItem.id);
+        const existing = messages.get(normalizedItem.id);
         const wasUnread = countsAsUnread(existing, this.currentUserId, progress);
-        const merged = upsertSortedMessage(list, normalizedItem);
+        const merged = mergeMessage(existing, normalizedItem);
         const isUnread = countsAsUnread(merged, this.currentUserId, progress);
         if (!this.unreadAuthoritative) this.unreadTotal = Math.max(0, this.unreadTotal + Number(isUnread) - Number(wasUnread));
-        this.messagesByConversation[item.conversationId] = [...list];
+        // Reinsertion retains the previous stable order for equal sequence/time pairs.
+        messages.delete(merged.id);
+        messages.set(merged.id, merged);
 
         const conversation = this.conversations.find(
           (entry) => entry.conversationId === normalizedItem.conversationId
@@ -312,6 +312,9 @@ export const useSessionStore = defineStore('session', {
           conversation.updatedAtMs = Math.max(conversation.updatedAtMs, normalizedItem.createdAtMs);
           touchedConversationIds.add(normalizedItem.conversationId);
         }
+      }
+      for (const [conversation, messages] of batches) {
+        this.messagesByConversation[conversation] = [...messages.values()].sort(compareMessages);
       }
       if (touchedConversationIds.size > 0) {
         this.conversations = [...this.conversations].sort((left, right) => right.updatedAtMs - left.updatedAtMs);
@@ -324,7 +327,7 @@ export const useSessionStore = defineStore('session', {
         if (!previous || update.globalSeq > previous.globalSeq) {
           counts[update.messageId] = update;
           this.readCountsByConversation[update.conversationId] = counts;
-          const item = this.messagesByConversation[update.conversationId]?.find(message => message.id === update.messageId);
+          const item = messageLookup(this.messagesByConversation[update.conversationId] ?? []).get(update.messageId);
           if (item) { item.unreadCount = update.unreadCount; item.readCountKnown = true; }
         }
         return;
@@ -342,7 +345,7 @@ export const useSessionStore = defineStore('session', {
       }
       if (update.type === 'recall' || update.type === 'burn') {
         const list = this.messagesByConversation[update.conversationId] ?? [];
-        const item = list.find((message) => message.id === update.messageId);
+        const item = messageLookup(this.messagesByConversation[update.conversationId] ?? []).get(update.messageId);
         if (item) {
           if (!this.unreadAuthoritative && countsAsUnread(item, this.currentUserId, this.readProgressByConversation[update.conversationId])) {
             this.unreadTotal = Math.max(0, this.unreadTotal - 1);

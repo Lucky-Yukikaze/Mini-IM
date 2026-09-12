@@ -314,3 +314,38 @@ test('paged history retains native unread totals and terminal updates', () => {
   assert.deepEqual(session.historyByConversation, {});
   assert.deepEqual(session.messagesByConversation, {});
 });
+
+test('mixed batches keep duplicate identity, terminal state, counts and stable ordering', () => {
+  const session = useSessionStore(createPinia());
+  session.applyInitialState({ currentUser: { userId: 'alice' } });
+  session.applyMessageUpdated({ type: 'receipt', eventId: 'read', conversationId: 'a',
+    readerId: 'alice', lastReadSeq: 1, readAtMs: 1 });
+  session.applyMessageUpdated({ type: 'burn', eventId: 'burn', conversationId: 'a',
+    messageId: 'gone', operatorId: 'system-burn', tsMs: 2 });
+  session.applyMessageUpdated({ type: 'readCount', eventId: 'count', conversationId: 'a',
+    messageId: 'two', globalSeq: 20, unreadCount: 0 });
+  const message = (id: string, seq: number) => ({ id, seq, conversationId: 'a', senderId: 'bob',
+    createdAtMs: seq, text: id, unreadCount: 9 });
+  session.pushMessages([message('three', 3), message('one', 1), message('two', 2),
+    { ...message('three', 3), recalled: true }, message('three', 3),
+    message('gone', 4), message('gone', 4),
+    { ...message('mine', 1), conversationId: 'b', senderId: 'alice' },
+    message('tie', 2), message('two', 2)]);
+  assert.deepEqual(session.messagesByConversation.a.map(item => item.id), ['one', 'tie', 'two', 'three', 'gone']);
+  assert.equal(session.messagesByConversation.b.length, 1);
+  assert.equal(session.unreadTotal, 2);
+  assert.equal(session.messagesByConversation.a.find(item => item.id === 'two')?.unreadCount, 0);
+  assert.equal(session.messagesByConversation.a.find(item => item.id === 'three')?.text, '');
+  assert.equal(session.messagesByConversation.a.find(item => item.id === 'gone')?.burned, true);
+  assert.equal(session.messagesByConversation.a.find(item => item.id === 'gone')?.text, '');
+  session.applyMessageUpdated({ type: 'readCount', eventId: 'count-new', conversationId: 'a',
+    messageId: 'tie', globalSeq: 30, unreadCount: 2 });
+  assert.equal(session.messagesByConversation.a[1].unreadCount, 2);
+  session.applyInitialState({ currentUser: { userId: 'alice' }, recentMessages: [message('replacement', 5)] });
+  session.applyMessageUpdated({ type: 'recall', eventId: 'recall-new', conversationId: 'a',
+    messageId: 'replacement', operatorId: 'bob', tsMs: 40 });
+  assert.equal(session.messagesByConversation.a[0].text, '');
+  assert.equal(session.messagesByConversation.a.some(item => item.id === 'two'), false);
+  session.applyInitialState({ currentUser: { userId: 'other' } });
+  assert.deepEqual(session.messagesByConversation, {});
+});
