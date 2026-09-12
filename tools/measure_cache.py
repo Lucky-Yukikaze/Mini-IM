@@ -18,9 +18,9 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def invoke(driver, cache):
+def invoke(driver, cache, *options):
     started = time.perf_counter()
-    result = subprocess.run([str(driver), str(cache)], capture_output=True, text=True,
+    result = subprocess.run([str(driver), str(cache), *options], capture_output=True, text=True,
         encoding='utf-8', errors='strict', timeout=120)
     if result.returncode:
         raise RuntimeError(f'cache driver exited {result.returncode}: {result.stderr}')
@@ -79,12 +79,26 @@ def main(args):
                 seed(database, count, args.conversations)
                 for repeat in range(args.repeats):
                     data = invoke(args.driver, cache)
-                    assert data['messages'] == data['deliveries'] == data['readCounts'] == data['unreadTotal'] == count
+                    expected_page = sum(min(50, (count + args.conversations - c - 1) // args.conversations)
+                        for c in range(args.conversations))
+                    assert data['messages'] == data['deliveries'] == data['readCounts'] == expected_page
+                    assert data['unreadTotal'] == count
                     assert data['conversations'] == args.conversations
                     results.append(dict(messageCount=count, repeat=repeat + 1,
                         databaseBytes=database.stat().st_size, **data))
                     (output / 'results.json').write_text(json.dumps(results, indent=2), encoding='utf-8')
                     print(json.dumps(results[-1]), flush=True)
+                verification = invoke(args.driver, cache, '--verify-history')
+                assert verification['historyMessages'] == verification['historyDeliveries'] == verification['historyReadCounts'] == count
+                # Measure upgrading an existing populated cache separately from steady-state samples.
+                with closing(sqlite3.connect(database)) as db:
+                    for index in ('objects_message_order', 'objects_message_unread', 'objects_delivery_message'):
+                        db.execute('DROP INDEX ' + index)
+                    db.commit()
+                upgrade = invoke(args.driver, cache)
+                assert upgrade['unreadTotal'] == count and upgrade['messages'] == expected_page
+                (output / f'history-{count}.json').write_text(json.dumps(dict(verification=verification,
+                    indexUpgrade=upgrade), indent=2), encoding='utf-8')
         print('CACHE MEASUREMENT PASSED ' + str(output), flush=True)
     except BaseException as error:
         (output / 'error.json').write_text(json.dumps(dict(error=repr(error))), encoding='utf-8')

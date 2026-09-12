@@ -1,5 +1,7 @@
 ﻿import { defineStore } from 'pinia';
 import type {
+  HistoryPage,
+  HistoryState,
   ConnectionState,
   ControlWriteItem,
   ConversationItem,
@@ -18,6 +20,8 @@ interface SessionStoreState {
   currentUserId: string;
   globalCursor: number;
   unreadTotal: number;
+  unreadAuthoritative: boolean;
+  historyByConversation: Record<string, HistoryState>;
   conversations: ConversationItem[];
   messageSends: MessageSendItem[];
   fileTasks: FileTaskItem[];
@@ -123,6 +127,8 @@ export const useSessionStore = defineStore('session', {
     currentUserId: '',
     globalCursor: 0,
     unreadTotal: 0,
+    unreadAuthoritative: false,
+    historyByConversation: {},
     conversations: [],
     messageSends: [],
     fileTasks: [],
@@ -184,6 +190,8 @@ export const useSessionStore = defineStore('session', {
         this.connection = connection;
       }
       this.currentUserId = userId;
+      if (payload.unreadAuthoritative !== undefined) this.unreadAuthoritative = payload.unreadAuthoritative;
+      if (payload.historyByConversation !== undefined) this.historyByConversation = payload.historyByConversation;
       if (payload.globalCursor !== undefined) {
         this.globalCursor = payload.globalCursor;
       }
@@ -243,6 +251,17 @@ export const useSessionStore = defineStore('session', {
         this.currentUserId
       );
     },
+    applySyncProgress(payload: { globalCursor: number; unreadTotal?: number }): void {
+      this.globalCursor = payload.globalCursor;
+      if (this.unreadAuthoritative && payload.unreadTotal !== undefined) this.unreadTotal = payload.unreadTotal;
+    },
+    applyHistory(page: HistoryPage): void {
+      if (!page.ok || page.userId !== this.currentUserId || !page.conversationId) return;
+      for (const count of page.readCounts ?? []) this.applyMessageUpdated(count);
+      for (const delivery of page.deliveries ?? []) this.applyMessageUpdated(delivery);
+      this.pushMessages(page.messages ?? []);
+      this.historyByConversation[page.conversationId] = { cursor: page.cursor ?? '', hasMore: page.hasMore ?? false };
+    },
     applyConversationUpdated(item: ConversationItem): void {
       const index = this.conversations.findIndex(
         (conversation) => conversation.conversationId === item.conversationId
@@ -283,7 +302,7 @@ export const useSessionStore = defineStore('session', {
         const wasUnread = countsAsUnread(existing, this.currentUserId, progress);
         const merged = upsertSortedMessage(list, normalizedItem);
         const isUnread = countsAsUnread(merged, this.currentUserId, progress);
-        this.unreadTotal = Math.max(0, this.unreadTotal + Number(isUnread) - Number(wasUnread));
+        if (!this.unreadAuthoritative) this.unreadTotal = Math.max(0, this.unreadTotal + Number(isUnread) - Number(wasUnread));
         this.messagesByConversation[item.conversationId] = [...list];
 
         const conversation = this.conversations.find(
@@ -325,7 +344,7 @@ export const useSessionStore = defineStore('session', {
         const list = this.messagesByConversation[update.conversationId] ?? [];
         const item = list.find((message) => message.id === update.messageId);
         if (item) {
-          if (countsAsUnread(item, this.currentUserId, this.readProgressByConversation[update.conversationId])) {
+          if (!this.unreadAuthoritative && countsAsUnread(item, this.currentUserId, this.readProgressByConversation[update.conversationId])) {
             this.unreadTotal = Math.max(0, this.unreadTotal - 1);
           }
           item.recalled = true;
@@ -367,7 +386,7 @@ export const useSessionStore = defineStore('session', {
       conversationProgress[update.readerId] = update.lastReadSeq;
       this.readProgressByConversation[update.conversationId] = conversationProgress;
       this.messagesByConversation[update.conversationId] = [...list];
-      this.unreadTotal = Math.max(0, this.unreadTotal - readByCurrentUser);
+      if (!this.unreadAuthoritative) this.unreadTotal = Math.max(0, this.unreadTotal - readByCurrentUser);
     },
     applyFileProgress(rawItem: FileProgressItem): void {
       const item = {

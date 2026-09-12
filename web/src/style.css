@@ -339,11 +339,15 @@ label {
 }
 
 .message-surface {
+  display: flex;
+  flex-direction: column;
   min-height: 0;
   background: #f2f4f7;
 }
 
 .message-viewport {
+  flex: 1;
+  min-height: 0;
   height: 100%;
   overflow: auto;
   padding: 18px 22px;

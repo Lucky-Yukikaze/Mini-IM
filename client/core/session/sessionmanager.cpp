@@ -800,6 +800,15 @@ bool MiniImSessionManager::sendFile(const QString& conversation_id, const QStrin
     return m_files.sendFile(conversation_id, file_path, priority);
 }
 
+QVariantMap MiniImSessionManager::loadHistory(const QString& conversation, const QString& before)
+{
+    if (!m_connected || m_transportStopping)
+    {
+        return {{"ok", false}, {"error", "connect before loading history"}};
+    }
+    return m_stateStore.messagePage(conversation, before);
+}
+
 bool MiniImSessionManager::downloadFile(
     const QString& conversation_id,
     const QString& source_file_id,

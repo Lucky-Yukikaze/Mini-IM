@@ -1,4 +1,4 @@
-import type { ConversationItem, MessageItem } from '../types';
+import type { ConversationItem, MessageItem, HistoryPage } from '../types';
 import { bridgeEvents } from '../events/bridge-event-store';
 
 export interface FileCleanupItem {
@@ -34,6 +34,7 @@ interface QtImBridge {
     burnTtlSec: number,
     done: (accepted: boolean) => void
   ): void;
+  loadHistory?(conversationId: string, cursor: string, done: (result: HistoryPage) => void): void;
   retryMessage(conversationId: string, clientMsgId: string, done: (accepted: boolean) => void): void;
   createConversation(clientConvId: string, title: string, memberIds: string[], done: (accepted: boolean) => void): void;
   createDirectConversation?(clientConvId: string, peerUserId: string, done: (accepted: boolean) => void): void;
@@ -438,6 +439,11 @@ export async function retryFile(clientFileId: string): Promise<boolean> {
 export async function cancelFile(clientFileId: string): Promise<boolean> {
   if (typeof runtimeWindow.imBridge?.cancelFile !== 'function') return false;
   return new Promise((resolve) => runtimeWindow.imBridge!.cancelFile(clientFileId, resolve));
+}
+
+export async function loadHistory(conversationId: string, cursor: string): Promise<HistoryPage> {
+  if (typeof runtimeWindow.imBridge?.loadHistory !== 'function') return { ok: false, error: '当前客户端不支持加载历史' };
+  return new Promise(resolve => runtimeWindow.imBridge!.loadHistory!(conversationId, cursor, resolve));
 }
 
 export async function previewCancelledDownloads(): Promise<FileCleanupResult> {

@@ -40,6 +40,8 @@ public:
     quint64 cursor() const;
     bool hasGap() const;
     QVariantMap snapshot() const;
+    QVariantMap messagePage(const QString& conversation, const QString& before = QString()) const;
+    quint64 unreadTotal() const;
     QString errorString() const;
     QString databasePath() const;
     MiniImMessageOutbox& outbox();
@@ -47,6 +49,7 @@ public:
     MiniImControlWriteStore& controlWrites();
 
 private:
+    void createHistoryIndexes();
     QSqlQuery run(const QString& sql, const QVariantList& values = {}) const;
     QString metadata(const QString& key) const;
     QVariantMap object(const QString& kind, const QString& id) const;

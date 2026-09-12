@@ -184,6 +184,11 @@ bool ImBridge::sendFile(const QString& conversation_id, const QString& file_path
     return m_session_manager.sendFile(conversation_id, file_path, priority);
 }
 
+QVariantMap ImBridge::loadHistory(const QString& conversation, const QString& before)
+{
+    return m_session_manager.loadHistory(conversation, before);
+}
+
 bool ImBridge::downloadFile(
     const QString& conversation_id,
     const QString& source_file_id,

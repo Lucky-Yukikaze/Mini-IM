@@ -45,6 +45,7 @@ public:
         quint32 burn_mode = 0,
         quint32 burn_ttl_sec = 0);
     bool retryMessage(const QString& conversationId, const QString& clientMsgId);
+    QVariantMap loadHistory(const QString& conversation, const QString& before);
     bool retryFile(const QString& clientFileId);
     bool cancelFile(const QString& clientFileId);
     QVariantMap previewCancelledDownloads();

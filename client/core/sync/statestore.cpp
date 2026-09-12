@@ -103,6 +103,7 @@ bool MiniImStateStore::open(const QString& root, const QString& endpoint, const 
             "kind TEXT NOT NULL, id TEXT NOT NULL, conversation TEXT NOT NULL, position INTEGER NOT NULL,"
             "data BLOB NOT NULL, PRIMARY KEY(kind,id))"));
         run(QStringLiteral("CREATE INDEX IF NOT EXISTS objects_conversation ON objects(kind,conversation)"));
+        createHistoryIndexes();
         m_outbox.open(m_db);
         m_fileTasks.open(m_db);
         m_controlWrites.open(m_db);
@@ -338,14 +339,10 @@ QVariantMap MiniImStateStore::snapshot() const
 {
     try
     {
-        QVariantList conversations;
-        QVariantList messages;
-        QVariantList files;
-        QVariantList deliveries;
-        QVariantList readCounts;
-        QVariantMap countsByMessage;
-        QVariantMap reads;
-        auto query = run(QStringLiteral("SELECT kind,data FROM objects ORDER BY position"));
+        QVariantList conversations, messages, files, deliveries, readCounts;
+        QVariantMap reads, history;
+        auto query = run(QStringLiteral("SELECT kind,data FROM objects "
+            "WHERE kind IN ('conversation','file','receipt') ORDER BY position"));
         while (query.next())
         {
             const QString kind = query.value(0).toString();
@@ -354,53 +351,38 @@ QVariantMap MiniImStateStore::snapshot() const
             {
                 conversations.append(data);
             }
-            else if (kind == QStringLiteral("message"))
-            {
-                messages.append(data);
-            }
             else if (kind == QStringLiteral("file"))
             {
                 files.append(data);
             }
-            else if (kind == QStringLiteral("delivery"))
+            else
             {
-                deliveries.append(data);
-            }
-            else if (kind == QStringLiteral("readCount"))
-            {
-                readCounts.append(data);
-                countsByMessage.insert(data.value(QStringLiteral("messageId")).toString(), data);
-            }
-            else if (kind == QStringLiteral("receipt"))
-            {
-                const QString conversation = data.value(QStringLiteral("conversationId")).toString();
+                const QString conversation = data.value("conversationId").toString();
                 auto progress = reads.value(conversation).toMap();
-                progress.insert(data.value(QStringLiteral("readerId")).toString(), data.value(QStringLiteral("lastReadSeq")));
+                progress.insert(data.value("readerId").toString(), data.value("lastReadSeq"));
                 reads.insert(conversation, progress);
             }
         }
-        int unreadTotal = 0;
-        for (auto& value : messages)
+        auto groups = run(QStringLiteral("SELECT DISTINCT conversation FROM objects WHERE kind='message'"));
+        while (groups.next())
         {
-            auto message = value.toMap();
-            const auto progress = reads.value(message.value(QStringLiteral("conversationId")).toString()).toMap();
-            const quint64 seq = message.value(QStringLiteral("seq")).toULongLong();
-            const auto count = countsByMessage.value(message.value(QStringLiteral("id")).toString()).toMap();
-            message.insert(QStringLiteral("readCountKnown"), !count.isEmpty());
-            if (!count.isEmpty())
+            const QString conversation = groups.value(0).toString();
+            const auto page = messagePage(conversation);
+            if (!page.value("ok").toBool())
             {
-                message.insert(QStringLiteral("unreadCount"), count.value(QStringLiteral("unreadCount")));
+                throw std::runtime_error(page.value("error").toString().toStdString());
             }
-            if (message.value(QStringLiteral("senderId")).toString() != m_user
-                && seq > progress.value(m_user).toULongLong() && !message.value(QStringLiteral("recalled")).toBool())
-            {
-                ++unreadTotal;
-            }
-            value = message;
+            messages.append(page.value("messages").toList());
+            deliveries.append(page.value("deliveries").toList());
+            readCounts.append(page.value("readCounts").toList());
+            history.insert(conversation, QVariantMap{{"cursor", page.value("cursor")},
+                {"hasMore", page.value("hasMore")}});
         }
         return {{"currentUser", QVariantMap{{"userId", m_user}}}, {"globalCursor", QVariant::fromValue(m_cursor)},
-            {"conversations", conversations}, {"recentMessages", messages}, {"unreadTotal", unreadTotal},
-            {"readProgressByConversation", reads}, {"readCounts", readCounts}, {"deliveries", deliveries}, {"files", files}, {"messageSends", m_outbox.pending()}, {"fileTasks", m_fileTasks.pending()},
+            {"conversations", conversations}, {"recentMessages", messages}, {"unreadTotal", QVariant::fromValue(unreadTotal())},
+            {"unreadAuthoritative", true}, {"historyByConversation", history},
+            {"readProgressByConversation", reads}, {"readCounts", readCounts}, {"deliveries", deliveries},
+            {"files", files}, {"messageSends", m_outbox.pending()}, {"fileTasks", m_fileTasks.pending()},
             {"controlWrites", m_controlWrites.pending()}};
     }
     catch (const std::exception& error)

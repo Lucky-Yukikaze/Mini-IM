@@ -293,3 +293,24 @@ test('native count snapshots correct legacy displays and clear across accounts',
   session.applyInitialState({ currentUser: { userId: 'bob' } });
   assert.deepEqual(session.readCountsByConversation, {});
 });
+
+test('paged history retains native unread totals and terminal updates', () => {
+  const session = createSession();
+  session.applyInitialState({ currentUser: { userId: 'alice' }, unreadTotal: 125, unreadAuthoritative: true,
+    recentMessages: [], historyByConversation: { private: { cursor: 'older', hasMore: true } } });
+  session.applyMessageUpdated({ type: 'recall', conversationId: 'private', messageId: 'old', eventId: 'recall', tsMs: 5, operatorId: 'carol' });
+  session.applyHistory({ ok: true, userId: 'alice', conversationId: 'private', cursor: 'end', hasMore: false,
+    messages: [{ id: 'old', conversationId: 'private', senderId: 'carol', seq: 1, text: 'must stay hidden',
+      createdAtMs: 1, recalled: false, burned: false, unreadCount: 1, burnMode: 0, burnTtlSec: 0 }] });
+  assert.equal(session.unreadTotal, 125);
+  assert.equal(session.messagesByConversation.private[0].text, '');
+  assert.equal(session.messagesByConversation.private[0].recalled, true);
+  session.applyMessageUpdated({ type: 'receipt', conversationId: 'private', eventId: 'read', readerId: 'alice', lastReadSeq: 100, readAtMs: 6 });
+  assert.equal(session.unreadTotal, 125, 'visible page must not decrement authoritative total');
+  session.applySyncProgress({ globalCursor: 200, unreadTotal: 24 });
+  assert.equal(session.unreadTotal, 24);
+  session.applyInitialState({ currentUser: { userId: 'bob' }, recentMessages: [], historyByConversation: {}, unreadTotal: 0, unreadAuthoritative: true });
+  session.applyHistory({ ok: true, userId: 'alice', conversationId: 'private', cursor: 'late', hasMore: true });
+  assert.deepEqual(session.historyByConversation, {});
+  assert.deepEqual(session.messagesByConversation, {});
+});

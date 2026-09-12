@@ -1,5 +1,8 @@
 <template>
   <section class="message-surface">
+    <button v-if="hasMore" class="secondary-button history-load" :disabled="historyBusy" @click="$emit('loadHistory')">
+      {{ historyBusy ? '正在加载历史…' : '加载更早消息' }}
+    </button>
     <div v-if="!conversationId" class="chat-empty">
       <div class="chat-empty-title">选择一个会话</div>
       <div class="chat-empty-subtitle">消息会在这里显示</div>
@@ -97,11 +100,14 @@ const props = defineProps<{
   currentUserId: string;
   messages: MessageItem[];
   recallDisabled: boolean;
+  hasMore?: boolean;
+  historyBusy?: boolean;
 }>();
 
 defineEmits<{
   recall: [conversationId: string, messageId: string];
   fillDownload: [fileId: string];
+  loadHistory: [];
 }>();
 
 const viewportRef = ref<HTMLElement | null>(null);
@@ -216,8 +222,16 @@ function parseFilePayload(text: string): FilePayload | null {
 }
 
 watch(
-  () => [props.conversationId, props.messages.length] as const,
-  async ([conversationId], [oldConversationId]) => {
+  () => [props.conversationId, props.messages.length, props.messages[0]?.id] as const,
+  async ([conversationId], [oldConversationId, , oldFirst]) => {
+    const prepended = conversationId === oldConversationId && oldFirst
+      ? props.messages.findIndex(item => item.id === oldFirst) : 0;
+    if (prepended > 0) {
+      scrollTop.value += prepended * ESTIMATED_ROW_HEIGHT;
+      await nextTick();
+      if (viewportRef.value) viewportRef.value.scrollTop = scrollTop.value;
+      return;
+    }
     const shouldStick = conversationId !== oldConversationId || isNearBottom();
     await nextTick();
     measureViewport();
@@ -225,7 +239,7 @@ watch(
       scrollToBottom();
     }
   },
-  { flush: 'post' }
+  { flush: 'pre' }
 );
 
 onMounted(async () => {

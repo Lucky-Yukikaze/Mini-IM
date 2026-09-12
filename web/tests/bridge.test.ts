@@ -79,3 +79,16 @@ test('cleanup uses asynchronous native preview and the exact approval token', as
   assert.equal((await bridge.previewCancelledDownloads()).ok, false);
   assert.equal((await bridge.cleanupCancelledDownloads('old')).ok, false);
 });
+
+test('history waits for the native callback and preserves errors', async () => {
+  let finish: ((page: { ok: boolean; error: string }) => void) | undefined;
+  runtime.imBridge = { loadHistory: (conversation: string, cursor: string, done: typeof finish) => {
+    assert.equal(conversation, 'private'); assert.equal(cursor, 'cursor'); finish = done;
+  } };
+  let settled = false;
+  const pending = bridge.loadHistory('private', 'cursor').then(page => { settled = true; return page; });
+  await Promise.resolve();
+  assert.equal(settled, false);
+  finish!({ ok: false, error: 'read failed' });
+  assert.deepEqual(await pending, { ok: false, error: 'read failed' });
+});

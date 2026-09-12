@@ -840,6 +840,26 @@ P95 = 将样本排序后取第 `ceil(0.95 × 样本数)` 项；P50、P99 同法�
 这是本机回环网络和原生核心的基线，未覆盖 Qt WebEngine 渲染、远程网络、其他操作系统、持续稳定负载和缓存增长。
 结果与后续优化范围统一记录在 [执行记录](refactoring-progress.md#聊天与文件并发测量基线--2026-09-12)。
 
+## 本地历史消息
+
+初始状态按会话加载最近 50 条本地消息，并附这些消息的投递与已读人数；完整历史继续保存在当前账号的本地数据库。
+聊天窗口点击“加载更早消息”每次读取至多 50 条，读取完成前按钮禁用，全部读取后隐藏。
+`loadHistory(conversationId, cursor)` 通过 Qt 完成回调返回 `ok`、`messages`、`deliveries`、`readCounts`、`cursor` 和 `hasMore`；
+游标 = 上一页最早消息的会话、会话内序号和消息 ID，页面按原值传回，不用它修改同步位置。
+该接口读取本地已保存历史；服务端遗漏事件继续由原有同步流程补齐，断开连接或正在关闭时拒绝读取。
+未读总数按完整本地消息与已读位置计算，并通过初始状态和同步进度更新；翻页不增加未读数。
+已有数据库首次打开会自动增加三个查询索引，保留业务对象、原同步位置与待确认任务。
+
+真实桌面历史专项使用新启动的隔离夹具；启动及 Playwright CLI 路径配置同 [真实桌面页面联调](#真实桌面页面联调)：
+
+~~~powershell
+& ./.venv/Scripts/python.exe ./tools/test_desktop_ui.py --context ./tmp/desktop-integration/<运行时间>/context.json --playwright-cli 'C:/tools/playwright-core/lib/tools/cli-client/cli.js' --history-only
+~~~
+
+该场景生成 125 条真实服务消息，通过 QUIC 同步到 Qt 后重启客户端，验证最近 50 条、后续 50/25 条、
+真实回调等待、最早消息可见及历史按钮结束状态；不伪造历史读取结果。
+当前限制仅针对初始消息页及其关联投影：会话、文件、已读位置仍全部读取，在线同步和已加载历史也未设置页面内存上限。
+
 ## 客户端缓存规模测量
 
 [缓存测量入口](../tools/measure_cache.py) 使用 [Qt 测量驱动](../client/tests/cache_benchmark.cpp) 调用生产 `MiniImStateStore.open()` 和 `snapshot()`，
@@ -862,9 +882,12 @@ cmake --build ./build/client-manifest --config Release --target mini_im_cache_be
 `--driver` 指定构建驱动，`--output` 指定证据目录；`--messages` 范围 0 至 100,000，
 `--conversations` 范围 1 至 100，`--repeats` 范围 1 至 10，单个进程等待上限 120 秒。
 结果位于 `tmp/cache-measurement/<时间>/`，保存环境、源码/工具/驱动摘要、每次分项耗时、对象数量和输出大小。
-所有样本必须保留全部输入消息、投递和已读人数，并核对会话及未读总数；不使用丢弃输入的结果比较速度。
+每个初始快照核对每会话至多 50 条消息及相关投递、已读人数，并按全部输入核对未读总数。
+每个规模另启独立进程逐页读取完整历史，核对所有消息 ID 无重复、总数与关联投影数量完全一致；此遍历不计入初始快照样本。
+`history-<数量>.json` 保存完整历史验证，以及移除新增索引后重新打开数据库的独立升级测量；升级操作保留业务数据。
+初始读取的性能比较只在完整历史校验通过后成立。
 这项检查不包含登录、真实 QWebChannel 传递、页面渲染或进程内存采样，不能把 JSON 字节数当作内存占用。
-当前结果见 [缓存规模基线](refactoring-progress.md#客户端缓存规模测量基线--2026-09-12)。
+原始结果见 [缓存规模基线](refactoring-progress.md#客户端缓存规模测量基线--2026-09-12)，优化结果见 [初始消息分页与本地历史](refactoring-progress.md#初始消息分页与本地历史--2026-09-12)。
 
 ## 现有脚本与历史环境
 

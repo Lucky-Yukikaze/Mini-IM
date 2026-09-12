@@ -28,6 +28,39 @@ async page => {
     if (data.failure !== undefined) {
       await page.waitForFunction(expected => document.querySelector('[aria-label="操作状态"]').textContent.includes('邀请成员 · 未成功') === expected, data.failure);
     }
+  } else if (data.phase === 'history-visible') {
+    await page.locator('.message-row .bubble').filter({ hasText: data.text }).waitFor();
+  } else if (data.phase === 'history-top') {
+    await page.locator('.message-viewport').evaluate(element => { element.scrollTop = 0; });
+    await page.locator('.message-row .bubble').filter({ hasText: data.text }).waitFor();
+    check(await button('加载更早消息').count() === (data.more ? 1 : 0), 'incorrect history availability');
+    if (data.more) check(await button('加载更早消息').isEnabled(), 'history button remained disabled');
+    if (data.image) await page.screenshot({ path: data.image });
+  } else if (data.phase === 'history-load') {
+    await page.evaluate(() => {
+      const original = window.imBridge.loadHistory;
+      window.historyQa = { original, calls: 0 };
+      window.imBridge.loadHistory = (...args) => {
+        window.historyQa.calls++;
+        const callback = args.pop();
+        original(...args, result => {
+          window.historyQa.result = result;
+          window.historyQa.release = () => callback(result);
+        });
+      };
+    });
+    try {
+      await button('加载更早消息').click();
+      await page.waitForFunction(() => typeof window.historyQa.release === 'function');
+      check(await button('正在加载历史…').isDisabled(), 'history enabled before completion callback');
+      const result = await page.evaluate(() => window.historyQa.result);
+      check(result.ok && result.messages.length === data.count, 'incorrect native history page');
+      check(await page.evaluate(() => window.historyQa.calls) === 1, 'duplicate history request');
+      await page.evaluate(() => window.historyQa.release());
+      await button('正在加载历史…').waitFor({ state: 'hidden' });
+    } finally {
+      await page.evaluate(() => { window.imBridge.loadHistory = window.historyQa.original; delete window.historyQa; });
+    }
   } else if (data.phase === 'callback') {
     await page.evaluate(() => {
       const original = window.imBridge.createConversation;

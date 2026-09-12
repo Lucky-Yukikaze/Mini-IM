@@ -29,6 +29,19 @@ export interface ConnectionState {
   sessionId: string;
 }
 
+export interface HistoryState { cursor: string; hasMore: boolean; }
+export interface HistoryPage {
+  ok: boolean;
+  error?: string;
+  userId?: string;
+  conversationId?: string;
+  messages?: MessageItem[];
+  deliveries?: DeliveryUpdate[];
+  readCounts?: ReadCountUpdate[];
+  cursor?: string;
+  hasMore?: boolean;
+}
+
 export interface InitialStatePayload {
   currentUser: {
     userId: string;
@@ -36,6 +49,8 @@ export interface InitialStatePayload {
   conversations?: ConversationItem[];
   recentMessages?: MessageItem[];
   unreadTotal?: number;
+  unreadAuthoritative?: boolean;
+  historyByConversation?: Record<string, HistoryState>;
   globalCursor?: number;
   readProgressByConversation?: Record<string, Record<string, number>>;
   deliveries?: DeliveryUpdate[];

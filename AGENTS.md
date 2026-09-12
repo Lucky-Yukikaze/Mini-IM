@@ -178,6 +178,9 @@ Qt 事件采用 connectionChanged、initialStateLoaded、messagePushed、message
 conversationUpdated、syncProgress、messageSendsChanged、controlWritesChanged、fileTasksChanged、fileProgress、errorRaised 等高层对象。
 initialStateLoaded 的目标契约包含当前用户、会话、最近消息和未读数；
 实际是否满足契约以执行记录和测试为准，不把目标接口当成已经实现。
+本地消息历史通过 loadHistory 分页读取，历史页游标只用于访问已保存消息，不推进同步位置。
+未读总数由 Qt 按完整本地投影和当前用户已读位置计算；页面加载历史不得增加未读数。
+分页同时加载相关投递和已读人数，旧页与在线更新合并时保留撤回、焚毁终态及较新的计数。
 
 ## 编码规范
 

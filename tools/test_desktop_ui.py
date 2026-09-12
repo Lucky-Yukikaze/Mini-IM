@@ -113,6 +113,21 @@ class DesktopCheck:
         self.attach_client()
         self.phase("login", user=user, title="Desktop QA")
 
+    def run_history(self):
+        for index in range(125):
+            self.command("message", text=f"Desktop history {index:03d}")
+        self.attach_client()
+        self.phase("login", user="alice", title="Desktop QA")
+        self.phase("history-visible", text="Desktop history 124")
+        self.restart_client("alice")
+        self.phase("history-top", text="Desktop history 075", more=True)
+        self.phase("history-load", count=50)
+        self.phase("history-top", text="Desktop history 025", more=True)
+        self.phase("history-load", count=25)
+        self.phase("history-top", text="Desktop history 000", more=False,
+                   image=str(self.artifacts / "history-complete.png"))
+        return self.command("snapshot")
+
     def run_files(self):
         self.attach_client()
         self.phase("login", user="alice", title="Desktop QA")
@@ -377,11 +392,14 @@ if __name__ == "__main__":
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--files-only", action="store_true", help="verify actual desktop file transfer and restart flows")
     mode.add_argument("--concurrent-files", action="store_true", help="verify mixed desktop file concurrency, cancellation and restart")
+    mode.add_argument("--history-only", action="store_true", help="verify cached history pages in the real desktop")
     args = parser.parse_args()
     check = DesktopCheck(args.context, args.playwright_cli)
     result = dict(ok=False, started=time.strftime("%Y-%m-%d %H:%M:%S"))
     try:
-        if args.concurrent_files:
+        if args.history_only:
+            result["state"] = check.run_history()
+        elif args.concurrent_files:
             from desktop_file_concurrency import run_concurrent_files
             result["state"] = run_concurrent_files(check)
         else:

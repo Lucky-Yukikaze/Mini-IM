@@ -1,5 +1,6 @@
 #include "core/sync/statestore.h"
 #include "core/file/cleanup.h"
+#include <QSet>
 #include <QFile>
 #include <QFileInfo>
 
@@ -623,11 +624,71 @@ void CheckCancelledDownloadCleanup()
     Require(cleanup.preview({task}).value("items").toList().isEmpty(), "removed fragment reappeared");
 }
 
+void CheckPagedHistoryAndUnread()
+{
+    QTemporaryDir directory;
+    MiniImStateStore store;
+    Open(store, directory, "bob");
+    QVector<MiniImStateEvent> events;
+    for (quint64 index = 1; index <= 125; ++index)
+    {
+        events.append(Message(index, QStringLiteral("paged-%1").arg(index)));
+    }
+    Apply(store, events);
+    auto initial = store.snapshot();
+    Require(initial.value("recentMessages").toList().size() == 50, "initial history is unbounded");
+    Require(initial.value("unreadTotal").toInt() == 125, "unread count depends on visible page");
+    auto page = store.messagePage("conversation");
+    QSet<QString> ids;
+    int pages = 0;
+    while (true)
+    {
+        Require(page.value("ok").toBool(), "history read failed");
+        const auto messages = page.value("messages").toList();
+        Require(messages.size() <= 50, "history page is unbounded");
+        for (const auto& value : messages)
+        {
+            const auto id = value.toMap().value("id").toString();
+            Require(!ids.contains(id), "history cursor repeated a message");
+            ids.insert(id);
+        }
+        ++pages;
+        if (!page.value("hasMore").toBool())
+        {
+            break;
+        }
+        page = store.messagePage("conversation", page.value("cursor").toString());
+    }
+    Require(ids.size() == 125 && pages == 3, "history traversal lost messages");
+    Apply(store, {Receipt(126, "bob", 100),
+        {127, "event-127", "burn", {{"messageId", "paged-120"}, {"conversationId", "conversation"}}}});
+    Require(store.unreadTotal() == 24, "read/burn did not update full unread count");
+    Apply(store, {{128, "event-128", "recall", {{"messageId", "paged-1"}, {"conversationId", "conversation"}}}});
+    initial = store.snapshot();
+    Require(FindMessage(initial, "paged-1").isEmpty(), "old recall moved message into recent page");
+    auto cursor = initial.value("historyByConversation").toMap().value("conversation").toMap().value("cursor").toString();
+    Require(!store.messagePage("other", cursor).value("ok").toBool(), "cross-conversation cursor accepted");
+    Require(!store.messagePage("conversation", "broken").value("ok").toBool(), "invalid cursor accepted");
+    const auto path = store.databasePath();
+    store.close();
+    Query(path, "DROP INDEX objects_message_order");
+    Query(path, "DROP INDEX objects_message_unread");
+    Query(path, "DROP INDEX objects_delivery_message");
+    Open(store, directory, "bob");
+    Require(store.unreadTotal() == 24, "index migration changed read state");
+    page = store.messagePage("conversation", store.messagePage("conversation", cursor).value("cursor").toString());
+    const auto old = page.value("messages").toList().first().toMap();
+    Require(old.value("recalled").toBool() && old.value("text").toString().isEmpty(), "history restored recalled content");
+    Open(store, directory, "other");
+    Require(store.messagePage("conversation").value("messages").toList().isEmpty(), "history leaked across accounts");
+}
+
 int main(int argc, char* argv[])
 {
     QCoreApplication app(argc, argv);
     try
     {
+        CheckPagedHistoryAndUnread();
         CheckAbsoluteReadCountsAndLegacyCache();
         CheckDeliveryAndConfirmationPersistence();
         CheckGapsAndDuplicateReplay();

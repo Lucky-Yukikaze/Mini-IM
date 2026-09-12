@@ -1259,6 +1259,44 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         return next(protocol for protocol in reversed(self.protocols)
                     if protocol.m_user_id == user and not protocol._closed.is_set())
 
+    async def test_paged_cache_history_keeps_unread_and_terminal_state_after_restart(self):
+        sent = []
+        for index in range(125):
+            intent = f"history-{index}"
+            mark = await self.bob.command("message", conversation=self.conversation, intent=intent, text=intent)
+            sent.append(await self.alice.wait("message", lambda item: item["clientMsgId"] == intent))
+            await self.bob.wait("message-sends", lambda item: not item["items"], since=mark)
+        await self.confirmations_settled()
+        await self.alice.crash()
+        initial = await self.restart_alice()
+        self.assertEqual(50, len(initial["recentMessages"]))
+        self.assertEqual(125, initial["unreadTotal"])
+        self.assertTrue(initial["unreadAuthoritative"])
+        oldest = sent[0]
+        mark = await self.bob.command("recall", conversation=self.conversation, message=oldest["id"])
+        await self.bob.wait("control-writes", lambda item: not item["items"], since=mark)
+        await self.alice.wait("update", lambda item: item.get("messageId") == oldest["id"] and item["type"] == "recall")
+        await self.alice.wait("sync", lambda item: item.get("unreadTotal") == 124)
+        history = initial["historyByConversation"][self.conversation]
+        messages = {item["id"]: item for item in initial["recentMessages"]}
+        while history["hasMore"]:
+            mark = await self.alice.command("history", conversation=self.conversation, cursor=history["cursor"])
+            history = await self.alice.wait("history", since=mark)
+            self.assertTrue(history["ok"])
+            self.assertLessEqual(len(history["messages"]), 50)
+            for item in history["messages"]:
+                self.assertNotIn(item["id"], messages)
+                messages[item["id"]] = item
+        self.assertEqual({item["id"] for item in sent}, set(messages))
+        self.assertTrue(messages[oldest["id"]]["recalled"])
+        self.assertEqual("", messages[oldest["id"]]["text"])
+        mark = await self.alice.command("receipt", conversation=self.conversation, seq=100)
+        await self.alice.wait("control-writes", lambda item: not item["items"], since=mark)
+        await self.alice.wait("sync", lambda item: item.get("unreadTotal") == 25)
+        await self.alice.command("disconnect")
+        mark = await self.alice.command("history", conversation=self.conversation, cursor="")
+        self.assertFalse((await self.alice.wait("history", since=mark))["ok"])
+
     async def test_queue_overload_resumes_original_upload_after_committed_progress(self):
         source = self.root / "overload-upload.bin"
         payload = bytes(range(251)) * 4096

@@ -27,6 +27,9 @@
         :current-user-id="session.currentUserId"
         :recall-disabled="controlDisabled || hasPendingRecall"
         :messages="session.currentMessages"
+        :has-more="session.historyByConversation[session.activeConversationId]?.hasMore ?? false"
+        :history-busy="historyLoading[session.activeConversationId] || session.connection.state !== 'connected'"
+        @load-history="onLoadHistory"
         @recall="onRecall"
         @fill-download="onFillDownload"
       />
@@ -184,7 +187,8 @@ import {
   renameConversation,
   sendFile,
   sendMessage,
-  sendReceipt
+  sendReceipt,
+  loadHistory,
 } from '../api/bridge';
 import ConversationDialog from '../components/conversation-dialog.vue';
 import FileCleanupDialog from '../components/file-cleanup-dialog.vue';
@@ -212,6 +216,7 @@ const cleanupOpen = ref(false);
 watch(() => [session.currentUserId, session.connection.state], () => { cleanupOpen.value = false; });
 const dialogMode = ref<'create' | 'join' | 'direct' | null>(null);
 const notice = ref('');
+const historyLoading = ref<Record<string, boolean>>({});
 const memberDraft = ref('');
 const renameTitle = ref('');
 const downloadPreset = ref<{ fileId: string } | null>(null);
@@ -338,6 +343,27 @@ function flushPendingMessages(): void {
   }
 }
 
+async function onLoadHistory(): Promise<void> {
+  const conversation = session.activeConversationId;
+  const history = session.historyByConversation[conversation];
+  if (!history?.hasMore || historyLoading.value[conversation] || session.connection.state !== 'connected') return;
+  const epoch = accountEpoch;
+  const connection = session.connection.sessionId;
+  historyLoading.value[conversation] = true;
+  try {
+    const page = await loadHistory(conversation, history.cursor);
+    if (epoch !== accountEpoch || connection !== session.connection.sessionId || session.connection.state !== 'connected') return;
+    if (!page.ok) { showNotice(page.error ?? '历史消息加载失败'); return; }
+    if (page.conversationId !== conversation) { showNotice('历史消息会话不匹配'); return; }
+    flushPendingMessages();
+    session.applyHistory(page);
+  } catch {
+    if (epoch === accountEpoch) showNotice('历史消息加载失败，请重试');
+  } finally {
+    if (epoch === accountEpoch) delete historyLoading.value[conversation];
+  }
+}
+
 listen('connectionChanged', (payload) => {
   const connection = payload as Partial<ConnectionState>;
   session.setConnection({
@@ -348,6 +374,7 @@ listen('connectionChanged', (payload) => {
 
 listen('initialStateLoaded', (payload) => {
   accountEpoch++;
+  historyLoading.value = {};
   controlSubmitting.value = false;
   receiptSaved.clear();
   receiptInFlight.clear();
@@ -379,7 +406,7 @@ listen('messageSendsChanged', (payload) => {
 });
 
 listen('syncProgress', (payload) => {
-  session.globalCursor = (payload as { globalCursor: number }).globalCursor;
+  session.applySyncProgress(payload as { globalCursor: number; unreadTotal?: number });
 });
 
 listen('conversationUpdated', (payload) => {

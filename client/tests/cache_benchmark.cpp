@@ -5,14 +5,16 @@
 #include <QElapsedTimer>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QSet>
 #include <iostream>
 
 int main(int argc, char** argv)
 {
     QCoreApplication app(argc, argv);
-    if (argc != 2)
+    const bool verify = argc == 3 && app.arguments().at(2) == QStringLiteral("--verify-history");
+    if (argc != 2 && !verify)
     {
-        std::cerr << "usage: mini_im_cache_benchmark <isolated-cache-directory>\n";
+        std::cerr << "usage: mini_im_cache_benchmark <isolated-cache-directory> [--verify-history]\n";
         return 2;
     }
     MiniImStateStore store;
@@ -36,7 +38,7 @@ int main(int argc, char** argv)
     timer.restart();
     const auto encoded = QJsonDocument(QJsonObject::fromVariantMap(snapshot)).toJson(QJsonDocument::Compact);
     const double encodeMs = timer.nsecsElapsed() / 1000000.0;
-    const QJsonObject result{
+    QJsonObject result{
         {"database", store.databasePath()}, {"qtVersion", qVersion()}, {"openMs", openMs}, {"snapshotMs", snapshotMs},
         {"encodeMs", encodeMs}, {"encodedBytes", static_cast<double>(encoded.size())},
         {"messages", static_cast<double>(snapshot.value("recentMessages").toList().size())},
@@ -45,6 +47,56 @@ int main(int argc, char** argv)
         {"readCounts", static_cast<double>(snapshot.value("readCounts").toList().size())},
         {"unreadTotal", snapshot.value("unreadTotal").toInt()}
     };
+    if (verify)
+    {
+        QSet<QString> ids;
+        int deliveries = 0, counts = 0, pages = 0;
+        for (const auto& item : snapshot.value("conversations").toList())
+        {
+            const auto conversation = item.toMap().value("id").toString();
+            QString cursor;
+            while (true)
+            {
+                const auto page = store.messagePage(conversation, cursor);
+                if (!page.value("ok").toBool())
+                {
+                    std::cerr << page.value("error").toString().toStdString();
+                    return 1;
+                }
+                const auto messages = page.value("messages").toList();
+                if (messages.size() > 50)
+                {
+                    return 1;
+                }
+                for (const auto& message : messages)
+                {
+                    const auto id = message.toMap().value("id").toString();
+                    if (id.isEmpty() || ids.contains(id))
+                    {
+                        return 1;
+                    }
+                    ids.insert(id);
+                }
+                deliveries += page.value("deliveries").toList().size();
+                counts += page.value("readCounts").toList().size();
+                ++pages;
+                if (!page.value("hasMore").toBool())
+                {
+                    break;
+                }
+                const auto next = page.value("cursor").toString();
+                if (next.isEmpty() || next == cursor || messages.isEmpty())
+                {
+                    return 1;
+                }
+                cursor = next;
+            }
+        }
+        result.insert("historyMessages", ids.size());
+        result.insert("historyDeliveries", deliveries);
+        result.insert("historyReadCounts", counts);
+        result.insert("historyPages", pages);
+    }
     std::cout << QJsonDocument(result).toJson(QJsonDocument::Compact).constData() << '\n';
     return 0;
 }

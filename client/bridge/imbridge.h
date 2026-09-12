@@ -29,6 +29,7 @@ public:
         const QString& text,
         quint32 burn_mode,
         quint32 burn_ttl_sec);
+    Q_INVOKABLE QVariantMap loadHistory(const QString& conversation, const QString& before);
     Q_INVOKABLE bool retryFile(const QString& clientFileId);
     Q_INVOKABLE bool cancelFile(const QString& clientFileId);
     Q_INVOKABLE QVariantMap previewCancelledDownloads();

@@ -144,7 +144,12 @@ int main(int argc, char** argv)
                 const QJsonObject command = QJsonDocument::fromJson(peer->readLine()).object();
                 const auto operation = command.value("op").toString();
                 bool accepted = true;
-                if (operation == "preview-file-cleanup")
+                if (operation == "history")
+                {
+                    send(QStringLiteral("history"), bridge.loadHistory(command.value("conversation").toString(),
+                        command.value("cursor").toString()));
+                }
+                else if (operation == "preview-file-cleanup")
                 {
                     send(QStringLiteral("file-cleanup"), bridge.previewCancelledDownloads());
                 }

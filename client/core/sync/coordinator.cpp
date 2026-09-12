@@ -233,7 +233,24 @@ bool MiniImSyncCoordinator::apply(const QVector<MiniImStateEvent>& events)
         emit eventApplied(event);
     }
     emit stateApplied();
-    emit progressChanged({{"globalCursor", QVariant::fromValue(m_store.cursor())}, {"hasGap", m_store.hasGap()}});
+    QVariantMap progress{{"globalCursor", QVariant::fromValue(m_store.cursor())}, {"hasGap", m_store.hasGap()}};
+    for (const auto& event : applied)
+    {
+        if (event.type == "message" || event.type == "receipt" || event.type == "recall" || event.type == "burn")
+        {
+            try
+            {
+                progress.insert("unreadTotal", QVariant::fromValue(m_store.unreadTotal()));
+            }
+            catch (const std::exception& error)
+            {
+                fail(QString::fromUtf8(error.what()));
+                return false;
+            }
+            break;
+        }
+    }
+    emit progressChanged(progress);
     return true;
 }
 
