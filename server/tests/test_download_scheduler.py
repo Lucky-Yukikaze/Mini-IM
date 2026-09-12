@@ -99,6 +99,28 @@ class DownloadSchedulerTest(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(self.sender.peak_pending_bytes, STREAM_BUFFER_LIMIT)
         self.assertFalse(self.sender.jobs)
 
+    async def test_fin_survives_packet_without_room_for_stream_header(self):
+        self.sender.start("fin-budget", self.path, len(self.payload), 0)
+        # Isolate the actual sender from background file reads. Simulate all data
+        # being acknowledged before the scheduler writes its separate EOF.
+        await self.stop()
+        stream = self.quic._streams[3].sender
+        while frame := stream.get_frame(4096):
+            stream.on_data_delivery(QuicDeliveryState.ACKED, frame.offset,
+                frame.offset + len(frame.data), frame.fin)
+        stream.write(b"", end_stream=True)
+        for attempt in range(2):
+            # aioquic passes remaining packet capacity minus the stream header;
+            # consuming FIN here would lose it before start_frame rejects the packet.
+            self.assertIsNone(stream.get_frame(-1))
+            fin = stream.get_frame(0)
+            self.assertIsNotNone(fin)
+            self.assertTrue(fin.fin)
+            self.assertEqual(b"", fin.data)
+            stream.on_data_delivery(QuicDeliveryState.LOST if attempt == 0 else QuicDeliveryState.ACKED,
+                fin.offset, fin.offset, True)
+        self.assertTrue(stream.is_finished)
+
     async def test_parallel_limit_resume_bytes_and_disconnect(self):
         offset = 123
         for index in range(MAX_DOWNLOADS):

@@ -1,6 +1,7 @@
 """Measure chat alone and chat with simultaneous native uploads/downloads on Windows.
 
 Every case starts two real Qt drivers and an isolated production service process.
+Use --sustained to refill each transfer slot until the measurement deadline.
 This is a reproducible measurement, not a throughput or latency acceptance SLA.
 """
 from __future__ import annotations
@@ -68,7 +69,8 @@ async def settled(root, db_path, clients):
 
 async def run_case(args, output, concurrency):
     output.mkdir()
-    report = dict(ok=False, concurrencyPerDirection=concurrency, fileBytes=args.file_bytes,
+    report = dict(ok=False, mode='sustained' if args.sustained else 'burst',
+        concurrencyPerDirection=concurrency, fileBytes=args.file_bytes,
         minimumChatSeconds=args.seconds, chatIntervalSeconds=args.interval, started=time.strftime('%Y-%m-%d %H:%M:%S'))
     clients, resources = {}, {}
     server = None
@@ -148,17 +150,26 @@ async def run_case(args, output, concurrency):
                         acceptedMs=(accepted - before) * 1000, afterAcceptMs=elapsed * 1000 - (accepted - before) * 1000))
                     await asyncio.sleep(max(0, args.interval - elapsed))
 
+            async def transfer_slot(direction, index):
+                iteration = 0
+                while iteration == 0 or (args.sustained and time.perf_counter() < started + args.seconds):
+                    suffix = f'{index}-{iteration}' if args.sustained else str(index)
+                    path = root / f'{direction}-{suffix}.bin'
+                    if direction == 'upload':
+                        content = bytes([(index + iteration + 1) % 256]) + payload[1:]
+                        path.write_bytes(content)
+                        upload_digests[path.name] = hashlib.sha256(content).hexdigest()
+                        result = await transfer('alice', direction, path)
+                    else:
+                        result = await transfer('bob', direction, path, seed)
+                    files.append(dict(slot=index, iteration=iteration, **result))
+                    iteration += 1
+
             async def transfers():
                 async with asyncio.TaskGroup() as group:
-                    tasks = []
                     for index in range(concurrency):
-                        source = root / f'upload-{index}.bin'
-                        content = bytes([(index + 1) % 256]) + payload[1:]
-                        source.write_bytes(content)
-                        upload_digests[source.name] = hashlib.sha256(content).hexdigest()
-                        tasks.append(group.create_task(transfer('alice', 'upload', source)))
-                        tasks.append(group.create_task(transfer('bob', 'download', root / f'download-{index}.bin', seed)))
-                files.extend(task.result() for task in tasks)
+                        for direction in ('upload', 'download'):
+                            group.create_task(transfer_slot(direction, index))
                 await asyncio.sleep(max(0, args.seconds - (time.perf_counter() - started)))
                 done.set()
 
@@ -170,15 +181,24 @@ async def run_case(args, output, concurrency):
             elapsed = time.perf_counter() - started
             final = {name: process.sample() for name, process in resources.items()}
             measured = (await server_command(server, 'metrics', 'metrics'))['values']
-            assert measured.get('uploadBytes', 0) == concurrency * args.file_bytes
+            upload_count = sum(file['direction'] == 'upload' for file in files)
+            assert measured.get('uploadBytes', 0) == upload_count * args.file_bytes
             for file in files:
                 file['startSeconds'] = file.pop('startedMonotonic') - started
                 file['finishSeconds'] = file.pop('finishedMonotonic') - started
             transfer_window = max((file['finishSeconds'] for file in files), default=0)
             overlapping = [message['deliveryMs'] for message in messages if message['startSeconds'] < transfer_window]
+            # A transfer slot includes command acceptance, protocol work and completion
+            # observation; it does not mean wire bytes flow for the entire interval.
+            for point in samples:
+                point['activeTransfers'] = {direction: sum(file['direction'] == direction
+                    and file['startSeconds'] <= point['seconds'] < file['finishSeconds'] for file in files)
+                    for direction in ('upload', 'download')}
+            active_messages = [message['deliveryMs'] for message in messages if any(
+                file['startSeconds'] <= message['startSeconds'] < file['finishSeconds'] for file in files)]
             await settled(root, db_path, clients)
             transfers_rows = rows(db_path, 'SELECT * FROM file_transfers')
-            assert len(transfers_rows) == (2 * concurrency + 1 if concurrency else 0)
+            assert len(transfers_rows) == len(files) + (1 if concurrency else 0)
             assert all(row['status'] == 'completed' for row in transfers_rows)
             for row in transfers_rows:
                 if row['direction'] == 1:
@@ -186,7 +206,7 @@ async def run_case(args, output, concurrency):
                     assert stored.stat().st_size == args.file_bytes
                     assert hashlib.sha256(stored.read_bytes()).hexdigest() == upload_digests[row['file_name']]
             stored_messages = rows(db_path, 'SELECT client_msg_id FROM messages')
-            assert len(stored_messages) == len(messages) + (concurrency + 1 if concurrency else 0)
+            assert len(stored_messages) == len(messages) + upload_count + (1 if concurrency else 0)
             assert {item['intent'] for item in messages} <= {row['client_msg_id'] for row in stored_messages}
             assert rows(db_path, 'PRAGMA integrity_check') == [{'integrity_check': 'ok'}]
             assert rows(db_path, 'PRAGMA foreign_key_check') == []
@@ -197,6 +217,9 @@ async def run_case(args, output, concurrency):
                 fileWindowSeconds=transfer_window,
                 fileWindowBytesPerSecond=sum(file['bytes'] for file in files) / transfer_window if transfer_window else 0,
                 chatDuringFileWindowMs=distribution(overlapping),
+                chatWhileTransferActiveMs=distribution(active_messages),
+                completedTransfers={direction: sum(file['direction'] == direction for file in files)
+                    for direction in ('upload', 'download')},
                 serverMeasurements=measured, resources={name: dict(
                     cpuSeconds=final[name]['cpuSeconds'] - initial[name]['cpuSeconds'],
                     cpuPercentOneCore=100 * (final[name]['cpuSeconds'] - initial[name]['cpuSeconds']) / elapsed,
@@ -207,6 +230,24 @@ async def run_case(args, output, concurrency):
                     syncConfirmed=True, databaseIntegrity=True))
         except BaseException as error:
             report['error'] = repr(error)
+            # Preserve failure evidence before the isolated runtime is removed.
+            try:
+                report['partialFiles'] = files
+                report['partialMessages'] = messages
+                report['failureFiles'] = [dict(path=str(path.relative_to(root)), bytes=path.stat().st_size)
+                    for path in root.rglob('*') if path.is_file()]
+                for path in root.rglob('*.sqlite'):
+                    with closing(sqlite3.connect(path)) as source, closing(sqlite3.connect(
+                            output / ('failure-' + '-'.join(path.relative_to(root).parts)))) as target:
+                        source.backup(target)
+                if db_path.exists():
+                    with closing(sqlite3.connect(db_path)) as source, closing(sqlite3.connect(
+                            output / 'failure-server.sqlite')) as target:
+                        source.backup(target)
+                if server:
+                    report['failureServer'] = await server_command(server, 'diagnostics', 'diagnostics')
+            except Exception as capture_error:
+                report['evidenceError'] = repr(capture_error)
             raise
         finally:
             try:
@@ -244,7 +285,7 @@ async def main(args):
         toolSha256={name: hashlib.sha256((ROOT / 'tools' / name).read_bytes()).hexdigest()
             for name in ('measure_load.py', 'load_server_fixture.py', 'process_metrics.py')},
         python=sys.version, client=str(args.client.resolve()), fileBytes=args.file_bytes, repeats=args.repeats,
-        seconds=args.seconds, interval=args.interval, concurrency=args.concurrency,
+        seconds=args.seconds, interval=args.interval, concurrency=args.concurrency, sustained=args.sustained,
         gitCommit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
         gitStatus=subprocess.check_output(['git', 'status', '--short'], cwd=ROOT, text=True))
     (output / 'environment.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
@@ -264,6 +305,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--client', type=Path, default=ROOT / 'build/client-manifest/Release/mini_im_native_driver.exe')
     parser.add_argument('--output', type=Path, default=ROOT / 'tmp/load-measurement')
+    parser.add_argument('--sustained', action='store_true',
+        help='refill each upload/download slot until --seconds, then drain all accepted tasks')
     parser.add_argument('--file-bytes', type=int, default=1048576)
     parser.add_argument('--seconds', type=float, default=5)
     parser.add_argument('--interval', type=float, default=0.1)

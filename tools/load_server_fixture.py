@@ -97,6 +97,15 @@ async def main(args):
             elif command['op'] == 'metrics':
                 active = False
                 emit('metrics', values=metrics)
+            elif command['op'] == 'diagnostics':
+                protocols = set(service._protocols.values()) if service else set()
+                emit('diagnostics', connections=[dict(user=p.m_user_id,
+                    downloads=[dict(streamId=j.stream_id, fileId=j.file_id, offset=j.offset,
+                        size=j.size, eof=j.eof, pendingBytes=p.m_download_sender.buffer.pending_bytes(j.stream_id),
+                        finished=p.m_download_sender.buffer.finished(j.stream_id))
+                        for j in p.m_download_sender.jobs.values()],
+                    schedulerDone=p.m_download_sender.task.done() if p.m_download_sender.task else None)
+                    for p in protocols])
             elif command['op'] == 'stop':
                 task.cancel()
                 return

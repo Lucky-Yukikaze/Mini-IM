@@ -19,6 +19,21 @@ class AioquicSendBuffer:
     def __init__(self, quic):
         self.quic = quic
 
+    def guard_empty_fin(self, stream_id: int) -> None:
+        sender = self.quic._streams[stream_id].sender
+        get_frame = sender.get_frame
+
+        def frame_with_budget(max_size, max_offset=None):
+            # aioquic 1.3.0 consumes a FIN-only frame even when the packet has
+            # insufficient room for its header. start_frame then raises without
+            # registering a delivery callback, leaving FIN neither sent nor pending.
+            # Keep it queued; max_size == 0 still permits a header-only FIN.
+            if max_size < 0:
+                return None
+            return get_frame(max_size, max_offset)
+
+        sender.get_frame = frame_with_budget
+
     def pending_bytes(self, stream_id: int) -> int:
         stream = self.quic._streams.get(stream_id)
         return len(stream.sender._buffer) if stream is not None else 0
@@ -76,6 +91,7 @@ class DownloadScheduler:
         if len(header) > 512:
             raise ValueError("invalid download file id")
         self.protocol._quic.send_stream_data(stream_id, header)
+        self.buffer.guard_empty_fin(stream_id)
         self.jobs[stream_id] = DownloadJob(stream_id, file_id, path, offset, size, priority)
         self.protocol.transmit()
         self.notify()
