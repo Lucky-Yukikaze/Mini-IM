@@ -4,17 +4,60 @@
 #include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QJsonDocument>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QSet>
 #include <iostream>
+#include <stdexcept>
+
+namespace
+{
+QJsonObject MeasureEvents(MiniImStateStore& store, int count)
+{
+    const QString conversation = QStringLiteral("conversation-0");
+    const auto recent = store.messagePage(conversation).value("messages").toList();
+    const auto last = recent.isEmpty() ? 0 : recent.last().toMap().value("seq").toULongLong();
+    const auto initialUnread = store.unreadTotal();
+    QJsonArray samples;
+    for (int index = 1; index <= count; ++index)
+    {
+        const auto identity = QStringLiteral("measurement-event-%1").arg(index);
+        MiniImStateEvent event{static_cast<quint64>(index), identity, QStringLiteral("message"),
+            {{"id", identity}, {"conversationId", conversation}, {"senderId", "bob"},
+             {"seq", QVariant::fromValue(last + index)}, {"text", QString(128, QChar('x'))},
+             {"recalled", false}, {"burned", false}}};
+        QVector<MiniImStateEvent> applied;
+        QElapsedTimer timer;
+        timer.start();
+        if (!store.apply({event}, &applied))
+        {
+            throw std::runtime_error(store.errorString().toStdString());
+        }
+        const double applyMs = timer.nsecsElapsed() / 1000000.0;
+        timer.restart();
+        const auto unread = store.unreadTotal();
+        const double unreadMs = timer.nsecsElapsed() / 1000000.0;
+        if (applied.size() != 1 || unread != initialUnread + index || store.cursor() != index)
+        {
+            throw std::runtime_error("event measurement lost a message, unread count or cursor");
+        }
+        samples.append(QJsonObject{{"applyMs", applyMs}, {"unreadMs", unreadMs},
+            {"totalMs", applyMs + unreadMs}});
+    }
+    return {{"samples", samples}, {"finalUnread", static_cast<double>(store.unreadTotal())},
+        {"cursor", static_cast<double>(store.cursor())}};
+}
+}
 
 int main(int argc, char** argv)
 {
     QCoreApplication app(argc, argv);
     const bool verify = argc == 3 && app.arguments().at(2) == QStringLiteral("--verify-history");
-    if (argc != 2 && !verify)
+    const int eventCount = argc == 4 && app.arguments().at(2) == "--measure-events"
+        ? app.arguments().at(3).toInt() : 0;
+    if (argc != 2 && !verify && !(eventCount >= 1 && eventCount <= 1000))
     {
-        std::cerr << "usage: mini_im_cache_benchmark <isolated-cache-directory> [--verify-history]\n";
+        std::cerr << "usage: mini_im_cache_benchmark <isolated-cache-directory> [--verify-history | --measure-events 1..1000]\n";
         return 2;
     }
     MiniImStateStore store;
@@ -96,6 +139,18 @@ int main(int argc, char** argv)
         result.insert("historyDeliveries", deliveries);
         result.insert("historyReadCounts", counts);
         result.insert("historyPages", pages);
+    }
+    if (eventCount > 0)
+    {
+        try
+        {
+            result.insert("eventMeasurement", MeasureEvents(store, eventCount));
+        }
+        catch (const std::exception& error)
+        {
+            std::cerr << error.what() << '\n';
+            return 1;
+        }
     }
     std::cout << QJsonDocument(result).toJson(QJsonDocument::Compact).constData() << '\n';
     return 0;

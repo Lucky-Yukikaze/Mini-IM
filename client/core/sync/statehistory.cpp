@@ -45,6 +45,10 @@ void MiniImStateStore::createHistoryIndexes()
 
 quint64 MiniImStateStore::unreadTotal() const
 {
+    if (m_unreadTotal)
+    {
+        return *m_unreadTotal;
+    }
     quint64 total = 0;
     auto groups = run(QStringLiteral("SELECT DISTINCT conversation FROM objects WHERE kind='message'"));
     while (groups.next())
@@ -62,7 +66,52 @@ quint64 MiniImStateStore::unreadTotal() const
             total += count.value(0).toULongLong();
         }
     }
+    m_unreadTotal = total;
     return total;
+}
+
+quint64 MiniImStateStore::unreadAffected(const MiniImStateEvent& event) const
+{
+    QString conversation;
+    QString predicate;
+    QVariantList values;
+    if (event.type == "receipt")
+    {
+        if (event.data.value("readerId").toString() != m_user)
+        {
+            return 0;
+        }
+        conversation = event.data.value("conversationId").toString();
+        predicate = QStringLiteral("conversation=? AND ") + kSequence + QStringLiteral("<=?");
+        values = {conversation, event.data.value("lastReadSeq")};
+    }
+    else if (event.type == "message" || event.type == "recall" || event.type == "burn")
+    {
+        const QString id = event.data.value(event.type == "message" ? "id" : "messageId").toString();
+        const auto message = object(QStringLiteral("message"), id);
+        if (message.isEmpty())
+        {
+            return 0;
+        }
+        conversation = message.value("conversationId").toString();
+        predicate = QStringLiteral("id=?");
+        values = {id};
+    }
+    else
+    {
+        return 0;
+    }
+    const auto receipt = QString::fromUtf8(QJsonDocument(QJsonArray{conversation, m_user})
+        .toJson(QJsonDocument::Compact));
+    const auto read = object(QStringLiteral("receipt"), receipt).value("lastReadSeq", 0);
+    values.append(read);
+    values.append(m_user);
+    // A receipt counts only its newly read interval; after projection that interval
+    // is empty. Other events inspect the affected message before and after merging.
+    auto count = run(QStringLiteral("SELECT COUNT(*) FROM objects WHERE ") + kUnread
+        + QStringLiteral(" AND ") + predicate + QStringLiteral(" AND ") + kSequence
+        + QStringLiteral(">? AND json_extract(CAST(data AS TEXT),'$.senderId')<>?"), values);
+    return count.next() ? count.value(0).toULongLong() : 0;
 }
 
 QVariantMap MiniImStateStore::messagePage(const QString& conversation, const QString& before) const

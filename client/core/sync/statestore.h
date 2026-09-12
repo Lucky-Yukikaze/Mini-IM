@@ -7,6 +7,7 @@
 #include <QString>
 #include <QVariantMap>
 #include <QVector>
+#include <optional>
 #include "core/message/outbox.h"
 #include "core/file/taskstore.h"
 #include "core/session/writestore.h"
@@ -50,6 +51,7 @@ public:
 
 private:
     void createHistoryIndexes();
+    quint64 unreadAffected(const MiniImStateEvent& event) const;
     QSqlQuery run(const QString& sql, const QVariantList& values = {}) const;
     QString metadata(const QString& key) const;
     QVariantMap object(const QString& kind, const QString& id) const;
@@ -65,6 +67,7 @@ private:
     QString m_path;
     QString m_user;
     quint64 m_cursor = 0;
+    mutable std::optional<quint64> m_unreadTotal;
     mutable QString m_error;
 };
 

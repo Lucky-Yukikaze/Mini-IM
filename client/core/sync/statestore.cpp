@@ -52,6 +52,7 @@ void MiniImStateStore::close()
         m_name.clear();
     }
     m_cursor = 0;
+    m_unreadTotal.reset();
 }
 
 QSqlQuery MiniImStateStore::run(const QString& sql, const QVariantList& values) const
@@ -268,6 +269,7 @@ bool MiniImStateStore::apply(const QVector<MiniImStateEvent>& events, QVector<Mi
     {
         run(QStringLiteral("BEGIN IMMEDIATE"));
         QVector<MiniImStateEvent> changes;
+        auto nextUnread = m_unreadTotal;
         for (const auto& event : events)
         {
             if (event.position == 0 || event.position > static_cast<quint64>(std::numeric_limits<qint64>::max())
@@ -286,7 +288,17 @@ bool MiniImStateStore::apply(const QVector<MiniImStateEvent>& events, QVector<Mi
                 continue;
             }
             auto result = event;
+            const auto before = nextUnread ? unreadAffected(event) : 0;
             result.data = project(event);
+            if (nextUnread)
+            {
+                const auto after = unreadAffected(event);
+                if (*nextUnread < before)
+                {
+                    throw std::runtime_error("unread count does not match cached projections");
+                }
+                *nextUnread = *nextUnread - before + after;
+            }
             run(QStringLiteral("INSERT INTO seen(position,event_id) VALUES(?,?)"),
                 {QVariant::fromValue(event.position), event.eventId});
             changes.append(result);
@@ -303,6 +315,7 @@ bool MiniImStateStore::apply(const QVector<MiniImStateEvent>& events, QVector<Mi
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value"), {QString::number(next)});
         run(QStringLiteral("COMMIT"));
         m_cursor = next;
+        m_unreadTotal = nextUnread;
         *applied = changes;
         return true;
     }

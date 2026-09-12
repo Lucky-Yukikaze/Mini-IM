@@ -64,7 +64,7 @@ def main(args):
         driverSourceSha256=hashlib.sha256((ROOT / 'client/tests/cache_benchmark.cpp').read_bytes()).hexdigest(),
         driver=str(args.driver.resolve()),
         driverSha256=hashlib.sha256(args.driver.read_bytes()).hexdigest(), counts=args.messages,
-        conversations=args.conversations, repeats=args.repeats, textBytes=128,
+        conversations=args.conversations, repeats=args.repeats, textBytes=128, eventCount=args.event_count,
         gitCommit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
         gitStatus=subprocess.check_output(['git', 'status', '--short'], cwd=ROOT, text=True))
     (output / 'environment.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
@@ -99,6 +99,15 @@ def main(args):
                 assert upgrade['unreadTotal'] == count and upgrade['messages'] == expected_page
                 (output / f'history-{count}.json').write_text(json.dumps(dict(verification=verification,
                     indexUpgrade=upgrade), indent=2), encoding='utf-8')
+                if args.event_count:
+                    measured = invoke(args.driver, cache, '--measure-events', str(args.event_count))
+                    events = measured['eventMeasurement']
+                    assert len(events['samples']) == events['cursor'] == args.event_count
+                    assert events['finalUnread'] == count + args.event_count
+                    with closing(sqlite3.connect(database)) as db:
+                        assert db.execute("SELECT COUNT(*) FROM objects WHERE kind='message'").fetchone()[0] == count + args.event_count
+                        assert db.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+                    (output / f'events-{count}.json').write_text(json.dumps(measured, indent=2), encoding='utf-8')
         print('CACHE MEASUREMENT PASSED ' + str(output), flush=True)
     except BaseException as error:
         (output / 'error.json').write_text(json.dumps(dict(error=repr(error))), encoding='utf-8')
@@ -112,8 +121,9 @@ if __name__ == '__main__':
     parser.add_argument('--messages', type=int, nargs='+', default=[100, 10000, 100000])
     parser.add_argument('--conversations', type=int, default=10)
     parser.add_argument('--repeats', type=int, default=3)
+    parser.add_argument("--event-count", type=int, default=0, help="measure 1..1000 committed messages after snapshot checks")
     args = parser.parse_args()
     if not args.driver.is_file() or not (1 <= args.conversations <= 100 and 1 <= args.repeats <= 10
-            and all(0 <= count <= 100000 for count in args.messages)):
-        parser.error('require built driver, conversations 1..100, repeats 1..10, messages 0..100000')
+            and 0 <= args.event_count <= 1000 and all(0 <= count <= 100000 for count in args.messages)):
+        parser.error('require built driver, conversations 1..100, repeats 1..10, messages 0..100000, event-count 0..1000')
     main(args)

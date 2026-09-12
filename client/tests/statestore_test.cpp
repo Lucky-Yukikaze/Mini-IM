@@ -9,6 +9,7 @@
 #include <QTemporaryDir>
 #include <QUuid>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 
 namespace
@@ -624,6 +625,65 @@ void CheckCancelledDownloadCleanup()
     Require(cleanup.preview({task}).value("items").toList().isEmpty(), "removed fragment reappeared");
 }
 
+void CheckIncrementalUnreadCommitAndRecovery()
+{
+    QTemporaryDir directory;
+    MiniImStateStore store;
+    Open(store, directory);
+    Require(store.unreadTotal() == 0, "new cache has unread messages");
+    Apply(store, {Receipt(1, "bob", 80),
+        {2, "event-2", "burn", {{"messageId", "late"}, {"conversationId", "conversation"}}}});
+    for (quint64 index = 1; index <= 200; ++index)
+    {
+        auto event = Message(index + 2, QStringLiteral("incremental-%1").arg(index));
+        event.data.insert("seq", QVariant::fromValue(201 - index));
+        if (index % 5 == 0)
+        {
+            event.data.insert("senderId", "bob");
+        }
+        Apply(store, {event, event}, 1);
+        if (index % 25 == 0)
+        {
+            MiniImStateStore reopened;
+            Open(reopened, directory);
+            Require(store.unreadTotal() == reopened.unreadTotal(), "incremental unread differs from full rebuild");
+        }
+    }
+    Require(store.unreadTotal() == 96, "early receipt or self message counted as unread");
+    auto late = Message(203, "late");
+    Apply(store, {late, Receipt(204, "alice", 500), Receipt(205, "bob", 20)});
+    Require(store.unreadTotal() == 96, "terminal or backwards/other receipt changed unread");
+    auto changed = Message(206, "incremental-1");
+    changed.data.insert("seq", 200);
+    changed.data.insert("conversationId", "another-conversation");
+    Apply(store, {changed});
+    Require(store.unreadTotal() == 96, "updated message counted twice");
+    Query(store.databasePath(), "CREATE TRIGGER unread_fail BEFORE UPDATE ON metadata WHEN NEW.key='cursor' "
+        "BEGIN SELECT RAISE(ABORT,'unread commit failure'); END");
+    QVector<MiniImStateEvent> applied;
+    const QVector<MiniImStateEvent> batch{Message(207, "rollback-message"), Receipt(208, "bob", 300),
+        {209, "event-209", "recall", {{"messageId", "incremental-1"}, {"conversationId", "another-conversation"}}}};
+    Require(!store.apply(batch, &applied) && applied.isEmpty(), "failed batch was published");
+    Require(store.unreadTotal() == 96 && store.cursor() == 206, "rollback changed cached unread or cursor");
+    Query(store.databasePath(), "DROP TRIGGER unread_fail");
+    Apply(store, batch);
+    Require(store.unreadTotal() == 0, "committed mixed batch has incorrect unread");
+    Open(store, directory);
+    Require(store.unreadTotal() == 0 && store.cursor() == 209, "restart changed committed unread");
+    auto another = Message(210, "new-unread");
+    another.data.insert("seq", 301);
+    Apply(store, {another});
+    Require(store.unreadTotal() == 1, "post-restart message did not increase unread");
+    Open(store, directory, "other");
+    Require(store.unreadTotal() == 0, "unread leaked across accounts");
+    Open(store, directory);
+    Require(store.unreadTotal() == 1, "account return did not rebuild unread");
+    Apply(store, {Receipt(211, "bob", std::numeric_limits<quint64>::max())});
+    Require(store.unreadTotal() == 0, "maximum receipt position did not clear unread");
+    Open(store, directory);
+    Require(store.unreadTotal() == 0, "maximum receipt differs after rebuild");
+}
+
 void CheckPagedHistoryAndUnread()
 {
     QTemporaryDir directory;
@@ -688,6 +748,7 @@ int main(int argc, char* argv[])
     QCoreApplication app(argc, argv);
     try
     {
+        CheckIncrementalUnreadCommitAndRecovery();
         CheckPagedHistoryAndUnread();
         CheckAbsoluteReadCountsAndLegacyCache();
         CheckDeliveryAndConfirmationPersistence();

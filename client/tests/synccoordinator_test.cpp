@@ -74,9 +74,15 @@ struct Fixture
         QObject::connect(&sync, &MiniImSyncCoordinator::eventApplied, [&](const MiniImStateEvent& event)
         {
             ++appliedCount;
-            const QString objects = event.type == QStringLiteral("readCount")
-                ? QStringLiteral("readCounts") : QStringLiteral("recentMessages");
-            Require(!store.snapshot().value(objects).toList().isEmpty(), "state committed before delivery");
+            if (event.type == QStringLiteral("readCount"))
+            {
+                Require(!sql("SELECT data FROM objects WHERE kind='readCount' AND id=?",
+                    {event.data.value("messageId")}).isEmpty(), "read count committed before delivery");
+            }
+            else
+            {
+                Require(!store.snapshot().value("recentMessages").toList().isEmpty(), "state committed before delivery");
+            }
         });
         sync.start();
     }
@@ -96,17 +102,28 @@ struct Fixture
         Require(sync.handleEnvelope(envelope), "sync envelope consumed");
     }
 
-    void sql(const QString& statement)
+    QVariantList sql(const QString& statement, const QVariantList& values = {})
     {
+        QVariantList rows;
         const auto name = QUuid::createUuid().toString();
         {
             auto database = QSqlDatabase::addDatabase("QSQLITE", name);
             database.setDatabaseName(store.databasePath());
             Require(database.open(), "open failure-injection connection");
             QSqlQuery query(database);
-            Require(query.exec(statement), query.lastError().text().toStdString().c_str());
+            Require(query.prepare(statement), query.lastError().text().toStdString().c_str());
+            for (const auto& value : values)
+            {
+                query.addBindValue(value);
+            }
+            Require(query.exec(), query.lastError().text().toStdString().c_str());
+            while (query.next())
+            {
+                rows.append(query.value(0));
+            }
         }
         QSqlDatabase::removeDatabase(name);
+        return rows;
     }
 };
 
