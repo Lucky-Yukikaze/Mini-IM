@@ -58,6 +58,7 @@ Windows 独立桌面包与迁移验收已提交为 `f6c9e1f`。
 2026-09-13 按用户要求收口性能工作，见 [范围调整](#性能工作范围调整--2026-09-13)。
 保留上传批量提交、初始分页、增量未读、页面批量合并及查询索引优化；固定消息窗口和进一步容量压测暂缓。
 后续优先核对功能正确性、使用体验和交付缺口；暂缓的性能事项不作为本轮阶段完成的强制条件。
+当前源码独立包已完成 [交付复验](#当前版本桌面交付--2026-09-13)，正在从空构建目录核对原始三个阶段的整体验收条件。
 历史结果按批次保留；当前缺口见 [下一步与未验证项](#下一步与未验证项)，文档整理记录位于文末。
 
 阶段须满足整体验收条件才可标记完成。
@@ -2404,6 +2405,31 @@ QString 字符数 = UTF-16 编码单元数量；长度在解析 JSON 前检查�
 并继续文件状态历史入口；仅完成双向接口不能宣称容量已受控，整体客户端与工程保障保持进行中。
 
 
+
+## 当前版本桌面交付 · 2026-09-13
+
+交付源码为 `2a370ab`，打包时工作区干净；本批将双向历史、增量未读及页面批量合并等最新改动纳入独立桌面包。
+使用 Windows、Qt 6.11.0/MSVC 2022 x64 Release、Python 3.14.3、Node 24.13.1、PowerShell 7.6.5。
+执行 `tools/package_desktop.ps1 -QtRoot D:/Qt/6.11.0/msvc2022_64 -WindowsSdkRoot 'D:/Windows Kits/10' -OutputDirectory build/packages/mini-im-current-2a370ab`，
+类型检查、Web 构建及客户端构建通过；输出 180 个清单文件、395041684 字节，另含清单自身。
+本机包位于 `build/packages/mini-im-current-2a370ab/`，整体复制到 `tmp/current package 2a370ab/Mini IM/`；
+核对两处完整文件集合、逐文件大小和 SHA-256，并核对程序及页面与当前构建产物一致。
+这些路径均被 Git 忽略；可用已入库的打包入口生成新目录，临时包不是新环境复现的前提。
+
+在复制目录执行 `tools/desktop_fixture.py --portable --client 'tmp/current package 2a370ab/Mini IM/mini_im_client.exe'`，
+使用默认离屏模式，再用 `tools/test_desktop_ui.py --context <本次上下文> --playwright-cli <已安装入口>` 分别执行
+`--history-only`、默认控制检查和 `--files-only`。实际夹具使用各自隔离数据与输出目录，三轮均正常退出并清理临时运行数据。
+Qt/QML 环境变量已清理，客户端 PATH 仅含 Windows 系统目录；每次连接检查实际加载包内页面。
+历史 9 项、控制 38 项、文件 50 项共 97 项全部通过，覆盖历史双向接口、用户切换、保存回调、控制恢复及上传下载、重启、重试与取消。
+运行中采集的 24 个 Qt、MsQuic、Protobuf 和 C++ 应用依赖均来自复制目录。
+首次模块筛选误把 Windows 的 `msvcp_win.dll` 归入应用依赖；按实际 `msvcp140*.dll` 等名称更正筛选后通过，未改动包或业务代码。
+
+打包日志为 `tmp/current-package-build.log`，清单核对为 `tmp/current-package-manifest-audit.json`，
+桌面结果为 `tmp/current-package-desktop-20260913-063148/`，模块记录为 `tmp/current-package-modules.json`；均未入库。
+本批复验仅覆盖本机离屏桌面及迁移包，不新增 Windows 原生窗口、无 Qt 的全新机器或其他平台结论。
+本批无业务代码改动；原始阶段的最终构建与回归结果单独记录，不以本次 97 项桌面检查替代。
+文档检查：`tmp/audit-burn-docs.py` 核对 7 份 UTF-8 文档、471 处内部链接和 8 个 CMake 目标通过；
+26 段 PowerShell 示例通过语法解析，`git -c core.whitespace=cr-at-eol diff --check` 通过。
 
 ## 下一步与未验证项
 
