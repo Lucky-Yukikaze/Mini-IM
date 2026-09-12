@@ -840,6 +840,32 @@ P95 = 将样本排序后取第 `ceil(0.95 × 样本数)` 项；P50、P99 同法�
 这是本机回环网络和原生核心的基线，未覆盖 Qt WebEngine 渲染、远程网络、其他操作系统、持续稳定负载和缓存增长。
 结果与后续优化范围统一记录在 [执行记录](refactoring-progress.md#聊天与文件并发测量基线--2026-09-12)。
 
+## 客户端缓存规模测量
+
+[缓存测量入口](../tools/measure_cache.py) 使用 [Qt 测量驱动](../client/tests/cache_benchmark.cpp) 调用生产 `MiniImStateStore.open()` 和 `snapshot()`，
+分别记录打开数据库、生成初始快照、转换为 JSON 的耗时与输出字节数；另记录完整进程墙钟时间。
+墙钟时间 = 控制器从启动测量进程到收到结果并确认退出的时间，包含动态库加载、对象释放及进程退出。
+驱动是 `BUILD_TESTING=ON` 下的独立构建目标，不进入桌面发布包。
+
+~~~powershell
+cmake --build ./build/client-manifest --config Release --target mini_im_cache_benchmark
+& ./.venv/Scripts/python.exe ./tools/measure_cache.py
+& ./.venv/Scripts/python.exe ./tools/measure_cache.py --messages 0 1000 --conversations 10 --repeats 1
+~~~
+
+默认消息数为 100、10,000、100,000，每个规模使用 10 个会话、128 字节正文，每条消息附一项投递及一项已读人数投影；
+各会话附当前用户已读位置 0，全部消息来自另一用户，因此预期未读总数等于消息数。
+数据由工具直接填充到隔离数据库，未通过业务事件写入；只测本地投影规模，不证明生产事件处理或同步恢复正确性。
+每个规模先建库并填充，再启动三个独立 Qt 进程测量；操作系统文件缓存未清空，不能称为冷启动磁盘性能。
+同组进程复用已填充数据库；输入生成时间不计入测量；失败非零退出，日志保留错误，临时缓存自动移除。
+
+`--driver` 指定构建驱动，`--output` 指定证据目录；`--messages` 范围 0 至 100,000，
+`--conversations` 范围 1 至 100，`--repeats` 范围 1 至 10，单个进程等待上限 120 秒。
+结果位于 `tmp/cache-measurement/<时间>/`，保存环境、源码/工具/驱动摘要、每次分项耗时、对象数量和输出大小。
+所有样本必须保留全部输入消息、投递和已读人数，并核对会话及未读总数；不使用丢弃输入的结果比较速度。
+这项检查不包含登录、真实 QWebChannel 传递、页面渲染或进程内存采样，不能把 JSON 字节数当作内存占用。
+当前结果见 [缓存规模基线](refactoring-progress.md#客户端缓存规模测量基线--2026-09-12)。
+
 ## 现有脚本与历史环境
 
 | 入口 | 当前使用边界 |
