@@ -31,7 +31,7 @@ from storage.repo import ConversationRepo, DeliveryRepo, FileRepo, MessageRepo, 
 from storage.sqlite.db import MiniImSqliteDb
 from storage.repo.control_write_repo import ControlWriteRepo
 from storage.sqlite.init_db import init_db
-from storage.sqlite.write_queue import SqliteWriteQueue
+from storage.sqlite.write_queue import SqliteWriteQueue, WriteQueueFull
 
 
 FILE_STREAM_HEADER_MAX = 512
@@ -127,6 +127,8 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
         self.m_device_id = ""
         self.m_control_stream_id: int | None = None
         self.m_control_closed = False
+        self.m_overloaded = False
+        self.m_last_queued_write: asyncio.Future | None = None
         self.m_control_stream_buffers: dict[int, bytearray] = {}
         self.m_file_stream_states: dict[int, FileStreamState] = {}
         self.m_file_storage_failed = False
@@ -306,7 +308,7 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
         return transfer
 
     def _schedule_upload_flush(self, stream_id: int, state: FileStreamState) -> None:
-        if not state.buffer or state.flush_timer is not None or state.flush_queued:
+        if self.m_overloaded or not state.buffer or state.flush_timer is not None or state.flush_queued:
             return
 
         def flush():
@@ -319,7 +321,12 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
             state.flush_timer = None
             state.flush_queued = True
             try:
-                result = self.m_online_hub.writes.enqueue(flush)
+                if self.m_overloaded:
+                    return
+                result = self._enqueue_write(flush)
+            except WriteQueueFull:
+                self._overload()
+                return
             except RuntimeError:
                 # A stopped queue will not accept a new timer operation. The uncommitted
                 # tail remains recoverable from the original client's durable intent.
@@ -404,7 +411,28 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
         self._quic.close(error_code=0x1003, reason_phrase=reason)
         self.transmit()
 
+    def _enqueue_write(self, operation, *, payload_bytes=0):
+        result = self.m_online_hub.writes.enqueue(operation, payload_bytes=payload_bytes)
+        self.m_last_queued_write = result
+        return result
+
+    def _overload(self) -> None:
+        if self.m_overloaded:
+            return
+        self.m_overloaded = True
+        # Do not allocate another queue entry when capacity is exhausted. The last
+        # accepted operation fences all earlier work from this connection.
+        def drained(_=None):
+            self._close_control("write_queue_overloaded")
+        last = self.m_last_queued_write
+        if last is not None and not last.done():
+            last.add_done_callback(drained)
+        else:
+            drained()
+
     def quic_event_received(self, event):
+        if self.m_overloaded or self.m_control_closed:
+            return
         if not isinstance(event, (ConnectionTerminated, StreamReset, StopSendingReceived, StreamDataReceived)):
             return
         receive_ended = isinstance(event, StreamReset) or (
@@ -420,7 +448,11 @@ class MiniImQuicProtocol(QuicConnectionProtocol):
                     self.m_pending_receive_ends.discard(event.stream_id)
 
         try:
-            result = self.m_online_hub.writes.enqueue(process)
+            result = self._enqueue_write(process,
+                payload_bytes=len(event.data) if isinstance(event, StreamDataReceived) else 0)
+        except WriteQueueFull:
+            self._overload()
+            return
         except RuntimeError:
             # Shutdown closes transport after accepted operations have drained.
             return

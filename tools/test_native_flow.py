@@ -1259,6 +1259,55 @@ class NativeFlowTest(unittest.IsolatedAsyncioTestCase):
         return next(protocol for protocol in reversed(self.protocols)
                     if protocol.m_user_id == user and not protocol._closed.is_set())
 
+    async def test_queue_overload_resumes_original_upload_after_committed_progress(self):
+        source = self.root / "overload-upload.bin"
+        payload = bytes(range(251)) * 4096
+        source.write_bytes(payload)
+        original_limit = self.hub.writes.max_payload_bytes
+        original_append = self.files.append_file_chunk
+        injected = False
+        def append(*args, **kwargs):
+            nonlocal injected
+            result = original_append(*args, **kwargs)
+            if not injected:
+                injected = True
+                self.hub.writes.max_payload_bytes = 1
+            return result
+        try:
+            with patch.object(self.files, "append_file_chunk", append):
+                mark = await self.alice.command("upload", conversation=self.conversation, path=str(source))
+                await self.alice.wait("connection", lambda item: item["state"] == "disconnected", since=mark)
+            progress = self.db.execute_fetchone("SELECT received_bytes FROM file_transfers")[0]
+            self.assertGreater(progress, 0)
+            self.assertLess(progress, len(payload))
+            self.assertEqual(0, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+        finally:
+            self.hub.writes.max_payload_bytes = original_limit
+        await self.alice.wait("file", lambda item: item["completed"], since=mark)
+        row, attempts = self.assert_single_file_intent("alice", 1)
+        self.assertEqual(progress, attempts[-1]["acceptedOffset"])
+        self.assertEqual(payload, self.files.get_storage_path(row["file_id"]).read_bytes())
+        self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+
+    async def test_queue_overload_reconnects_with_original_saved_message(self):
+        original_limit = self.hub.writes.max_payload_bytes
+        self.hub.writes.max_payload_bytes = 1
+        try:
+            mark = await self.alice.command("message", conversation=self.conversation,
+                intent="overload-message", text="retry after rejected input")
+            pending = await self.alice.wait("message-sends", lambda item: any(
+                row["clientMsgId"] == "overload-message" for row in item["items"]), since=mark)
+            identity = next(row for row in pending["items"] if row["clientMsgId"] == "overload-message")
+            await self.alice.wait("connection", lambda item: item["state"] == "disconnected", since=mark)
+            self.assertEqual(0, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+        finally:
+            self.hub.writes.max_payload_bytes = original_limit
+        await self.bob.wait("message", lambda item: item["clientMsgId"] == "overload-message")
+        await self.alice.wait("message-sends", lambda item: not item["items"], since=mark)
+        self.assertEqual(1, len(self.message_attempts))
+        self.assertEqual(identity["requestId"], self.message_attempts[0]["requestId"])
+        self.assert_single_message_intent("overload-message", 1)
+
     async def test_connection_drop_resends_unconfirmed_message_automatically(self):
         self.drop_message_ack_count = 1
         await self.alice.command("message", conversation=self.conversation, intent="reconnect-intent", text="recover")

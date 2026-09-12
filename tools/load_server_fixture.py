@@ -55,7 +55,7 @@ async def main(args):
             record('fsync', time.perf_counter() - started)
         return result
 
-    def enqueue(instance, operation):
+    def enqueue(instance, operation, *, payload_bytes=0):
         queued = time.perf_counter()
         measured = active
         def run():
@@ -67,9 +67,10 @@ async def main(args):
             finally:
                 if measured and active:
                     record('queueWork', time.perf_counter() - started)
-        result = original_enqueue(instance, run)
+        result = original_enqueue(instance, run, payload_bytes=payload_bytes)
         if active:
             metrics['maxQueuedOperations'] = max(metrics.get('maxQueuedOperations', 0), len(instance.m_queue))
+            metrics['maxQueuedPayloadBytes'] = max(metrics.get('maxQueuedPayloadBytes', 0), instance.pending_payload_bytes)
         return result
 
     async def listen(*pos, **kw):

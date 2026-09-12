@@ -9,7 +9,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from storage.sqlite.db import MiniImSqliteDb
-from storage.sqlite.write_queue import SqliteWriteQueue
+from storage.sqlite.write_queue import SqliteWriteQueue, WriteQueueFull
 
 
 class WriteQueueTest(unittest.IsolatedAsyncioTestCase):
@@ -81,6 +81,36 @@ class WriteQueueTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         await asyncio.sleep(0)
         self.assertEqual(4, len(await self.queue.submit(lambda: self.write_pair("second"))))
+
+    async def test_capacity_rejection_has_no_effect_and_drains_accepted_work(self):
+        queue = SqliteWriteQueue(max_operations=2, max_payload_bytes=8)
+        first = queue.enqueue(lambda: self.write_pair("first"), payload_bytes=3)
+        second = queue.enqueue(lambda: self.write_pair("second"), payload_bytes=5)
+        second.cancel()
+        with self.assertRaises(WriteQueueFull):
+            queue.enqueue(lambda: self.write_pair("rejected"))
+        self.assertEqual(8, queue.pending_payload_bytes)
+        await queue.stop()
+        await first
+        self.assertEqual(0, queue.pending_payload_bytes)
+        self.assertEqual(4, len(self.values()))
+
+    async def test_byte_capacity_released_after_failed_operation(self):
+        queue = SqliteWriteQueue(max_operations=8, max_payload_bytes=7)
+        failed = queue.enqueue(lambda: self.write_pair("rollback", True), payload_bytes=7)
+        with self.assertRaises(WriteQueueFull):
+            queue.enqueue(lambda: self.write_pair("rejected"), payload_bytes=1)
+        with self.assertRaises(ValueError):
+            await failed
+        self.assertEqual(0, queue.pending_payload_bytes)
+        self.assertEqual([], self.values())
+        await queue.enqueue(lambda: self.write_pair("retry"), payload_bytes=7)
+        with self.assertRaises(WriteQueueFull):
+            queue.enqueue(lambda: None, payload_bytes=8)
+        with self.assertRaises(ValueError):
+            queue.enqueue(lambda: None, payload_bytes=-1)
+        await queue.stop()
+        self.assertEqual(2, len(self.values()))
 
     async def test_coroutine_cannot_split_a_transaction_across_awaits(self):
         async def unsupported():

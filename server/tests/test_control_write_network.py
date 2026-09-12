@@ -219,6 +219,68 @@ class ControlWriteNetworkTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([("queue-one", [("one",)]),
                 ("queue-two", [("one",), ("two",)])], observations)
 
+    async def test_overload_drains_accepted_message_before_disconnect_and_replay(self):
+        request = message_pb2.SendMessage(conversation_id=self.conversation, client_msg_id="capacity-intent",
+            type=common_pb2.MSG_TEXT, content=b"accepted before overload")
+        async with self.peer(with_protocol=True) as (reader, send, protocol):
+            send("establish-capacity", heartbeat=auth_pb2.Heartbeat())
+            await self.read(reader, "establish-capacity", "heartbeat")
+            await self.hub.writes.submit(lambda: None)
+            await asyncio.sleep(0)
+            owner = self.protocols[-1]
+            entered, release = asyncio.Event(), asyncio.Event()
+            worker = self.hub.writes._worker_loop
+            async def paused():
+                entered.set()
+                await release.wait()
+                await worker()
+            with patch.object(self.hub.writes, "max_operations", 1), patch.object(
+                    self.hub.writes, "_worker_loop", paused):
+                try:
+                    send("accepted-capacity", send_message=request)
+                    await entered.wait()
+                    send("rejected-capacity", rename_conversation=conversation_pb2.RenameConversation(
+                        conversation_id=self.conversation, title="must not execute"))
+                    await self.until(lambda: owner.m_overloaded)
+                    self.assertFalse(owner.m_control_closed)
+                    self.assertEqual(1, len(self.hub.writes.m_queue))
+                    self.assertEqual(0, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+                finally:
+                    release.set()
+                await asyncio.wait_for(protocol.wait_closed(), 3)
+                self.assertEqual("write_queue_overloaded", protocol.termination.reason_phrase)
+            self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+            self.assertEqual("original", self.title())
+            self.assertEqual(0, self.hub.writes.pending_payload_bytes)
+        async with self.peer() as (reader, send):
+            send("accepted-capacity", send_message=request)
+            self.assertTrue((await self.read(reader, "accepted-capacity", "ack")).ack.success)
+            self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+
+    async def test_byte_overload_drops_partial_frame_and_original_request_retries(self):
+        request = message_pb2.SendMessage(conversation_id=self.conversation, client_msg_id="byte-capacity",
+            type=common_pb2.MSG_TEXT, content=b"partial frame must not survive rejection")
+        async with self.peer(with_protocol=True) as (reader, send, protocol):
+            send("establish-bytes", heartbeat=auth_pb2.Heartbeat())
+            await self.read(reader, "establish-bytes", "heartbeat")
+            owner = self.protocols[-1]
+            envelope = envelope_pb2.Envelope(version=1, request_id="retry-byte-capacity",
+                session_id=owner.m_session_id, send_message=request)
+            frame = EnvelopeCodec.encode_frame(envelope)
+            with patch.object(self.hub.writes, "max_payload_bytes", 8):
+                protocol._quic.send_stream_data(0, frame[:5]); protocol.transmit()
+                await self.until(lambda: len(owner.m_control_stream_buffers.get(0, b"")) == 5)
+                protocol._quic.send_stream_data(0, frame[5:]); protocol.transmit()
+                await asyncio.wait_for(protocol.wait_closed(), 3)
+                self.assertEqual("write_queue_overloaded", protocol.termination.reason_phrase)
+                self.assertEqual({}, owner.m_control_stream_buffers)
+                self.assertEqual(0, self.hub.writes.pending_payload_bytes)
+        self.assertEqual(0, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+        async with self.peer() as (reader, send):
+            send("retry-byte-capacity", send_message=request)
+            self.assertTrue((await self.read(reader, "retry-byte-capacity", "ack")).ack.success)
+        self.assertEqual(1, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+
     async def test_shutdown_drains_accepted_request_before_closing_connection(self):
         async with self.peer() as (reader, send):
             await self.hub.writes.submit(lambda: None)
@@ -243,9 +305,9 @@ class ControlWriteNetworkTest(unittest.IsolatedAsyncioTestCase):
                     # Real late input must not close the connection ahead of accepted work.
                     late = asyncio.Event()
                     enqueue = self.hub.writes.enqueue
-                    def observe_late(operation):
+                    def observe_late(operation, **kwargs):
                         late.set()
-                        return enqueue(operation)
+                        return enqueue(operation, **kwargs)
                     with patch.object(self.hub.writes, "enqueue", observe_late):
                         send("late-stop", heartbeat=auth_pb2.Heartbeat())
                         await asyncio.wait_for(late.wait(), 3)
@@ -968,6 +1030,32 @@ class ControlWriteNetworkTest(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(self.files.get_storage_path(initialized.file_id).exists())
                 self.assertFalse(owner.m_file_stream_states)
                 self.assertEqual(0, self.db.execute_fetchone("SELECT COUNT(*) FROM messages")[0])
+
+    async def test_full_queue_at_upload_timer_closes_without_advancing_buffer(self):
+        payload = b"capacity timer upload" * 1024
+        with patch("quic.server.UPLOAD_COMMIT_DELAY", 0.2):
+            async with self.peer(device="buffer-owner", with_protocol=True) as (reader, send, protocol):
+                initialized = await self.initialize_upload(reader, send, self.shared_upload_request(payload))
+                writer, owner = await self.pending_upload(protocol, initialized.file_id, payload[:8192])
+                await self.hub.writes.submit(lambda: None)
+                await asyncio.sleep(0)
+                release = asyncio.Event()
+                worker = self.hub.writes._worker_loop
+                async def paused():
+                    await release.wait()
+                    await worker()
+                with patch.object(self.hub.writes, "max_operations", 1), patch.object(
+                        self.hub.writes, "_worker_loop", paused):
+                    barrier = self.hub.writes.enqueue(lambda: None)
+                    try:
+                        await asyncio.wait_for(protocol.wait_closed(), 3)
+                        self.assertEqual("write_queue_overloaded", protocol.termination.reason_phrase)
+                        self.assertFalse(owner.m_file_stream_states)
+                        self.assertFalse(self.files.get_storage_path(initialized.file_id).exists())
+                        self.assertEqual(0, self.files.get_transfer_by_file_id(initialized.file_id).received_bytes)
+                    finally:
+                        release.set()
+                    await barrier
 
     async def test_queued_upload_flush_cannot_outlive_cancel(self):
         payload = b"queued buffered upload" * 1024
